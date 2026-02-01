@@ -16,9 +16,11 @@ class Difficulty(str, Enum):
 # Category schemas
 class CategoryBase(BaseModel):
     name: str
+    name_cantonese: Optional[str] = None
     icon: str = "📚"
     color: str = "bg-sky"
     description: Optional[str] = None
+    description_cantonese: Optional[str] = None
 
 
 class CategoryCreate(CategoryBase):
@@ -27,9 +29,11 @@ class CategoryCreate(CategoryBase):
 
 class CategoryUpdate(BaseModel):
     name: Optional[str] = None
+    name_cantonese: Optional[str] = None
     icon: Optional[str] = None
     color: Optional[str] = None
     description: Optional[str] = None
+    description_cantonese: Optional[str] = None
 
 
 class CategoryResponse(CategoryBase):
@@ -43,32 +47,42 @@ class CategoryResponse(CategoryBase):
 
 # Word schemas
 class WordBase(BaseModel):
-    word: str
+    word: str  # English word (for reference)
+    word_cantonese: Optional[str] = None  # Traditional Chinese
     category: str
-    pronunciation: Optional[str] = None
-    definition: str
-    example: str
+    pronunciation: Optional[str] = None  # English pronunciation
+    jyutping: Optional[str] = None  # Cantonese romanization
+    definition: str  # English definition
+    definition_cantonese: Optional[str] = None  # Traditional Chinese definition
+    example: str  # English example
+    example_cantonese: Optional[str] = None  # Traditional Chinese example
     difficulty: Difficulty = Difficulty.EASY
     physical_action: Optional[str] = None
 
 
 class WordCreate(WordBase):
     image_url: Optional[str] = None
-    audio_url: Optional[str] = None
+    audio_url: Optional[str] = None  # Cantonese audio
+    audio_url_english: Optional[str] = None  # English audio
     contexts: Optional[List[str]] = []
     related_words: Optional[List[str]] = []
 
 
 class WordUpdate(BaseModel):
     word: Optional[str] = None
+    word_cantonese: Optional[str] = None
     category: Optional[str] = None
     pronunciation: Optional[str] = None
+    jyutping: Optional[str] = None
     definition: Optional[str] = None
+    definition_cantonese: Optional[str] = None
     example: Optional[str] = None
+    example_cantonese: Optional[str] = None
     difficulty: Optional[Difficulty] = None
     physical_action: Optional[str] = None
     image_url: Optional[str] = None
     audio_url: Optional[str] = None
+    audio_url_english: Optional[str] = None
     contexts: Optional[List[str]] = None
     related_words: Optional[List[str]] = None
 
@@ -77,6 +91,7 @@ class WordResponse(WordBase):
     id: str
     image_url: Optional[str] = None
     audio_url: Optional[str] = None
+    audio_url_english: Optional[str] = None
     contexts: List[str] = []
     related_words: List[str] = []
     total_exposures: int
@@ -84,6 +99,7 @@ class WordResponse(WordBase):
     is_active: bool
     created_at: datetime
     category_name: Optional[str] = None
+    category_name_cantonese: Optional[str] = None
     
     @field_validator('contexts', 'related_words', mode='before')
     @classmethod

@@ -51,6 +51,7 @@ async def get_words(
     for word in words:
         word_dict = WordResponse.model_validate(word).model_dump()
         word_dict['category_name'] = word.category_rel.name if word.category_rel else None
+        word_dict['category_name_cantonese'] = word.category_rel.name_cantonese if word.category_rel else None
         response_words.append(word_dict)
     
     return response_words
@@ -114,6 +115,7 @@ async def get_words_with_progress(
         word_dict = {
             **word.__dict__,
             "category_name": word.category_rel.name if word.category_rel else None,
+            "category_name_cantonese": word.category_rel.name_cantonese if word.category_rel else None,
             "progress": progress
         }
         words_with_progress.append(word_dict)

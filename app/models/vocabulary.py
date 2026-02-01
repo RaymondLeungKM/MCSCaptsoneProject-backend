@@ -23,9 +23,11 @@ class Category(Base):
     
     id = Column(String, primary_key=True, index=True)
     name = Column(String, nullable=False, unique=True)
+    name_cantonese = Column(String)  # Traditional Chinese name
     icon = Column(String, default="📚")
     color = Column(String, default="bg-sky")
     description = Column(Text)
+    description_cantonese = Column(Text)  # Traditional Chinese description
     word_count = Column(Integer, default=0)
     sort_order = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
@@ -42,17 +44,22 @@ class Word(Base):
     __tablename__ = "words"
     
     id = Column(String, primary_key=True, index=True)
-    word = Column(String, nullable=False, index=True)
+    word = Column(String, nullable=False, index=True)  # English word (for reference)
+    word_cantonese = Column(String, index=True)  # Traditional Chinese
     category = Column(String, ForeignKey("categories.id"), nullable=False)
     
     # Content
-    pronunciation = Column(String)
-    definition = Column(Text, nullable=False)
-    example = Column(Text, nullable=False)
+    pronunciation = Column(String)  # English pronunciation
+    jyutping = Column(String)  # Cantonese romanization
+    definition = Column(Text, nullable=False)  # English definition
+    definition_cantonese = Column(Text)  # Traditional Chinese definition
+    example = Column(Text, nullable=False)  # English example
+    example_cantonese = Column(Text)  # Traditional Chinese example
     
     # Media
     image_url = Column(String)
-    audio_url = Column(String)
+    audio_url = Column(String)  # Cantonese audio URL
+    audio_url_english = Column(String)  # English audio URL (optional)
     
     # Learning metadata
     difficulty = Column(SQLEnum(Difficulty), default=Difficulty.EASY)

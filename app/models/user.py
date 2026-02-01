@@ -28,6 +28,12 @@ class TimeOfDay(str, enum.Enum):
     EVENING = "evening"
 
 
+class LanguagePreference(str, enum.Enum):
+    CANTONESE = "cantonese"  # Traditional Chinese only
+    ENGLISH = "english"  # English only
+    BILINGUAL = "bilingual"  # Both languages displayed
+
+
 class User(Base):
     """Parent/Guardian user account"""
     __tablename__ = "users"
@@ -63,6 +69,7 @@ class Child(Base):
     
     # Learning preferences
     learning_style = Column(SQLEnum(LearningStyle), default=LearningStyle.MIXED)
+    language_preference = Column(SQLEnum(LanguagePreference), default=LanguagePreference.CANTONESE)
     attention_span = Column(Integer, default=15)  # minutes
     preferred_time_of_day = Column(SQLEnum(TimeOfDay), default=TimeOfDay.MORNING)
     
@@ -75,6 +82,10 @@ class Child(Base):
     interests = relationship("ChildInterest", back_populates="child", cascade="all, delete-orphan")
     learning_sessions = relationship("LearningSession", back_populates="child", cascade="all, delete-orphan")
     word_progress = relationship("WordProgress", back_populates="child", cascade="all, delete-orphan")
+    daily_stats = relationship("DailyLearningStats", back_populates="child", cascade="all, delete-orphan")
+    insights = relationship("LearningInsight", back_populates="child", cascade="all, delete-orphan")
+    weekly_reports = relationship("WeeklyReport", back_populates="child", cascade="all, delete-orphan")
+    parental_control = relationship("ParentalControl", back_populates="child", cascade="all, delete-orphan", uselist=False)
 
 
 class ChildInterest(Base):

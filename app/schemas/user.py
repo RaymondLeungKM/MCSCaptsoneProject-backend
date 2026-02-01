@@ -25,6 +25,12 @@ class TimeOfDay(str, Enum):
     EVENING = "evening"
 
 
+class LanguagePreference(str, Enum):
+    CANTONESE = "cantonese"  # Traditional Chinese only
+    ENGLISH = "english"  # English only
+    BILINGUAL = "bilingual"  # Both languages displayed
+
+
 # User schemas
 class UserBase(BaseModel):
     email: EmailStr
@@ -57,6 +63,7 @@ class ChildBase(BaseModel):
     avatar: str = "👧"
     daily_goal: int = 5
     learning_style: LearningStyle = LearningStyle.MIXED
+    language_preference: LanguagePreference = LanguagePreference.CANTONESE
     attention_span: int = 15
     preferred_time_of_day: TimeOfDay = TimeOfDay.MORNING
 
@@ -71,6 +78,7 @@ class ChildUpdate(BaseModel):
     avatar: Optional[str] = None
     daily_goal: Optional[int] = None
     learning_style: Optional[LearningStyle] = None
+    language_preference: Optional[LanguagePreference] = None
     attention_span: Optional[int] = None
     preferred_time_of_day: Optional[TimeOfDay] = None
 
