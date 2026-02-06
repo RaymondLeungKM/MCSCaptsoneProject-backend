@@ -56,13 +56,23 @@ class GeneratedStoryCreate(BaseModel):
     title: str
     title_english: Optional[str] = None
     theme: Optional[str] = None
+    generated_at: Optional[datetime] = None
+    generated_by: Optional[str] = None
     content_cantonese: str
     content_english: Optional[str] = None
     jyutping: Optional[str] = None
+    vocab_used: Optional[str] = None
+    story_text: Optional[str] = None
+    story_text_ssml: Optional[str] = None
+    story_generate_provdier: Optional[str] = None
+    story_generate_model: Optional[str] = None
     featured_words: List[str] = Field(default_factory=list)  # List of word IDs
     word_usage: Optional[Dict[str, Any]] = None
     audio_url: Optional[str] = None
     audio_duration_seconds: Optional[int] = None
+    audio_filename: Optional[str] = None
+    audio_generate_provider: Optional[str] = None
+    audio_generate_voice_name: Optional[str] = None
     reading_time_minutes: int = 5
     word_count: Optional[int] = None
     difficulty_level: str = "easy"
@@ -79,13 +89,23 @@ class GeneratedStoryResponse(BaseModel):
     title_english: Optional[str]
     theme: Optional[str]
     generation_date: datetime
+    generated_at: datetime
+    generated_by: Optional[str]
     content_cantonese: str
     content_english: Optional[str]
     jyutping: Optional[str]
+    vocab_used: Optional[str]
+    story_text: str
+    story_text_ssml: str
+    story_generate_provdier: Optional[str]
+    story_generate_model: Optional[str]
     featured_words: List[str]
     word_usage: Optional[Dict[str, Any]]
     audio_url: Optional[str]
     audio_duration_seconds: Optional[int]
+    audio_filename: str
+    audio_generate_provider: Optional[str]
+    audio_generate_voice_name: Optional[str]
     reading_time_minutes: int
     word_count: Optional[int]
     difficulty_level: str

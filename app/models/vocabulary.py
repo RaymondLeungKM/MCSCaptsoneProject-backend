@@ -25,7 +25,7 @@ class Category(Base):
     name = Column(String, nullable=False, unique=True)
     name_cantonese = Column(String)  # Traditional Chinese name
     icon = Column(String, default="📚")
-    color = Column(String, default="bg-sky")
+    color = Column(String, default="bg-slate-400")  # Will be auto-assigned on creation
     description = Column(Text)
     description_cantonese = Column(Text)  # Traditional Chinese description
     word_count = Column(Integer, default=0)
@@ -78,6 +78,7 @@ class Word(Base):
     # Relationships
     category_rel = relationship("Category", back_populates="words")
     progress = relationship("WordProgress", back_populates="word")
+    generated_sentences = relationship("GeneratedSentence", back_populates="word", cascade="all, delete-orphan")
 
 
 class WordProgress(Base):

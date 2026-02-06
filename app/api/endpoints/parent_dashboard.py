@@ -17,7 +17,7 @@ from app.models.parent_analytics import (
     WeeklyReport,
     ParentalControl
 )
-from app.models.vocabulary import WordProgress
+from app.models.vocabulary import WordProgress, Word, Category
 from app.models.analytics import LearningSession
 from app.schemas.parent_analytics import (
     DailyLearningStatsResponse,
@@ -60,9 +60,80 @@ async def get_dashboard_summary(
     if not child:
         raise HTTPException(status_code=404, detail="Child not found")
     
-    # Get category progress
-    # TODO: Implement category progress calculation
+    # Calculate actual words learned from WordProgress table
+    words_learned_result = await db.execute(
+        select(func.count(WordProgress.id))
+        .where(
+            and_(
+                WordProgress.child_id == child_id,
+                WordProgress.exposure_count >= 1  # At least one exposure
+            )
+        )
+    )
+    actual_words_learned = words_learned_result.scalar() or 0
+    
+    # Update child's words_learned if different
+    if child.words_learned != actual_words_learned:
+        child.words_learned = actual_words_learned
+        await db.commit()
+        await db.refresh(child)
+    
+    # Get category progress - calculate from WordProgress records
+    
+    category_progress_result = await db.execute(
+        select(
+            Word.category,
+            func.count(WordProgress.id).label('words_learned')
+        )
+        .join(Word, WordProgress.word_id == Word.id)
+        .where(
+            and_(
+                WordProgress.child_id == child_id,
+                WordProgress.exposure_count >= 1
+            )
+        )
+        .group_by(Word.category)
+    )
+    category_counts = category_progress_result.all()
+    
+    # Get total words per category
     category_progress = []
+    for cat_id, learned_count in category_counts:
+        category_result = await db.execute(
+            select(Category, func.count(Word.id))
+            .join(Word, Category.id == Word.category)
+            .where(Category.id == cat_id)
+            .group_by(Category.id)
+        )
+        cat_data = category_result.first()
+        if cat_data:
+            category, total_words = cat_data
+            
+            # Calculate recent activity (last 7 days)
+            seven_days_ago_cat = date.today() - timedelta(days=6)  # 6 days ago + today = 7 days
+            seven_days_ago_cat_dt = datetime.combine(seven_days_ago_cat, datetime.min.time())
+            recent_result = await db.execute(
+                select(func.count(WordProgress.id))
+                .join(Word, WordProgress.word_id == Word.id)
+                .where(
+                    and_(
+                        WordProgress.child_id == child_id,
+                        Word.category == cat_id,
+                        WordProgress.last_practiced >= seven_days_ago_cat_dt
+                    )
+                )
+            )
+            recent_activity = recent_result.scalar() or 0
+            
+            category_progress.append(CategoryProgress(
+                category_id=category.id,
+                category_name=category.name,
+                category_name_cantonese=category.name_cantonese or category.name,
+                words_learned=learned_count,
+                total_words=total_words,
+                progress_percentage=(learned_count / total_words * 100) if total_words > 0 else 0,
+                recent_activity=recent_activity
+            ))
     
     # Get recent insights (last 5, unread first)
     insights_result = await db.execute(
@@ -96,23 +167,42 @@ async def get_dashboard_summary(
     )
     parental_control = control_result.scalar_one_or_none()
     
-    # Calculate weekly stats (last 7 days)
-    seven_days_ago = date.today() - timedelta(days=7)
-    weekly_stats_result = await db.execute(
-        select(
-            func.sum(DailyLearningStats.words_learned),
-            func.sum(DailyLearningStats.total_learning_time),
-            func.sum(DailyLearningStats.session_count),
-            func.sum(DailyLearningStats.xp_earned)
-        )
+    # Calculate weekly stats dynamically from WordProgress (last 7 days including today)
+    seven_days_ago = date.today() - timedelta(days=6)  # 6 days ago + today = 7 days
+    # Convert to datetime for proper comparison with DateTime field
+    seven_days_ago_dt = datetime.combine(seven_days_ago, datetime.min.time())
+    
+    # Count words practiced in the last 7 days
+    weekly_progress_result = await db.execute(
+        select(func.count(WordProgress.id.distinct()))
         .where(
             and_(
-                DailyLearningStats.child_id == child_id,
-                DailyLearningStats.date >= seven_days_ago
+                WordProgress.child_id == child_id,
+                WordProgress.last_practiced >= seven_days_ago_dt
             )
         )
     )
-    weekly_data = weekly_stats_result.first()
+    weekly_words_count = weekly_progress_result.scalar() or 0
+    
+    # Count unique learning sessions (approximated by unique dates with activity)
+    weekly_sessions_result = await db.execute(
+        select(func.count(func.distinct(func.date(WordProgress.last_practiced))))
+        .where(
+            and_(
+                WordProgress.child_id == child_id,
+                WordProgress.last_practiced >= seven_days_ago_dt
+            )
+        )
+    )
+    weekly_sessions = weekly_sessions_result.scalar() or 0
+    
+    # Calculate XP earned (10 XP per word for new words, 5 XP for reviews)
+    # For simplicity, count all words practiced in the last 7 days
+    weekly_xp = weekly_words_count * 10  # Approximate
+    
+    # Learning time - we don't track this precisely yet, so estimate based on engagement
+    # Approximate 2 minutes per word
+    weekly_learning_time = weekly_words_count * 2
     
     return DashboardSummaryResponse(
         child_id=child.id,
@@ -121,10 +211,10 @@ async def get_dashboard_summary(
         current_streak=child.current_streak,
         level=child.level,
         xp=child.xp,
-        weekly_learning_time=weekly_data[1] or 0,
-        weekly_sessions=weekly_data[2] or 0,
-        weekly_words_learned=weekly_data[0] or 0,
-        weekly_xp_earned=weekly_data[3] or 0,
+        weekly_learning_time=weekly_learning_time,
+        weekly_sessions=weekly_sessions,
+        weekly_words_learned=weekly_words_count,
+        weekly_xp_earned=weekly_xp,
         category_progress=category_progress,
         recent_insights=[LearningInsightResponse.from_orm(i) for i in insights],
         latest_report=WeeklyReportResponse.from_orm(latest_report) if latest_report else None,
@@ -155,52 +245,141 @@ async def get_analytics_charts(
     # Calculate date range
     today = date.today()
     if period == "week":
-        start_date = today - timedelta(days=7)
+        start_date = today - timedelta(days=6)  # 6 days ago + today = 7 days
+        num_days = 7
     elif period == "month":
         start_date = today - timedelta(days=30)
+        num_days = 30
     else:  # all
         start_date = date(2020, 1, 1)  # Far in the past
+        num_days = (today - start_date).days
     
-    # Get daily stats for time series
-    stats_result = await db.execute(
-        select(DailyLearningStats)
+    # Convert start_date to datetime for proper comparison with DateTime field
+    start_date_dt = datetime.combine(start_date, datetime.min.time())
+    
+    # ALWAYS calculate dynamically from WordProgress records with dates
+    # Get all word progress records with their practice dates
+    progress_result = await db.execute(
+        select(WordProgress, Word)
+        .join(Word, WordProgress.word_id == Word.id)
         .where(
             and_(
-                DailyLearningStats.child_id == child_id,
-                DailyLearningStats.date >= start_date
+                WordProgress.child_id == child_id,
+                WordProgress.last_practiced >= start_date_dt
             )
         )
-        .order_by(DailyLearningStats.date)
     )
-    daily_stats = stats_result.scalars().all()
+    progress_records = progress_result.all()
     
-    # Build time series data
-    dates = [str(stat.date) for stat in daily_stats]
-    words_learned = [stat.words_learned for stat in daily_stats]
-    learning_time = [stat.total_learning_time for stat in daily_stats]
-    xp_earned = [stat.xp_earned for stat in daily_stats]
-    accuracy = [stat.average_accuracy for stat in daily_stats]
-    
-    # Aggregate category breakdown
+    # Group by date and category
+    date_stats = {}
     category_breakdown = {}
-    for stat in daily_stats:
-        for category_id, count in stat.categories_studied.items():
-            category_breakdown[category_id] = category_breakdown.get(category_id, 0) + count
     
-    # Learning style distribution (placeholder)
+    for progress, word in progress_records:
+        if progress.last_practiced:
+            practice_date = progress.last_practiced.date()
+            if practice_date >= start_date and practice_date <= today:
+                # Initialize date entry if needed
+                if practice_date not in date_stats:
+                    date_stats[practice_date] = {
+                        'words_learned': set(),  # Use set to avoid duplicates
+                        'xp': 0
+                    }
+                
+                # Add word to this date (set prevents duplicates)
+                date_stats[practice_date]['words_learned'].add(progress.word_id)
+                
+                # Aggregate categories
+                if word.category not in category_breakdown:
+                    category_breakdown[word.category] = set()
+                category_breakdown[word.category].add(progress.word_id)
+    
+    # Create time series arrays - generate a date for each day in range
+    dates = []
+    words_learned = []
+    xp_earned = []
+    
+    current_date = start_date
+    while current_date <= today:
+        dates.append(str(current_date))
+        
+        day_stats = date_stats.get(current_date, {'words_learned': set(), 'xp': 0})
+        words_count = len(day_stats['words_learned'])
+        
+        words_learned.append(words_count)
+        xp_earned.append(words_count * 10)  # 10 XP per word
+        
+        current_date += timedelta(days=1)
+    
+    # Placeholder arrays (we don't track these precisely yet)
+    learning_time = [words * 2 for words in words_learned]  # Approximate 2 min per word
+    accuracy = [95.0 if words > 0 else 0.0 for words in words_learned]  # Approximate
+    
+    # Get category info and format progress data
+    category_progress = []
+    category_breakdown_for_response = {}
+    
+    if category_breakdown:
+        categories_result = await db.execute(
+            select(Category).where(Category.id.in_(list(category_breakdown.keys())))
+        )
+        categories = categories_result.scalars().all()
+        
+        for category in categories:
+            # Calculate total words in category
+            total_words_result = await db.execute(
+                select(func.count(Word.id)).where(Word.category == category.id)
+            )
+            total_words = total_words_result.scalar() or 0
+            
+            # Count unique words learned in this category
+            words_learned_count = len(category_breakdown[category.id])
+            
+            # Add to response dict (use cantonese name if available, fallback to English)
+            category_breakdown_for_response[category.name_cantonese or category.name] = words_learned_count
+            
+            # Calculate recent activity (last 7 days) - count words practiced recently
+            seven_days_ago_chart = date.today() - timedelta(days=6)  # 6 days ago + today = 7 days
+            seven_days_ago_chart_dt = datetime.combine(seven_days_ago_chart, datetime.min.time())
+            recent_result = await db.execute(
+                select(func.count(WordProgress.id.distinct()))
+                .join(Word, WordProgress.word_id == Word.id)
+                .where(
+                    and_(
+                        WordProgress.child_id == child_id,
+                        Word.category == category.id,
+                        WordProgress.last_practiced >= seven_days_ago_chart_dt
+                    )
+                )
+            )
+            recent_activity = recent_result.scalar() or 0
+            
+            category_progress.append(CategoryProgress(
+                category_id=category.id,
+                category_name=category.name,
+                category_name_cantonese=category.name_cantonese or category.name,
+                words_learned=words_learned_count,
+                total_words=total_words,
+                progress_percentage=(words_learned_count / total_words * 100) if total_words > 0 else 0,
+                recent_activity=recent_activity
+            ))
+    
+    # Learning style distribution (placeholder - we don't track these separately yet)
+    # Approximate based on word activity
+    total_words_in_period = sum(words_learned)
     learning_style_distribution = {
-        "games": sum(s.games_played for s in daily_stats),
-        "stories": sum(s.stories_read for s in daily_stats),
-        "practice": sum(s.session_count for s in daily_stats)
+        "games": 0,  # Would need separate tracking
+        "stories": 0,  # Would need separate tracking
+        "practice": len([w for w in words_learned if w > 0])  # Days with activity
     }
     
-    # Calculate best time of day (placeholder)
-    best_time_of_day = child.preferred_time_of_day.value
+    # Calculate best time of day
+    best_time_of_day = child.preferred_time_of_day.value if child.preferred_time_of_day else "morning"
     
     # Calculate average session length
     total_time = sum(learning_time)
-    total_sessions = sum(s.session_count for s in daily_stats)
-    avg_session_length = int(total_time / total_sessions) if total_sessions > 0 else 0
+    days_with_activity = len([w for w in words_learned if w > 0])
+    average_session_length = int(total_time / days_with_activity) if days_with_activity > 0 else 0
     
     return AnalyticsChartsResponse(
         child_id=child_id,
@@ -212,10 +391,10 @@ async def get_analytics_charts(
             xp_earned=xp_earned,
             accuracy=accuracy
         ),
-        category_breakdown=category_breakdown,
+        category_breakdown=category_breakdown_for_response,
         learning_style_distribution=learning_style_distribution,
         best_time_of_day=best_time_of_day,
-        average_session_length=avg_session_length
+        average_session_length=average_session_length
     )
 
 

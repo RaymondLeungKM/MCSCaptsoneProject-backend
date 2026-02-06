@@ -1,7 +1,7 @@
 """
 Daily word tracking for bedtime story generation
 """
-from sqlalchemy import Column, String, Integer, ForeignKey, DateTime, Boolean, Float
+from sqlalchemy import Column, String, Integer, ForeignKey, DateTime, Boolean, Float, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import JSONB
@@ -50,11 +50,18 @@ class GeneratedStory(Base):
     title_english = Column(String)
     theme = Column(String)  # e.g., "adventure", "family", "animals"
     generation_date = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    generated_at = Column(DateTime(), nullable=False, server_default=func.now())
+    generated_by = Column(String)
     
     # Story content
     content_cantonese = Column(String, nullable=False)  # Full story in Traditional Chinese
     content_english = Column(String)  # English translation
     jyutping = Column(String)  # Romanization for difficult words
+    vocab_used = Column(String(500))
+    story_text = Column(Text, nullable=False)
+    story_text_ssml = Column(Text, nullable=False)
+    story_generate_provdier = Column(String)
+    story_generate_model = Column(String)
     
     # Featured words
     featured_words = Column(JSONB)  # Array of word IDs used in story
@@ -63,6 +70,9 @@ class GeneratedStory(Base):
     # Audio
     audio_url = Column(String)  # TTS narration
     audio_duration_seconds = Column(Integer)
+    audio_filename = Column(String, nullable=False)
+    audio_generate_provider = Column(String)
+    audio_generate_voice_name = Column(String)
     
     # Metadata
     reading_time_minutes = Column(Integer, default=5)

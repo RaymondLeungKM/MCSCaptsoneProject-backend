@@ -18,7 +18,7 @@ class CategoryBase(BaseModel):
     name: str
     name_cantonese: Optional[str] = None
     icon: str = "📚"
-    color: str = "bg-sky"
+    color: Optional[str] = None  # Auto-assigned if not provided
     description: Optional[str] = None
     description_cantonese: Optional[str] = None
 
@@ -173,4 +173,22 @@ class ExternalWordLearningResponse(BaseModel):
 class WordWithProgress(WordResponse):
     """Word with child's progress data"""
     progress: Optional[WordProgressResponse] = None
+
+
+# Sentence generation schemas
+class GeneratedSentence(BaseModel):
+    """A generated example sentence"""
+    sentence: str = Field(..., description="Cantonese Traditional Chinese sentence")
+    sentence_english: Optional[str] = Field(None, description="English translation")
+    jyutping: Optional[str] = Field(None, description="Jyutping romanization")
+    context: str = Field(..., description="Context/scenario (e.g., 'home', 'school', 'park')")
+    difficulty: str = Field(default="easy", description="Difficulty level: easy, medium, hard")
+
+
+class SentenceGenerationResult(BaseModel):
+    """Result of sentence generation for a word"""
+    word: str = Field(..., description="English word")
+    word_cantonese: str = Field(..., description="Cantonese word (Traditional Chinese)")
+    sentences: List[GeneratedSentence] = Field(..., description="List of generated example sentences")
+    total_generated: int = Field(..., description="Number of sentences generated")
 

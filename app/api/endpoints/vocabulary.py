@@ -1,12 +1,17 @@
 """
 Vocabulary word endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, File, UploadFile, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
-from typing import List, Optional
+from typing import List, Optional, Dict
 import uuid
+from datetime import datetime
+from pathlib import Path
+import aiofiles
+import os
+import json
 
 from app.db.session import get_db
 from app.schemas.vocabulary import (
@@ -19,8 +24,11 @@ from app.schemas.vocabulary import (
     ExternalWordLearningResponse
 )
 from app.models.vocabulary import Word, WordProgress, Category
+from app.models.generated_sentences import GeneratedSentence as GeneratedSentenceModel
 from app.models.user import User, Child
 from app.core.security import get_current_active_user
+from app.core.category_colors import get_category_color
+from app.services.sentence_generator import get_sentence_generator, SentenceGenerationResult
 
 router = APIRouter()
 
@@ -218,6 +226,7 @@ async def update_word_progress(
         db.add(progress)
     
     # Update progress
+    old_exposure_count = progress.exposure_count or 0
     update_data = progress_data.dict(exclude_unset=True)
     for field, value in update_data.items():
         setattr(progress, field, value)
@@ -229,11 +238,10 @@ async def update_word_progress(
         else:
             progress.success_rate = 0.0
     
-    # Update child's aggregate stats
-    if is_new_word or (progress.exposure_count == 1):
-        # First time encountering this word
+    # Update child's aggregate stats (only for first exposure to a new word)
+    if is_new_word and progress.exposure_count == 1:
+        # First time encountering this word - increment counters
         child.words_learned = (child.words_learned or 0) + 1
-        child.today_progress = (child.today_progress or 0) + 1
         child.xp = (child.xp or 0) + 10  # Award XP for learning new word
         
         # Level up logic (100 XP per level)
@@ -293,7 +301,15 @@ async def update_word_progress(
     tags=["Mobile Integration"]
 )
 async def record_external_word_learning(
-    learning_event: ExternalWordLearning,
+    word: str = Form(..., description="The word that was learned"),
+    child_id: str = Form(..., description="ID of the child who learned the word"),
+    source: str = Form(..., description="Source of learning (e.g., object_detection, physical_activity)"),
+    timestamp: str = Form(..., description="ISO 8601 timestamp when word was learned"),
+    word_id: Optional[str] = Form(None, description="Optional word ID if known"),
+    confidence: Optional[float] = Form(None, description="Detection confidence (0.0-1.0)"),
+    image_url: Optional[str] = Form(None, description="Image URL (if not uploading file)"),
+    metadata: Optional[str] = Form(None, description="Additional metadata as JSON string"),
+    image: Optional[UploadFile] = File(None, description="Optional image file from camera"),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -307,35 +323,101 @@ async def record_external_word_learning(
     - **XP rewards**: Awards 10 XP for first exposure to a word
     - **Level progression**: Automatically levels up the child (100 XP per level)
     - **Learning sources**: Tracks source (object_detection, physical_activity, etc.)
+    - **Direct image upload**: Upload image file directly without separate API call
     
     **Use Cases:**
     - Mobile app with object detection identifies a word from a photo
     - Physical activity sensors detect kinesthetic learning
     - External educational tools integrate with the platform
     
-    **Request Body:**
-    - `word`: The word text (will be created if it doesn't exist)
-    - `child_id`: UUID of the child
-    - `timestamp`: ISO 8601 timestamp of when the word was learned
-    - `source`: Source identifier (e.g., "object_detection", "physical_activity")
+    **Request (multipart/form-data):**
+    - `word`: The word text (required)
+    - `child_id`: UUID of the child (required)
+    - `timestamp`: ISO 8601 timestamp (required)
+    - `source`: Source identifier (required)
     - `word_id`: (Optional) If you already know the word ID
     - `confidence`: (Optional) Confidence score for ML-based detection (0.0-1.0)
-    - `image_url`: (Optional) URL of the image used for detection
-    - `metadata`: (Optional) Additional custom data
+    - `image_url`: (Optional) URL of the image (use if image is already hosted)
+    - `image`: (Optional) Image file upload (JPG, PNG, etc.) - direct from camera
+    - `metadata`: (Optional) Additional custom data as JSON string
+    
+    **Mobile Integration Workflow (Simplified - Single API Call):**
+    1. Mobile app captures photo and performs object detection
+    2. Mobile calls THIS endpoint with form-data including the image file
+    3. Backend saves image, records progress, awards XP, and returns updated stats
+    
+    **Note:** You can either provide `image` (file upload) OR `image_url` (string), not both.
+    If both are provided, the file upload takes precedence.
     """
+    # Handle image file upload if provided
+    final_image_url = image_url
+    if image and image.filename:
+        try:
+            # Validate file type
+            ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+            file_ext = Path(image.filename).suffix.lower()
+            if file_ext not in ALLOWED_EXTENSIONS:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+                )
+            
+            # Create uploads directory
+            UPLOAD_DIR = Path("uploads/images")
+            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            
+            # Generate unique filename
+            unique_filename = f"{uuid.uuid4()}{file_ext}"
+            file_path = UPLOAD_DIR / unique_filename
+            
+            # Save file
+            async with aiofiles.open(file_path, 'wb') as f:
+                content = await image.read()
+                await f.write(content)
+            
+            # Generate URL
+            base_url = os.getenv("API_BASE_URL", "http://localhost:8000")
+            final_image_url = f"{base_url}/uploads/images/{unique_filename}"
+            print(f"[External Word Learning] Image uploaded: {final_image_url}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[External Word Learning] Image upload failed: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to upload image: {str(e)}"
+            )
+    
+    # Parse metadata if provided
+    metadata_dict = None
+    if metadata:
+        try:
+            metadata_dict = json.loads(metadata)
+        except json.JSONDecodeError:
+            print(f"[External Word Learning] Invalid metadata JSON: {metadata}")
+    
+    # Parse timestamp
     try:
-        print(f"[External Word Learning] Received request: word={learning_event.word}, child_id={learning_event.child_id}, source={learning_event.source}")
+        timestamp_dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid timestamp format. Use ISO 8601 format."
+        )
+    
+    try:
+        print(f"[External Word Learning] Received request: word={word}, child_id={child_id}, source={source}")
         
         # Verify child exists
         result = await db.execute(
-            select(Child).where(Child.id == learning_event.child_id)
+            select(Child).where(Child.id == child_id)
         )
         child = result.scalar_one_or_none()
         if not child:
-            print(f"[External Word Learning] ERROR: Child not found: {learning_event.child_id}")
+            print(f"[External Word Learning] ERROR: Child not found: {child_id}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Child not found: {learning_event.child_id}"
+                detail=f"Child not found: {child_id}"
             )
     except HTTPException:
         raise
@@ -350,21 +432,26 @@ async def record_external_word_learning(
     
     # Find the word by ID or word text
     word_created = False
-    if learning_event.word_id:
+    if word_id:
         result = await db.execute(
-            select(Word).where(Word.id == learning_event.word_id)
+            select(Word).where(Word.id == word_id)
         )
-        word = result.scalar_one_or_none()
+        word_obj = result.scalar_one_or_none()
     else:
         # Try to find word by text (case-insensitive)
         result = await db.execute(
-            select(Word).where(Word.word.ilike(learning_event.word))
+            select(Word).where(Word.word.ilike(word))
         )
-        word = result.scalar_one_or_none()
+        word_obj = result.scalar_one_or_none()
     
-    if not word:
+    # If word exists and image_url provided, update it
+    if word_obj and final_image_url and not word_obj.image_url:
+        word_obj.image_url = final_image_url
+        print(f"[External Word Learning] Updated image URL for existing word: {word_obj.word}")
+    
+    if not word_obj:
         # Create new word from object detection
-        print(f"[External Word Learning] Creating new word: '{learning_event.word}'")
+        print(f"[External Word Learning] Creating new word: '{word}'")
         word_created = True
         
         # Ensure "general" category exists
@@ -374,43 +461,49 @@ async def record_external_word_learning(
         general_category = result.scalar_one_or_none()
         if not general_category:
             print(f"[External Word Learning] Creating 'general' category")
+            # Get count for color assignment
+            result_count = await db.execute(select(Category))
+            existing_count = len(result_count.scalars().all())
+            
             general_category = Category(
                 id=str(uuid.uuid4()),
                 name="general",
+                name_cantonese="一般",
                 description="Words learned from external sources",
+                description_cantonese="從外部來源學習的詞語",
                 icon="📝",
-                color="bg-gray",
+                color=get_category_color("general", existing_count),
                 sort_order=99
             )
             db.add(general_category)
             await db.flush()  # Ensure category is created before creating word
         
-        word = Word(
+        word_obj = Word(
             id=str(uuid.uuid4()),
-            word=learning_event.word.capitalize(),
+            word=word.capitalize(),
             category=general_category.id,  # Use category ID, not name
             difficulty="easy",  # Use valid enum value: easy, medium, or hard
-            definition=f"A word learned from {learning_event.source}",
-            example=f"I saw a {learning_event.word.lower()}.",
+            definition=f"A word learned from {source}",
+            example=f"I saw a {word.lower()}.",
             pronunciation=None,
             physical_action=None,
-            image_url=None,
+            image_url=final_image_url,
             audio_url=None,
-            contexts=[learning_event.source],
+            contexts=[source],
             related_words=[]
         )
-        db.add(word)
+        db.add(word_obj)
         
         # Increment category word count
         general_category.word_count = (general_category.word_count or 0) + 1
         print(f"[External Word Learning] Updated category word count: {general_category.word_count}")
-        print(f"[External Word Learning] New word created: {word.word} (ID: {word.id})")
+        print(f"[External Word Learning] New word created: {word_obj.word} (ID: {word_obj.id})")
     
     # Get or create progress
     result = await db.execute(
         select(WordProgress).where(
-            WordProgress.child_id == learning_event.child_id,
-            WordProgress.word_id == word.id
+            WordProgress.child_id == child_id,
+            WordProgress.word_id == word_obj.id
         )
     )
     progress = result.scalar_one_or_none()
@@ -419,8 +512,8 @@ async def record_external_word_learning(
     if not progress:
         is_new_word = True
         progress = WordProgress(
-            child_id=learning_event.child_id,
-            word_id=word.id,
+            child_id=child_id,
+            word_id=word_obj.id,
             exposure_count=0,
             total_attempts=0,
             correct_attempts=0
@@ -429,12 +522,12 @@ async def record_external_word_learning(
     
     # Increment exposure count
     progress.exposure_count += 1
-    progress.last_practiced = learning_event.timestamp
+    progress.last_practiced = timestamp_dt
     
     # Track learning modality based on source
-    if learning_event.source == 'object_detection':
+    if source == 'object_detection':
         progress.visual_exposures = (progress.visual_exposures or 0) + 1
-    elif learning_event.source == 'physical_activity':
+    elif source == 'physical_activity':
         progress.kinesthetic_exposures = (progress.kinesthetic_exposures or 0) + 1
     
     # Mark as correct attempt (external sources are considered successful)
@@ -443,6 +536,7 @@ async def record_external_word_learning(
     progress.success_rate = progress.correct_attempts / progress.total_attempts
     
     # Update child's aggregate stats (only for first exposure)
+    leveled_up = False
     if is_new_word or progress.exposure_count == 1:
         child.words_learned = (child.words_learned or 0) + 1
         child.today_progress = (child.today_progress or 0) + 1
@@ -451,46 +545,64 @@ async def record_external_word_learning(
         # Level up logic (100 XP per level)
         if child.xp >= child.level * 100:
             child.level += 1
+            leveled_up = True
     
     await db.commit()
     await db.refresh(progress)
     await db.refresh(child)
-    await db.refresh(word)
+    await db.refresh(word_obj)
+    
+    # Generate AI sentences for new words (async, in background)
+    if word_created or is_new_word:
+        try:
+            print(f"[External Word Learning] Generating AI sentences for new word: {word_obj.word}")
+            generator = get_sentence_generator()
+            await generator.generate_sentences(
+                word=word_obj,
+                num_sentences=3,
+                contexts=["home", "school"],
+                db=db,
+                save_to_db=True
+            )
+            print(f"[External Word Learning] AI sentences generated and saved for: {word_obj.word}")
+        except Exception as e:
+            # Don't fail the whole request if sentence generation fails
+            print(f"[External Word Learning] WARNING: Failed to generate sentences: {e}")
     
     # Get category name for response
     result = await db.execute(
-        select(Category).where(Category.id == word.category)
+        select(Category).where(Category.id == word_obj.category)
     )
     word_category = result.scalar_one_or_none()
     category_name = word_category.name if word_category else None
     
-    print(f"[External Word Learning] SUCCESS: {word.word} learned by child {child.id}, XP awarded: {10 if (is_new_word or progress.exposure_count == 1) else 0}, Word created: {word_created}")
+    print(f"[External Word Learning] SUCCESS: {word_obj.word} learned by child {child.id}, XP awarded: {10 if (is_new_word or progress.exposure_count == 1) else 0}, Word created: {word_created}")
     
     # Prepare word response data for frontend
     word_data = {
-        "id": word.id,
-        "word": word.word,
-        "category": word.category,
+        "id": word_obj.id,
+        "word": word_obj.word,
+        "category": word_obj.category,
         "category_name": category_name,
-        "pronunciation": word.pronunciation,
-        "definition": word.definition,
-        "example": word.example,
-        "difficulty": word.difficulty,
-        "physical_action": word.physical_action,
-        "image_url": word.image_url,
-        "audio_url": word.audio_url,
-        "contexts": word.contexts or [],
-        "related_words": word.related_words or [],
-        "total_exposures": word.total_exposures,
-        "success_rate": word.success_rate,
-        "is_active": word.is_active,
-        "created_at": word.created_at
+        "pronunciation": word_obj.pronunciation,
+        "definition": word_obj.definition,
+        "example": word_obj.example,
+        "difficulty": word_obj.difficulty,
+        "physical_action": word_obj.physical_action,
+        "image_url": word_obj.image_url,
+        "audio_url": word_obj.audio_url,
+        "contexts": word_obj.contexts or [],
+        "related_words": word_obj.related_words or [],
+        "total_exposures": word_obj.total_exposures,
+        "success_rate": word_obj.success_rate,
+        "is_active": word_obj.is_active,
+        "created_at": word_obj.created_at
     }
     
     return {
         "success": True,
-        "word": word.word,
-        "word_id": word.id,
+        "word": word_obj.word,
+        "word_id": word_obj.id,
         "word_data": word_data,
         "word_created": word_created,
         "child_id": child.id,
@@ -499,6 +611,150 @@ async def record_external_word_learning(
         "total_xp": child.xp,
         "level": child.level,
         "words_learned": child.words_learned,
-        "source": learning_event.source,
-        "timestamp": learning_event.timestamp
+        "source": source,
+        "timestamp": timestamp_dt,
+        "level_up": leveled_up,
     }
+
+
+@router.post(
+    "/{word_id}/generate-sentences",
+    response_model=SentenceGenerationResult,
+    summary="Generate example sentences for a word",
+    description="""
+    Generate age-appropriate Cantonese example sentences for a vocabulary word using AI.
+    
+    This endpoint uses LLM to create contextual, natural sentences that demonstrate
+    how the word is used in everyday situations relevant to Hong Kong preschoolers.
+    
+    **Features:**
+    - 3-5 example sentences per word
+    - Multiple contexts (home, school, park, etc.)
+    - Includes Jyutping romanization
+    - English translations provided
+    - Age-appropriate language (3-5 years old)
+    - Difficulty levels (easy, medium, hard)
+    
+    **Use Cases:**
+    - Show examples after object detection
+    - Enhance word learning with contextual usage
+    - Provide variety in teaching materials
+    - Help parents understand word usage
+    
+    **Parameters:**
+    - `word_id`: UUID of the word
+    - `num_sentences`: Number of sentences to generate (default 3, max 5)
+    - `contexts`: Optional list of specific contexts (home, school, park, supermarket, playground, meal_time, bedtime)
+    
+    **Response:**
+    - Generated sentences with Traditional Chinese text
+    - Jyutping romanization for pronunciation
+    - English translations
+    - Context labels (where the word might be used)
+    - Difficulty ratings
+    
+    **Note:** First request may take 5-10 seconds. Results are not cached in this version.
+    """,
+    tags=["AI Features"]
+)
+async def generate_word_sentences(
+    word_id: str,
+    num_sentences: int = Query(default=3, ge=1, le=5, description="Number of sentences to generate"),
+    contexts: Optional[List[str]] = Query(default=None, description="Specific contexts (optional)"),
+    db: AsyncSession = Depends(get_db)
+):
+    """Generate example sentences for a word using AI"""
+    # Get word with category relationship
+    result = await db.execute(
+        select(Word).options(selectinload(Word.category_rel)).where(Word.id == word_id)
+    )
+    word = result.scalar_one_or_none()
+    
+    if not word:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Word not found: {word_id}"
+        )
+    
+    # Generate sentences
+    try:
+        generator = get_sentence_generator()
+        result = await generator.generate_sentences(
+            word=word,
+            num_sentences=num_sentences,
+            contexts=contexts,
+            db=db,
+            save_to_db=True  # Save to database
+        )
+        return result
+    except Exception as e:
+        print(f"[GenerateSentences] ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate sentences: {str(e)}"
+        )
+
+
+@router.get(
+    "/{word_id}/sentences",
+    response_model=List[Dict],
+    summary="Get saved example sentences for a word",
+    description="""
+    Retrieve AI-generated example sentences that have been saved to the database.
+    
+    Returns sentences with:
+    - Traditional Chinese text
+    - Jyutping romanization
+    - English translation
+    - Context information (home, school, park, etc.)
+    - Difficulty level
+    
+    If no sentences are saved, returns empty list. Use the /generate-sentences endpoint
+    to generate and save new sentences.
+    """
+)
+async def get_word_sentences(
+    word_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Get saved example sentences for a word"""
+    # Verify word exists
+    result = await db.execute(
+        select(Word).where(Word.id == word_id)
+    )
+    word = result.scalar_one_or_none()
+    
+    if not word:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Word not found: {word_id}"
+        )
+    
+    # Get saved sentences
+    result = await db.execute(
+        select(GeneratedSentenceModel)
+        .where(GeneratedSentenceModel.word_id == word_id)
+        .where(GeneratedSentenceModel.is_active == True)
+        .order_by(GeneratedSentenceModel.created_at.desc())
+    )
+    sentences = result.scalars().all()
+    
+    # Increment view count
+    for sent in sentences:
+        sent.view_count = (sent.view_count or 0) + 1
+    await db.commit()
+    
+    return [
+        {
+            "id": sent.id,
+            "sentence": sent.sentence,
+            "sentence_english": sent.sentence_english,
+            "jyutping": sent.jyutping,
+            "context": sent.context,
+            "difficulty": sent.difficulty,
+            "created_at": sent.created_at
+        }
+        for sent in sentences
+    ]

@@ -8,36 +8,40 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, date
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
-import anthropic
-import openai
 
 from app.models.daily_words import DailyWordTracking, GeneratedStory
 from app.models.vocabulary import Word
 from app.models.user import Child
 from app.schemas.stories import DailyWordSummary, StoryGenerationRequest
+from app.core.config import settings
+from app.services.llm_service import LLMService, LLMProvider, LLMMessage
 
 
 class StoryGeneratorService:
     """Service for generating AI-powered bedtime stories"""
     
-    def __init__(self):
-        # Try to use Claude (Anthropic) first, fallback to OpenAI
-        self.anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-        self.openai_key = os.getenv("OPENAI_API_KEY")
-        
-        if self.anthropic_key:
-            self.client = anthropic.Anthropic(api_key=self.anthropic_key)
-            self.ai_model = "claude-3-5-sonnet-20241022"
-            self.provider = "anthropic"
-        elif self.openai_key:
-            self.client = openai.OpenAI(api_key=self.openai_key)
-            self.ai_model = "gpt-4o"
-            self.provider = "openai"
+    def __init__(self, provider: Optional[LLMProvider] = None):
+        # Determine which LLM provider to use
+        # Priority: config setting > environment variable > Ollama (for local testing)
+        if provider:
+            self.provider = provider
+        elif hasattr(settings, 'LLM_PROVIDER') and settings.LLM_PROVIDER:
+            self.provider = LLMProvider(settings.LLM_PROVIDER)
+        elif os.getenv("ANTHROPIC_API_KEY"):
+            self.provider = LLMProvider.ANTHROPIC
+        elif os.getenv("OPENAI_API_KEY"):
+            self.provider = LLMProvider.OPENAI
         else:
-            self.client = None
-            self.ai_model = None
-            self.provider = None
-            print("[StoryGenerator] Warning: No AI API keys found. Story generation will be disabled.")
+            # Default to Ollama for local testing
+            self.provider = LLMProvider.OLLAMA
+            print("[StoryGenerator] Using Ollama for local story generation")
+        
+        try:
+            self.llm_service = LLMService(provider=self.provider)
+            print(f"[StoryGenerator] Initialized with provider: {self.provider}")
+        except Exception as e:
+            print(f"[StoryGenerator] Warning: Could not initialize LLM service: {e}")
+            self.llm_service = None
     
     async def get_daily_words(
         self,
@@ -91,6 +95,180 @@ class StoryGeneratorService:
             ))
         
         return summaries
+
+    def _build_story_ssml(self, text: str) -> str:
+        """Create simple SSML from story text"""
+        if not text:
+            return "<speak></speak>"
+        paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+        if not paragraphs:
+            return f"<speak>{text}</speak>"
+        ssml_paragraphs = "".join([f"<p>{p}</p>" for p in paragraphs])
+        return f"<speak>{ssml_paragraphs}</speak>"
+    
+    def _parse_story_json(self, ai_response: str) -> dict:
+        """Parse JSON response from AI with error handling and auto-fixes"""
+        import json
+        import re
+        
+        # Log the full response for debugging
+        print(f"[StoryGenerator] AI Response Length: {len(ai_response)}")
+        print(f"[StoryGenerator] AI Response Preview (first 1000 chars):")
+        print(ai_response[:1000])
+        print(f"[StoryGenerator] AI Response End (last 500 chars):")
+        print(ai_response[-500:])
+        
+        # Extract JSON from markdown code blocks if present
+        original_response = ai_response
+        if "```json" in ai_response:
+            ai_response = ai_response.split("```json")[1].split("```")[0].strip()
+        elif "```" in ai_response:
+            # Try to get the first code block
+            parts = ai_response.split("```")
+            if len(parts) >= 3:
+                ai_response = parts[1].strip()
+                # Remove language identifier if present
+                if ai_response.startswith(('json', 'JSON')):
+                    ai_response = ai_response[4:].strip()
+        
+        # Try to parse JSON directly first
+        try:
+            parsed = json.loads(ai_response)
+            print(f"[StoryGenerator] Successfully parsed JSON on first attempt")
+            return parsed
+        except json.JSONDecodeError as e:
+            print(f"[StoryGenerator] Initial JSON parse failed: {str(e)}")
+            print(f"[StoryGenerator] Error position: line {e.lineno}, column {e.colno}")
+            print(f"[StoryGenerator] Attempting to fix common JSON issues...")
+            
+            # Try common fixes
+            fixed_response = ai_response
+            
+            # Fix 1: Remove trailing commas before } or ]
+            fixed_response = re.sub(r',\s*([}\]])', r'\1', fixed_response)
+            
+            # Fix 2: Remove any trailing commas at the end
+            fixed_response = fixed_response.rstrip().rstrip(',')
+            
+            # Fix 3: Try to find and extract just the JSON object
+            json_match = re.search(r'\{.*\}', fixed_response, re.DOTALL)
+            if json_match:
+                fixed_response = json_match.group(0)
+            
+            try:
+                parsed = json.loads(fixed_response)
+                print(f"[StoryGenerator] Successfully parsed JSON after fixes")
+                return parsed
+            except json.JSONDecodeError as e2:
+                print(f"[StoryGenerator] JSON parse still failed after fixes")
+                print(f"[StoryGenerator] Error: {str(e2)}")
+                print(f"[StoryGenerator] Error position: line {e2.lineno}, column {e2.colno}")
+                
+                # Last resort: try to extract just the essential fields using multiple patterns
+                print(f"[StoryGenerator] Attempting regex extraction as last resort...")
+                
+                try:
+                    # Try to extract title
+                    title_match = re.search(r'"title"\s*:\s*"([^"]+)"', ai_response)
+                    if not title_match:
+                        title_match = re.search(r"'title'\s*:\s*'([^']+)'", ai_response)
+                    
+                    # Try multiple patterns for content
+                    content_match = None
+                    
+                    # Pattern 1: Match until next JSON field
+                    content_match = re.search(
+                        r'"content"\s*:\s*"((?:[^"\\]|\\.)*)"\s*[,}]',
+                        ai_response,
+                        re.DOTALL
+                    )
+                    
+                    if not content_match:
+                        # Pattern 2: Match with escaped quotes
+                        content_match = re.search(
+                            r'"content"\s*:\s*"([^"]*(?:\\"[^"]*)*)"',
+                            ai_response,
+                            re.DOTALL
+                        )
+                    
+                    if not content_match:
+                        # Pattern 3: More aggressive - match everything between "content": " and next "
+                        content_match = re.search(
+                            r'"content"\s*:\s*"(.*?)"(?:\s*[,}])',
+                            ai_response,
+                            re.DOTALL
+                        )
+                    
+                    # Try to extract word_usage as well
+                    word_usage = {}
+                    word_usage_match = re.search(
+                        r'"word_usage"\s*:\s*\{([^}]*)\}',
+                        ai_response,
+                        re.DOTALL
+                    )
+                    if word_usage_match:
+                        word_usage_str = word_usage_match.group(1)
+                        # Parse word usage entries
+                        for entry in re.finditer(r'"([^"]+)"\s*:\s*"([^"]*)"', word_usage_str):
+                            word_usage[entry.group(1)] = entry.group(2)
+                    
+                    if title_match and content_match:
+                        print(f"[StoryGenerator] Successfully extracted essential fields using regex")
+                        extracted_content = content_match.group(1)
+                        # Basic unescape
+                        extracted_content = extracted_content.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+                        
+                        result = {
+                            "title": title_match.group(1),
+                            "title_english": "Story",
+                            "content": extracted_content,
+                            "word_usage": word_usage
+                        }
+                        print(f"[StoryGenerator] Extracted: title={result['title'][:30]}..., content_length={len(result['content'])}, word_usage_count={len(word_usage)}")
+                        return result
+                    else:
+                        print(f"[StoryGenerator] Regex extraction failed - title_match={title_match is not None}, content_match={content_match is not None}")
+                        
+                except Exception as regex_error:
+                    print(f"[StoryGenerator] Regex extraction exception: {str(regex_error)}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # Re-raise the original error with more context
+                print(f"[StoryGenerator] All parsing attempts failed. Full response:")
+                print(ai_response)
+                raise ValueError(
+                    f"Failed to parse AI response as JSON. Error: {str(e2)}. "
+                    f"Please check the backend logs for the full response."
+                )
+    
+    def _clean_story_content(self, content: str) -> str:
+        """Clean story content by removing JSON artifacts and fixing escape sequences"""
+        if not content:
+            return ""
+        
+        import re
+        
+        # Remove any JSON structure that leaked into content
+        # Look for patterns like: \n\nword_usage": { or },\n"moral":
+        content = re.sub(r'\\n\\n\s*["\']?\w+["\']?\s*:\s*\{.*$', '', content, flags=re.DOTALL)
+        content = re.sub(r'\}\s*,\s*["\']?\w+["\']?\s*:.*$', '', content, flags=re.DOTALL)
+        
+        # Fix escaped newlines and quotes
+        content = content.replace('\\n', '\n')
+        content = content.replace('\\"', '"')
+        content = content.replace("\\'", "'")
+        
+        # Remove any trailing JSON fragments
+        content = re.sub(r'\s*[,\}\]]+\s*$', '', content)
+        
+        # Clean up multiple consecutive newlines
+        content = re.sub(r'\n{3,}', '\n\n', content)
+        
+        # Strip whitespace
+        content = content.strip()
+        
+        return content
     
     def _create_story_prompt(
         self,
@@ -146,7 +324,7 @@ class StoryGeneratorService:
    - 結尾：溫馨、正面的結局，適合入睡
 
 **輸出格式：**
-請只輸出JSON格式，包含以下字段：
+請直接輸出JSON，不要先解釋或思考過程。立即開始輸出JSON格式的故事（不要有多餘的文字說明），包含以下字段：
 ```json
 {{
   "title": "故事標題（繁體中文）",
@@ -160,7 +338,12 @@ class StoryGeneratorService:
 }}
 ```
 
-請確保JSON格式正確，可以被解析。"""
+**重要提醒：**
+1. 確保輸出的JSON格式正確，沒有語法錯誤
+2. 字符串中的引號要正確轉義
+3. 不要在最後一個字段後面加逗號
+4. 確保所有括號完整配對
+"""
         
         return prompt
     
@@ -171,8 +354,8 @@ class StoryGeneratorService:
     ) -> tuple[Optional[GeneratedStory], List[DailyWordSummary], float]:
         """Generate a bedtime story using AI"""
         
-        if not self.client:
-            raise ValueError("No AI API key configured. Please set ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable.")
+        if not self.llm_service:
+            raise ValueError("LLM service not initialized. Please configure an API key or run Ollama locally.")
         
         start_time = time.time()
         
@@ -204,60 +387,114 @@ class StoryGeneratorService:
             word_count_target=request.word_count_target
         )
         
-        # Call AI API
+        # Call AI API using unified LLM service
         try:
-            if self.provider == "anthropic":
-                response = self.client.messages.create(
-                    model=self.ai_model,
-                    max_tokens=2000,
-                    messages=[{
-                        "role": "user",
-                        "content": prompt
-                    }]
-                )
-                ai_response = response.content[0].text
-            else:  # openai
-                response = self.client.chat.completions.create(
-                    model=self.ai_model,
-                    messages=[{
-                        "role": "user",
-                        "content": prompt
-                    }],
-                    temperature=0.8,
-                    max_tokens=2000
-                )
-                ai_response = response.choices[0].message.content
+            if not self.llm_service:
+                raise ValueError("LLM service not initialized. Please configure an API key or run Ollama locally.")
             
-            # Parse JSON response
-            import json
-            # Extract JSON from markdown code blocks if present
-            if "```json" in ai_response:
-                ai_response = ai_response.split("```json")[1].split("```")[0].strip()
-            elif "```" in ai_response:
-                ai_response = ai_response.split("```")[1].split("```")[0].strip()
+            # Create messages for the LLM
+            messages = [
+                LLMMessage(role="user", content=prompt)
+            ]
             
-            story_data = json.loads(ai_response)
+            # Generate story using LLM service
+            # Note: qwen3:4b uses Chain-of-Thought and needs more tokens for thinking + output
+            ai_response = await self.llm_service.generate(
+                messages=messages,
+                temperature=0.8,
+                max_tokens=5000
+            )
+            
+            # Parse JSON response with robust error handling
+            story_data = self._parse_story_json(ai_response)
+
+            story_id = str(uuid.uuid4())
+            
+            # Extract and clean story content
+            story_text_raw = story_data.get("content", "")
+            print(f"[StoryGenerator] Raw content length: {len(story_text_raw)}")
+            print(f"[StoryGenerator] Raw content preview (first 200 chars): {story_text_raw[:200]}")
+            
+            story_text = self._clean_story_content(story_text_raw)
+            print(f"[StoryGenerator] Cleaned content length: {len(story_text)}")
+            print(f"[StoryGenerator] Cleaned content preview (first 200 chars): {story_text[:200]}")
+            
+            # If cleaning removed too much, use raw (but still fix escape sequences)
+            if len(story_text) < 50 and len(story_text_raw) > 50:
+                print(f"[StoryGenerator] Warning: Cleaning removed too much content, using raw with basic fixes")
+                story_text = story_text_raw.replace('\\n', '\n').replace('\\"', '"')
+            
+            vocab_terms = [w.word_cantonese or w.word for w in words]
+            vocab_used = ", ".join(vocab_terms)
+            if len(vocab_used) > 500:
+                vocab_used = vocab_used[:497] + "..."
+
+            # Filter and ensure word_usage only contains words that were actually learned
+            # Create a set of valid word keys from the words list
+            valid_word_keys = {(w.word_cantonese or w.word) for w in words}
+            
+            # Get AI's word_usage and filter to only include valid words
+            ai_word_usage = story_data.get("word_usage", {})
+            word_usage_dict = {}
+            
+            # First, add words from AI's response that match our learned words
+            for word_key, usage in ai_word_usage.items():
+                if word_key in valid_word_keys:
+                    word_usage_dict[word_key] = usage
+            
+            # Then, add any missing words from our learned list with default descriptions
+            for w in words:
+                word_key = w.word_cantonese or w.word
+                if word_key not in word_usage_dict:
+                    # Add missing word with default description
+                    word_usage_dict[word_key] = w.definition_cantonese or w.example_cantonese or f"用於故事中 (Used in the story)"
+            
+            print(f"[StoryGenerator] Words learned today: {len(words)}")
+            print(f"[StoryGenerator] Words in AI response: {len(ai_word_usage)}")
+            print(f"[StoryGenerator] Final word_usage count: {len(word_usage_dict)}")
+
+            default_audio_setting = None
+            if settings.STORY_AUDIO_VOICE_SETTINGS:
+                default_audio_setting = settings.STORY_AUDIO_VOICE_SETTINGS[0]
             
             # Create story record
             story = GeneratedStory(
-                id=str(uuid.uuid4()),
+                id=story_id,
                 child_id=request.child_id,
                 title=story_data.get("title", "今日的故事"),
                 title_english=story_data.get("title_english"),
                 theme=request.theme,
-                content_cantonese=story_data.get("content", ""),
+                generated_at=datetime.utcnow(),
+                generated_by="story_generator",
+                content_cantonese=story_text,
                 content_english=None,  # TODO: Add translation if requested
                 jyutping=None,  # TODO: Add jyutping for difficult words
+                vocab_used=vocab_used,
+                story_text=story_text,
+                story_text_ssml=self._build_story_ssml(story_text),
+                story_generate_provdier=str(self.provider),
+                story_generate_model=self.llm_service.model if self.llm_service else "unknown",
                 featured_words=[w.word_id for w in words],
-                word_usage=story_data.get("word_usage", {}),
+                word_usage=word_usage_dict,
                 audio_url=None,  # TODO: Generate TTS audio
                 reading_time_minutes=request.reading_time_minutes,
                 word_count=len(story_data.get("content", "")),
                 difficulty_level="easy",
                 cultural_references=None,  # TODO: Extract cultural references
-                ai_model=self.ai_model,
+                ai_model=self.llm_service.model if self.llm_service else "unknown",
                 generation_prompt=prompt,
-                generation_time_seconds=time.time() - start_time
+                generation_time_seconds=time.time() - start_time,
+                audio_filename=f"story_{story_id}.mp3",
+                audio_generate_provider=(
+                    default_audio_setting.get("audio_generate_provider")
+                    if default_audio_setting
+                    else None
+                ),
+                audio_generate_voice_name=(
+                    default_audio_setting.get("audio_generate_voice_name")
+                    if default_audio_setting
+                    else None
+                )
             )
             
             # Save to database

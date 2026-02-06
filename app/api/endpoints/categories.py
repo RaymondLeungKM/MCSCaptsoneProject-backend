@@ -12,6 +12,7 @@ from app.schemas.vocabulary import CategoryCreate, CategoryUpdate, CategoryRespo
 from app.models.vocabulary import Category, Word
 from app.models.user import User
 from app.core.security import get_current_active_user
+from app.core.category_colors import get_category_color
 
 router = APIRouter()
 
@@ -66,12 +67,23 @@ async def create_category(
     current_user: User = Depends(get_current_active_user)
 ):
     """Create new category (admin only)"""
+    # Get count of existing categories for color assignment
+    result = await db.execute(select(Category))
+    existing_count = len(result.scalars().all())
+    
+    # Auto-assign color if not provided or if default value
+    color = category_data.color
+    if not color or color in ["bg-sky", "bg-slate-400"]:
+        color = get_category_color(category_data.name, existing_count)
+    
     category = Category(
         id=str(uuid.uuid4()),
         name=category_data.name,
+        name_cantonese=category_data.name_cantonese,
         icon=category_data.icon,
-        color=category_data.color,
+        color=color,
         description=category_data.description,
+        description_cantonese=category_data.description_cantonese,
     )
     
     db.add(category)

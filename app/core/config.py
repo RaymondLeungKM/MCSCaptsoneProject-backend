@@ -1,7 +1,7 @@
 """
 Application configuration
 """
-from typing import List
+from typing import List, Dict
 from pydantic_settings import BaseSettings
 
 
@@ -34,14 +34,34 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     
+    # AI/LLM Configuration
+    # LLM_PROVIDER: "openai", "anthropic", or "ollama"
+    LLM_PROVIDER: str = "ollama"  # Default to Ollama for local testing
+    
     # OpenAI
     OPENAI_API_KEY: str = ""
+    
+    # Anthropic Claude
+    ANTHROPIC_API_KEY: str = ""
+    
+    # Ollama (for local testing)
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "qwen3:4b"  # Lightweight model for testing
     
     # AWS S3
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
     S3_BUCKET_NAME: str = "preschool-vocab-media"
     AWS_REGION: str = "us-east-1"
+
+    # Story audio defaults (temporary sample settings)
+    STORY_AUDIO_VOICE_SETTINGS: List[Dict[str, str]] = [
+        {"audio_generate_provider": "aws", "audio_generate_voice_name": "Hiujin"},
+        {"audio_generate_provider": "google", "audio_generate_voice_name": "yue-HK-Standard-A"},
+        {"audio_generate_provider": "azure", "audio_generate_voice_name": "zh-HK-HiuGaaiNeural"},
+        {"audio_generate_provider": "aws", "audio_generate_voice_name": "Hiujin"},
+        {"audio_generate_provider": "aws", "audio_generate_voice_name": "Hiujin"},
+    ]
     
     class Config:
         env_file = ".env"

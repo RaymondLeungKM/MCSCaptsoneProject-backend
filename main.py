@@ -4,7 +4,9 @@ Main application entry point
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from app.api import api_router
 from app.core.config import settings
@@ -17,6 +19,11 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
     # Startup
     print("🚀 Starting Preschool Vocabulary Platform API...")
+    
+    # Create uploads directory if it doesn't exist
+    uploads_dir = Path("uploads/images")
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    
     # Create tables (in production, use Alembic migrations)
     # async with engine.begin() as conn:
     #     await conn.run_sync(Base.metadata.create_all)
@@ -40,6 +47,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount static files for uploaded images
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # Include API routes
 app.include_router(api_router, prefix="/api/v1")

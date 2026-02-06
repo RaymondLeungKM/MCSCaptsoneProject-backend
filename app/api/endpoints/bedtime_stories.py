@@ -145,15 +145,29 @@ async def generate_bedtime_story(
         )
     
     except ValueError as e:
+        error_msg = str(e)
+        print(f"[API] ValueError during story generation: {error_msg}")
+        
+        # Provide more user-friendly error messages
+        if "No words learned today" in error_msg:
+            detail = "No words learned today to include in story. Please complete some learning activities first."
+        elif "Failed to parse AI response" in error_msg:
+            # Include more details for debugging
+            detail = f"The AI generated an invalid story format. Error: {error_msg}"
+        else:
+            detail = error_msg
+        
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
+            detail=detail
         )
     except Exception as e:
         print(f"[API] Error generating story: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate story"
+            detail=f"Failed to generate story: {str(e)}"
         )
 
 
