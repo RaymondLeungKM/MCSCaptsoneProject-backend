@@ -1,7 +1,7 @@
 """
 Vocabulary word endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query, File, UploadFile, Form
+from fastapi import APIRouter, Depends, HTTPException, status, Query, File, UploadFile, Form, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -13,7 +13,7 @@ import aiofiles
 import os
 import json
 
-from app.db.session import get_db
+from app.db.session import get_db, AsyncSessionLocal
 from app.schemas.vocabulary import (
     WordCreate, 
     WordUpdate, 
@@ -32,6 +32,45 @@ from app.services.sentence_generator import get_sentence_generator, SentenceGene
 from app.services.word_enhancement_service import get_word_enhancement_service
 
 router = APIRouter()
+
+
+# Background task for sentence generation
+async def generate_sentences_background(word_id: str, word_text: str):
+    """
+    Background task to generate AI sentences for a word without blocking the API response.
+    This runs asynchronously after the API returns success to the user.
+    """
+    try:
+        print(f"[Background Task] Starting sentence generation for word: {word_text} (ID: {word_id})")
+        
+        # Create a new database session for the background task
+        async with AsyncSessionLocal() as db:
+            # Fetch the word with category relationship
+            result = await db.execute(
+                select(Word).options(selectinload(Word.category_rel)).where(Word.id == word_id)
+            )
+            word = result.scalar_one_or_none()
+            
+            if not word:
+                print(f"[Background Task] ERROR: Word not found: {word_id}")
+                return
+            
+            # Generate sentences
+            generator = get_sentence_generator()
+            await generator.generate_sentences(
+                word=word,
+                num_sentences=3,
+                contexts=["home", "school"],
+                db=db,
+                save_to_db=True
+            )
+            
+            print(f"[Background Task] ✓ Successfully generated and saved sentences for: {word_text}")
+            
+    except Exception as e:
+        print(f"[Background Task] ERROR generating sentences for {word_text}: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 @router.get("/", response_model=List[WordResponse])
@@ -302,6 +341,7 @@ async def update_word_progress(
     tags=["Mobile Integration"]
 )
 async def record_external_word_learning(
+    background_tasks: BackgroundTasks,
     word: str = Form(..., description="The word that was learned"),
     child_id: str = Form(..., description="ID of the child who learned the word"),
     source: str = Form(..., description="Source of learning (e.g., object_detection, physical_activity)"),
@@ -589,22 +629,14 @@ async def record_external_word_learning(
     await db.refresh(child)
     await db.refresh(word_obj)
     
-    # Generate AI sentences for new words (async, in background)
+    # Schedule AI sentence generation in background (non-blocking)
     if word_created or is_new_word:
-        try:
-            print(f"[External Word Learning] Generating AI sentences for new word: {word_obj.word}")
-            generator = get_sentence_generator()
-            await generator.generate_sentences(
-                word=word_obj,
-                num_sentences=3,
-                contexts=["home", "school"],
-                db=db,
-                save_to_db=True
-            )
-            print(f"[External Word Learning] AI sentences generated and saved for: {word_obj.word}")
-        except Exception as e:
-            # Don't fail the whole request if sentence generation fails
-            print(f"[External Word Learning] WARNING: Failed to generate sentences: {e}")
+        print(f"[External Word Learning] Scheduling background sentence generation for: {word_obj.word}")
+        background_tasks.add_task(
+            generate_sentences_background,
+            word_id=word_obj.id,
+            word_text=word_obj.word
+        )
     
     # Get category name for response
     result = await db.execute(
