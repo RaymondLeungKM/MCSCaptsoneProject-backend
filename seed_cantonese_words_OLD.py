@@ -11,6 +11,9 @@ from app.models.user import User, Child
 from app.models.vocabulary import Word, Category, WordProgress
 from app.models.content import Story, Game, Mission
 from app.models.analytics import LearningSession, DailyStats, Achievement
+from app.models.parent_analytics import DailyLearningStats, LearningInsight, WeeklyReport, ParentalControl
+from app.models.generated_sentences import GeneratedSentence
+from app.models.daily_words import DailyWordTracking
 
 
 async def seed_cantonese_data():

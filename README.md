@@ -1,128 +1,227 @@
-# Preschool Vocabulary Platform - FastAPI Backend
+# Preschool Vocabulary Platform - Backend API
 
-A comprehensive FastAPI backend for managing vocabulary learning for preschool children with adaptive learning, progress tracking, and multi-sensory engagement features.
+FastAPI backend for a Cantonese/English vocabulary learning platform for preschool children.
 
-## Features
+## 🚀 Quick Start
 
-### Core Functionality
+### Prerequisites
 
-- **User Management**: Parent authentication and child profile management
-- **Vocabulary System**: Words, categories, and personalized learning paths
-- **Content Delivery**: Interactive stories, games, and missions
-- **Progress Tracking**: Detailed analytics and learning session monitoring
-- **Adaptive Learning**: AI-powered recommendations based on child's learning style and progress
-- **Multi-sensory Learning**: Visual, auditory, and kinesthetic learning modes
+- Python 3.11+
+- PostgreSQL 13+
+- pip and virtualenv
 
-### Key Technologies
+### Local Development Setup
 
-- **FastAPI**: Modern, fast web framework
-- **SQLAlchemy 2.0**: Async ORM with PostgreSQL
-- **Pydantic**: Data validation and settings management
-- **JWT**: Secure authentication
-- **Redis**: Caching and session management
-- **Celery**: Background task processing
+1. **Create virtual environment**
 
-## Project Structure
+```bash
+python3.11 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+2. **Install dependencies**
+
+```bash
+pip install -r requirements.txt
+```
+
+3. **Configure environment**
+
+```bash
+cp .env.example .env
+# Edit .env with your database credentials
+```
+
+4. **Initialize database**
+
+```bash
+python init_db.py
+```
+
+5. **Seed data (optional)**
+
+```bash
+python seed_database.py           # Comprehensive vocabulary with 100+ words
+```
+
+6. **Run development server**
+
+```bash
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Visit: http://localhost:8000/docs for API documentation
+
+## 📚 Features
+
+- **User Management**: Parent/child accounts with authentication
+- **Vocabulary System**: Words, categories, progress tracking
+- **Content Generation**: AI-powered stories and sentences (Ollama integration)
+- **Learning Analytics**: Detailed progress tracking and insights
+- **Multi-language Support**: English and Cantonese (Traditional Chinese with Jyutping)
+- **Adaptive Learning**: Personalized learning paths based on child's progress
+
+## 🗂️ Project Structure
 
 ```
 backend/
-├── main.py                 # Application entry point
-├── requirements.txt        # Python dependencies
-├── .env.example           # Environment variables template
-├── alembic/               # Database migrations
-├── app/
-│   ├── api/
-│   │   ├── __init__.py    # API router aggregation
-│   │   └── endpoints/     # API endpoints
-│   │       ├── auth.py           # Authentication
-│   │       ├── users.py          # User management
-│   │       ├── children.py       # Child profiles
-│   │       ├── vocabulary.py     # Word management
-│   │       ├── categories.py     # Category management
-│   │       ├── stories.py        # Story content
-│   │       ├── games.py          # Game management
-│   │       ├── missions.py       # Mission system
-│   │       ├── progress.py       # Progress tracking
-│   │       ├── analytics.py      # Analytics & stats
-│   │       └── adaptive_learning.py  # AI recommendations
-│   ├── core/
-│   │   ├── config.py      # App configuration
-│   │   └── security.py    # Security utilities (JWT, hashing)
-│   ├── db/
-│   │   ├── base.py        # SQLAlchemy base
-│   │   └── session.py     # Database session management
-│   ├── models/            # SQLAlchemy models
-│   │   ├── user.py        # User & Child models
-│   │   ├── vocabulary.py  # Word & Category models
-│   │   ├── content.py     # Story, Game, Mission models
-│   │   └── analytics.py   # Learning session & stats models
-│   ├── schemas/           # Pydantic schemas
-│   │   ├── user.py
-│   │   ├── vocabulary.py
-│   │   ├── content.py
-│   │   └── analytics.py
-│   ├── services/          # Business logic
-│   │   ├── adaptive_learning.py  # Adaptive learning engine
-│   │   ├── progress.py           # Progress calculation
-│   │   └── speech.py             # Speech processing
-│   └── utils/             # Utility functions
+├── main.py                      # Application entry point
+├── init_db.py                   # Database initialization script
+├── seed_words.py                # English vocabulary data
+├── seed_cantonese_words.py      # Cantonese vocabulary data
+├── requirements.txt             # Python dependencies
+├── .env                         # Environment variables (create from .env.example)
+├── alembic/                     # Database migrations
+└── app/
+    ├── api/endpoints/           # API route handlers
+    ├── core/                    # Configuration and security
+    ├── db/                      # Database session and base
+    ├── models/                  # SQLAlchemy models
+    ├── schemas/                 # Pydantic schemas
+    └── services/                # Business logic
 ```
 
-## Database Models
+## 🔧 Key Technologies
 
-### User Models
+- **FastAPI** - Modern async web framework
+- **SQLAlchemy 2.0** - Async ORM with PostgreSQL
+- **Pydantic** - Data validation
+- **JWT** - Authentication
+- **Ollama** - Local LLM for content generation (optional)
 
-- **User**: Parent/guardian accounts
-- **Child**: Child profiles with learning preferences
-- **ChildInterest**: Child's category preferences
-
-### Vocabulary Models
-
-- **Category**: Word categories (Animals, Food, etc.)
-- **Word**: Vocabulary words with multi-sensory content
-- **WordProgress**: Child's progress on individual words
-
-### Content Models
-
-- **Story**: Interactive stories with dialogic reading prompts
-- **StoryProgress**: Story completion tracking
-- **Game**: Learning games with characteristics
-- **Mission**: Daily and offline missions
-- **MissionProgress**: Mission completion tracking
-
-### Analytics Models
-
-- **LearningSession**: Individual session tracking
-- **DailyStats**: Daily aggregated statistics
-- **Achievement**: Achievement/badge definitions
-- **ChildAchievement**: Earned achievements
-
-## API Endpoints
+## 📖 API Endpoints
 
 ### Authentication
-
-- `POST /api/v1/auth/register` - Register new parent user
-- `POST /api/v1/auth/login` - Login and get JWT token
-- `POST /api/v1/auth/token` - OAuth2 compatible token endpoint
-
-### User Management
-
-- `GET /api/v1/users/me` - Get current user profile
-- `PATCH /api/v1/users/me` - Update user profile
+- `POST /auth/register` - Register new parent account
+- `POST /auth/login` - Login
+- `GET /auth/me` - Get current user
 
 ### Children
-
-- `POST /api/v1/children` - Create child profile
-- `GET /api/v1/children` - List all children for user
-- `GET /api/v1/children/{child_id}` - Get child profile with stats
-- `PATCH /api/v1/children/{child_id}` - Update child profile
-- `DELETE /api/v1/children/{child_id}` - Delete child profile
+- `GET /children` - List all children for parent
+- `POST /children` - Create child profile
+- `GET /children/{id}` - Get child details
+- `PUT /children/{id}` - Update child profile
 
 ### Vocabulary
+- `GET /vocabulary/words` - List words (with filters)
+- `GET /vocabulary/categories` - List categories
+- `GET /vocabulary/words/{id}` - Get word details
+- `POST /vocabulary/progress` - Update learning progress
 
-- `GET /api/v1/vocabulary` - List words (with filters)
-- `GET /api/v1/vocabulary/{word_id}` - Get word details
-- `GET /api/v1/vocabulary/child/{child_id}` - Get words with progress
+### Content
+- `POST /stories/generate` - Generate AI story
+- `GET /stories/{id}` - Get story details
+- `POST /sentences/generate` - Generate example sentences
+
+### Analytics
+- `GET /analytics/child/{id}/daily-stats` - Daily learning stats
+- `GET /analytics/child/{id}/progress` - Overall progress
+- `GET /analytics/child/{id}/insights` - Learning insights
+
+Full API documentation available at `/docs` when server is running.
+
+## 🌍 Environment Variables
+
+```bash
+# Database
+DATABASE_URL=postgresql+asyncpg://user:password@localhost/dbname
+ASYNC_DATABASE_URL=postgresql+asyncpg://user:password@localhost/dbname
+
+# Security
+SECRET_KEY=your-secret-key-here
+
+# CORS (comma-separated)
+ALLOWED_ORIGINS=http://localhost:3000,http://localhost:3001
+
+# Ollama (optional - for AI content generation)
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.2:1b
+```
+
+## 🗄️ Database Models
+
+- **User** - Parent accounts
+- **Child** - Child profiles with learning preferences
+- **Category** - Vocabulary categories
+- **Word** - Vocabulary words with Cantonese/English
+- **WordProgress** - Individual word learning progress
+- **LearningSession** - Learning activity sessions
+- **Story** - Generated stories
+- **GeneratedSentence** - Example sentences
+- **DailyLearningStats** - Daily aggregated statistics
+- **WeeklyReport** - Weekly progress reports
+
+## 🚢 Production Deployment
+
+See [VM_SETUP_GUIDE.md](../VM_SETUP_GUIDE.md) in the parent directory for complete production setup instructions.
+
+### Quick Production Checklist
+
+- [ ] Set strong SECRET_KEY
+- [ ] Configure production database
+- [ ] Set ALLOWED_ORIGINS to your frontend domain
+- [ ] Use HTTPS with SSL certificates
+- [ ] Set up database backups
+- [ ] Configure monitoring and logging
+- [ ] Use systemd service for auto-restart
+- [ ] Set up Nginx reverse proxy
+
+## 🛠️ Development Commands
+
+```bash
+# Activate virtual environment
+source venv/bin/activate
+
+# Run development server
+uvicorn main:app --reload
+
+# Run with custom host/port
+uvicorn main:app --host 0.0.0.0 --port 8000
+
+# Create database migration
+alembic revision --autogenerate -m "description"
+
+# Run migrations
+alembic upgrade head
+
+# Rollback migration
+alembic downgrade -1
+```
+
+## 🐛 Troubleshooting
+
+### Database Connection Issues
+
+```bash
+# Check PostgreSQL is running
+sudo systemctl status postgresql
+
+# Test connection
+psql -h localhost -U your_user -d your_db
+```
+
+### Import Errors
+
+Make sure all model modules are imported before database initialization. The `init_db.py` script imports all necessary models.
+
+### Module Not Found
+
+```bash
+# Ensure virtual environment is activated
+source venv/bin/activate
+
+# Reinstall dependencies
+pip install -r requirements.txt
+```
+
+## 📝 License
+
+This project is for educational purposes.
+
+---
+
+**For complete VM setup instructions, see**: [VM_SETUP_GUIDE.md](../VM_SETUP_GUIDE.md)
+
 - `POST /api/v1/vocabulary` - Create word (admin)
 - `PATCH /api/v1/vocabulary/{word_id}` - Update word
 
