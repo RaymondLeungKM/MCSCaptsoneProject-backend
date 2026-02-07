@@ -107,7 +107,7 @@ class LLMService:
         
         payload = {
             "model": self.model,
-            "messages": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
+            "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
             "temperature": temperature,
             "max_tokens": max_tokens,
             **kwargs
@@ -139,10 +139,10 @@ class LLMService:
         user_messages = []
         
         for msg in messages:
-            if msg["role"] == "system":
-                system_message = msg["content"]
+            if msg.role == "system":
+                system_message = msg.content
             else:
-                user_messages.append({"role": msg["role"], "content": msg["content"]})
+                user_messages.append({"role": msg.role, "content": msg.content})
         
         payload = {
             "model": self.model,
@@ -182,8 +182,8 @@ class LLMService:
         chat_messages = []
         for msg in messages:
             chat_messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
+                "role": msg.role,
+                "content": msg.content
             })
         
         chat_payload = {
@@ -241,12 +241,12 @@ class LLMService:
             # Fallback to generate endpoint
             prompt_parts = []
             for msg in messages:
-                if msg["role"] == "system":
-                    prompt_parts.append(f"System: {msg["content"]}")
-                elif msg["role"] == "user":
-                    prompt_parts.append(f"User: {msg["content"]}")
-                elif msg["role"] == "assistant":
-                    prompt_parts.append(f"Assistant: {msg["content"]}")
+                if msg.role == "system":
+                    prompt_parts.append(f"System: {msg.content}")
+                elif msg.role == "user":
+                    prompt_parts.append(f"User: {msg.content}")
+                elif msg.role == "assistant":
+                    prompt_parts.append(f"Assistant: {msg.content}")
             
             prompt = "\n\n".join(prompt_parts) + "\n\nAssistant:"
             print(f"[LLMService] Prompt length: {len(prompt)} chars")
