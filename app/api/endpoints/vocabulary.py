@@ -29,6 +29,7 @@ from app.models.user import User, Child
 from app.core.security import get_current_active_user
 from app.core.category_colors import get_category_color
 from app.services.sentence_generator import get_sentence_generator, SentenceGenerationResult
+from app.services.word_enhancement_service import get_word_enhancement_service
 
 router = APIRouter()
 
@@ -448,10 +449,11 @@ async def record_external_word_learning(
     if word_obj and final_image_url and not word_obj.image_url:
         word_obj.image_url = final_image_url
         print(f"[External Word Learning] Updated image URL for existing word: {word_obj.word}")
+        print(f"[External Word Learning] NOTE: For existing words, we only update image. The word text '{word_obj.word}' remains unchanged.")
     
     if not word_obj:
-        # Create new word from object detection
-        print(f"[External Word Learning] Creating new word: '{word}'")
+        # Create new word from object detection with AI-enhanced bilingual content
+        print(f"[External Word Learning] Creating new word with AI enhancement: '{word}'")
         word_created = True
         
         # Ensure "general" category exists
@@ -478,20 +480,55 @@ async def record_external_word_learning(
             db.add(general_category)
             await db.flush()  # Ensure category is created before creating word
         
-        word_obj = Word(
-            id=str(uuid.uuid4()),
-            word=word.capitalize(),
-            category=general_category.id,  # Use category ID, not name
-            difficulty="easy",  # Use valid enum value: easy, medium, or hard
-            definition=f"A word learned from {source}",
-            example=f"I saw a {word.lower()}.",
-            pronunciation=None,
-            physical_action=None,
-            image_url=final_image_url,
-            audio_url=None,
-            contexts=[source],
-            related_words=[]
-        )
+        # Use AI to generate complete bilingual content
+        try:
+            enhancement_service = get_word_enhancement_service()
+            enhanced_content = await enhancement_service.enhance_word(
+                word=word,
+                source=source,
+                image_url=final_image_url
+            )
+            
+            print(f"[External Word Learning] ✓ AI-enhanced content generated")
+            print(f"  - Cantonese: {enhanced_content.word_cantonese} ({enhanced_content.jyutping})")
+            
+            word_obj = Word(
+                id=str(uuid.uuid4()),
+                word=enhanced_content.word_english.capitalize(),
+                word_cantonese=enhanced_content.word_cantonese,
+                jyutping=enhanced_content.jyutping,
+                category=general_category.id,
+                difficulty=enhanced_content.difficulty,
+                definition=enhanced_content.definition_english,
+                definition_cantonese=enhanced_content.definition_cantonese,
+                example=enhanced_content.example_english,
+                example_cantonese=enhanced_content.example_cantonese,
+                pronunciation=None,
+                physical_action=None,
+                image_url=final_image_url,
+                audio_url=None,
+                contexts=[source],
+                related_words=[]
+            )
+        except Exception as e:
+            print(f"[External Word Learning] WARNING: AI enhancement failed: {e}")
+            print(f"[External Word Learning] Falling back to basic word creation")
+            # Fallback to basic word creation
+            word_obj = Word(
+                id=str(uuid.uuid4()),
+                word=word.capitalize(),
+                category=general_category.id,
+                difficulty="easy",
+                definition=f"A word learned from {source}",
+                example=f"I saw a {word.lower()}.",
+                pronunciation=None,
+                physical_action=None,
+                image_url=final_image_url,
+                audio_url=None,
+                contexts=[source],
+                related_words=[]
+            )
+        
         db.add(word_obj)
         
         # Increment category word count
@@ -758,3 +795,309 @@ async def get_word_sentences(
         }
         for sent in sentences
     ]
+
+
+@router.post(
+    "/{word_id}/enhance",
+    response_model=WordResponse,
+    summary="Enhance word with AI-generated bilingual content",
+    description="""
+    Enhance an existing word with AI-generated bilingual content (Cantonese + English).
+    
+    This endpoint uses AI to generate:
+    - Cantonese word text and Jyutping romanization
+    - Age-appropriate definitions in both languages
+    - Example sentences in both languages
+    - Appropriate difficulty level
+    
+    **IMPORTANT: Preservation Behavior**
+    - Existing word text (English and Cantonese) is NEVER modified
+    - Only MISSING bilingual fields are filled in
+    - If word already has Cantonese content, it's preserved
+    - Only generic definitions ("word learned from...") are updated
+    
+    **Use Cases:**
+    - Add missing Cantonese translations to English-only words
+    - Fill in missing definitions/examples
+    - Add Jyutping to words that lack it
+    
+    **What Gets Updated:**
+    - ✅ Missing `word_cantonese`, `jyutping`, definitions, examples
+    - ✅ Generic definitions that need improvement
+    - ❌ Existing word text (English or Cantonese)
+    - ❌ Existing manually curated content
+    """,
+    tags=["AI Features"]
+)
+async def enhance_word_content(
+    word_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Enhance a word with AI-generated bilingual content"""
+    # Get word
+    result = await db.execute(
+        select(Word).where(Word.id == word_id)
+    )
+    word = result.scalar_one_or_none()
+    
+    if not word:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Word not found: {word_id}"
+        )
+    
+    # Store original word to ensure it's never modified
+    original_word = word.word
+    
+    print(f"[EnhanceWord] Enhancing word: {original_word} (ID: {word_id})")
+    print(f"[EnhanceWord] Current state:")
+    print(f"  - word: {word.word}")
+    print(f"  - word_cantonese: {word.word_cantonese}")
+    print(f"  - definition: {word.definition[:50] if word.definition else 'None'}...")
+    
+    # Generate enhanced content
+    try:
+        enhancement_service = get_word_enhancement_service()
+        enhanced = await enhancement_service.enhance_word(
+            word=original_word,
+            source="enhancement"
+        )
+        
+        # IMPORTANT: Only update MISSING bilingual fields
+        # NEVER modify existing word.word (English) or word.word_cantonese (Chinese) text
+        
+        # Store original Cantonese word to ensure it's never modified
+        original_word_cantonese = word.word_cantonese
+        
+        # Only update if field is missing/empty
+        if not word.word_cantonese:
+            word.word_cantonese = enhanced.word_cantonese
+        else:
+            print(f"[EnhanceWord]   Preserving existing Cantonese word: {word.word_cantonese}")
+        
+        if not word.jyutping:
+            word.jyutping = enhanced.jyutping
+        else:
+            print(f"[EnhanceWord]   Preserving existing jyutping: {word.jyutping}")
+        
+        if not word.definition_cantonese:
+            word.definition_cantonese = enhanced.definition_cantonese
+        else:
+            print(f"[EnhanceWord]   Preserving existing Cantonese definition")
+        
+        if not word.example_cantonese:
+            word.example_cantonese = enhanced.example_cantonese
+        else:
+            print(f"[EnhanceWord]   Preserving existing Cantonese example")
+        
+        # Only update English definition/example if it was generic
+        if not word.definition or "word learned from" in word.definition.lower():
+            word.definition = enhanced.definition_english
+            word.example = enhanced.example_english
+        
+        # Update difficulty if needed
+        if enhanced.difficulty and enhanced.difficulty in ["easy", "medium", "hard"]:
+            word.difficulty = enhanced.difficulty
+        
+        # Explicitly ensure word fields are NOT changed
+        if word.word != original_word:
+            print(f"[EnhanceWord] ⚠️  WARNING: English word was modified! Reverting.")
+            print(f"[EnhanceWord]   Original: {original_word}")
+            print(f"[EnhanceWord]   Changed to: {word.word}")
+            word.word = original_word
+        
+        if original_word_cantonese and word.word_cantonese != original_word_cantonese:
+            print(f"[EnhanceWord] ⚠️  WARNING: Cantonese word was modified! Reverting.")
+            print(f"[EnhanceWord]   Original: {original_word_cantonese}")
+            print(f"[EnhanceWord]   Changed to: {word.word_cantonese}")
+            word.word_cantonese = original_word_cantonese
+        
+        await db.commit()
+        await db.refresh(word)
+        
+        # Final verification that word texts weren't changed
+        if word.word != original_word:
+            print(f"[EnhanceWord] ❌ ERROR: English word was unexpectedly modified after commit!")
+            print(f"[EnhanceWord]   Original: {original_word}")
+            print(f"[EnhanceWord]   Changed to: {word.word}")
+            word.word = original_word
+            await db.commit()
+        
+        if original_word_cantonese and word.word_cantonese != original_word_cantonese:
+            print(f"[EnhanceWord] ❌ ERROR: Cantonese word was unexpectedly modified after commit!")
+            print(f"[EnhanceWord]   Original: {original_word_cantonese}")
+            print(f"[EnhanceWord]   Changed to: {word.word_cantonese}")
+            word.word_cantonese = original_word_cantonese
+            await db.commit()
+        
+        print(f"[EnhanceWord] ✓ Successfully enhanced word: {word.word}")
+        print(f"[EnhanceWord] Final state:")
+        print(f"  - word: {word.word} (unchanged: {word.word == original_word})")
+        print(f"  - word_cantonese: {word.word_cantonese} (unchanged: {not original_word_cantonese or word.word_cantonese == original_word_cantonese})")
+        print(f"  - definition: {word.definition[:50] if word.definition else 'None'}...")
+        
+        return word
+        
+    except Exception as e:
+        print(f"[EnhanceWord] ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to enhance word: {str(e)}"
+        )
+
+
+@router.post(
+    "/batch-enhance",
+    summary="Batch enhance multiple words with AI",
+    description="""
+    Enhance multiple words with AI-generated bilingual content.
+    
+    This endpoint processes words and fills in missing Cantonese translations
+    and generates complete bilingual content for them.
+    
+    **IMPORTANT: Preservation Behavior**
+    - Existing word text (English and Cantonese) is NEVER modified
+    - Only MISSING bilingual fields are filled in
+    - Words with existing Cantonese content are preserved
+    - Only generic definitions ("word learned from...") are updated
+    
+    **Parameters:**
+    - `limit`: Maximum number of words to process (default 10, max 50)
+    - `category`: Optional category filter
+    - `only_missing`: Only enhance words without Cantonese content (default true)
+    
+    **Response:**
+    - Number of words processed
+    - Number of successes and failures
+    - List of processed word IDs
+    
+    **Safe to Use:**
+    - Won't overwrite manually curated content
+    - Preserves existing translations
+    - Only fills in gaps in bilingual content
+    
+    **Note:** This operation can take time. For large batches, consider
+    running in multiple smaller batches (10-20 words at a time).
+    """,
+    tags=["AI Features"]
+)
+async def batch_enhance_words(
+    limit: int = Query(default=10, ge=1, le=50),
+    category: Optional[str] = Query(default=None),
+    only_missing: bool = Query(default=True),
+    db: AsyncSession = Depends(get_db)
+):
+    """Batch enhance words with AI-generated content"""
+    print(f"[BatchEnhance] Starting batch enhancement (limit={limit}, category={category}, only_missing={only_missing})")
+    
+    # Build query
+    query = select(Word).where(Word.is_active == True)
+    
+    if category:
+        query = query.where(Word.category == category)
+    
+    if only_missing:
+        # Only enhance words without Cantonese content
+        query = query.where(
+            (Word.word_cantonese.is_(None)) | (Word.word_cantonese == "")
+        )
+    
+    query = query.limit(limit)
+    
+    result = await db.execute(query)
+    words = result.scalars().all()
+    
+    if not words:
+        return {
+            "message": "No words found matching criteria",
+            "total": 0,
+            "success": 0,
+            "failed": 0,
+            "processed_ids": []
+        }
+    
+    print(f"[BatchEnhance] Found {len(words)} words to enhance")
+    
+    # Process each word
+    enhancement_service = get_word_enhancement_service()
+    processed_ids = []
+    success_count = 0
+    failed_count = 0
+    
+    for word in words:
+        try:
+            # Store original words to ensure they're never modified
+            original_word = word.word
+            original_word_cantonese = word.word_cantonese
+            
+            print(f"[BatchEnhance] Processing: {original_word} (ID: {word.id})")
+            
+            enhanced = await enhancement_service.enhance_word(
+                word=original_word,
+                source="batch_enhancement"
+            )
+            
+            # IMPORTANT: Only update MISSING bilingual fields
+            # NEVER modify existing word.word (English) or word.word_cantonese (Chinese) text
+            
+            # Only update if field is missing/empty
+            if not word.word_cantonese:
+                word.word_cantonese = enhanced.word_cantonese
+                print(f"[BatchEnhance]   Added Cantonese: {enhanced.word_cantonese}")
+            else:
+                print(f"[BatchEnhance]   Preserving existing Cantonese: {word.word_cantonese}")
+            
+            if not word.jyutping:
+                word.jyutping = enhanced.jyutping
+            
+            if not word.definition_cantonese:
+                word.definition_cantonese = enhanced.definition_cantonese
+            
+            if not word.example_cantonese:
+                word.example_cantonese = enhanced.example_cantonese
+            
+            # Only update English definition/example if it was generic
+            if not word.definition or "word learned from" in word.definition.lower():
+                word.definition = enhanced.definition_english
+                word.example = enhanced.example_english
+            
+            if enhanced.difficulty and enhanced.difficulty in ["easy", "medium", "hard"]:
+                word.difficulty = enhanced.difficulty
+            
+            # Explicitly ensure word fields are NOT changed
+            if word.word != original_word:
+                print(f"[BatchEnhance] ⚠️  WARNING: English word was modified! Reverting.")
+                print(f"[BatchEnhance]   Original: {original_word}")
+                print(f"[BatchEnhance]   Changed to: {word.word}")
+                word.word = original_word
+            
+            if original_word_cantonese and word.word_cantonese != original_word_cantonese:
+                print(f"[BatchEnhance] ⚠️  WARNING: Cantonese word was modified! Reverting.")
+                print(f"[BatchEnhance]   Original: {original_word_cantonese}")
+                print(f"[BatchEnhance]   Changed to: {word.word_cantonese}")
+                word.word_cantonese = original_word_cantonese
+            
+            processed_ids.append(word.id)
+            success_count += 1
+            final_cantonese = word.word_cantonese or enhanced.word_cantonese
+            print(f"[BatchEnhance] ✓ Enhanced: {original_word} -> {final_cantonese} (words unchanged: EN={word.word == original_word}, 粵={not original_word_cantonese or word.word_cantonese == original_word_cantonese})")
+            
+        except Exception as e:
+            failed_count += 1
+            print(f"[BatchEnhance] ✗ Failed to enhance {word.word}: {str(e)}")
+    
+    # Commit all changes
+    await db.commit()
+    
+    result = {
+        "message": f"Processed {len(words)} words",
+        "total": len(words),
+        "success": success_count,
+        "failed": failed_count,
+        "processed_ids": processed_ids
+    }
+    
+    print(f"[BatchEnhance] Complete: {success_count} success, {failed_count} failed")
+    return result
