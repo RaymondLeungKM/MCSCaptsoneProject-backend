@@ -242,7 +242,7 @@ class StoryGeneratorService:
                     f"Please check the backend logs for the full response."
                 )
     
-    def _clean_story_content(self, content: str) -> str:
+    def _clean_story_content(self, content: Optional[str]) -> str:
         """Clean story content by removing JSON artifacts and fixing escape sequences"""
         if not content:
             return ""
@@ -411,7 +411,14 @@ class StoryGeneratorService:
             story_id = str(uuid.uuid4())
             
             # Extract and clean story content
-            story_text_raw = story_data.get("content", "")
+            # Ensure we always get a string, not None (use 'or' to handle None values)
+            story_text_raw = story_data.get("content") or ""
+            
+            if not story_text_raw:
+                print(f"[StoryGenerator] ERROR: AI did not return any content!")
+                print(f"[StoryGenerator] Full response keys: {list(story_data.keys())}")
+                raise ValueError("AI response did not contain story content. Please try again.")
+            
             print(f"[StoryGenerator] Raw content length: {len(story_text_raw)}")
             print(f"[StoryGenerator] Raw content preview (first 200 chars): {story_text_raw[:200]}")
             
@@ -434,7 +441,11 @@ class StoryGeneratorService:
             valid_word_keys = {(w.word_cantonese or w.word) for w in words}
             
             # Get AI's word_usage and filter to only include valid words
-            ai_word_usage = story_data.get("word_usage", {})
+            ai_word_usage = story_data.get("word_usage") or {}
+            if not isinstance(ai_word_usage, dict):
+                print(f"[StoryGenerator] Warning: word_usage is not a dict, got {type(ai_word_usage)}")
+                ai_word_usage = {}
+            
             word_usage_dict = {}
             
             # First, add words from AI's response that match our learned words
@@ -461,8 +472,8 @@ class StoryGeneratorService:
             story = GeneratedStory(
                 id=story_id,
                 child_id=request.child_id,
-                title=story_data.get("title", "今日的故事"),
-                title_english=story_data.get("title_english"),
+                title=story_data.get("title") or "今日的故事",
+                title_english=story_data.get("title_english") or "Story",
                 theme=request.theme,
                 generated_at=datetime.utcnow(),
                 generated_by="story_generator",
@@ -478,7 +489,7 @@ class StoryGeneratorService:
                 word_usage=word_usage_dict,
                 audio_url=None,  # TODO: Generate TTS audio
                 reading_time_minutes=request.reading_time_minutes,
-                word_count=len(story_data.get("content", "")),
+                word_count=len(story_text),  # Use cleaned text length, not raw AI response
                 difficulty_level="easy",
                 cultural_references=None,  # TODO: Extract cultural references
                 ai_model=self.llm_service.model if self.llm_service else "unknown",

@@ -45,8 +45,11 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     
     # Ollama (for local testing)
+    # To change model: Update OLLAMA_MODEL in .env file and run: ollama pull <model-name>
+    # Recommended: qwen2.5:1.5b (fast, excellent Cantonese)
+    # Alternatives: qwen3:4b, qwen2.5:7b, qwen2.5:14b
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "qwen3:4b"  # Lightweight model for testing
+    OLLAMA_MODEL: str = "qwen2.5:1.5b"  # Default model for Cantonese content
     
     # AWS S3
     AWS_ACCESS_KEY_ID: str = ""
