@@ -65,25 +65,11 @@ Create age-appropriate vocabulary content for 3-5 year old children in both Cant
         
         context_info = f"這個詞語是透過{source}學習的" if source != "object_detection" else "這個詞語是透過物件識別學習的"
         
-        user_prompt = f"""請為以下詞語創建完整的雙語學習資料：
+        user_prompt = f"""請為詞語 "{word}" 創建完整的雙語學習資料（來源：{context_info}）。
 
-**詞語：** {word}
-**來源：** {context_info}
+以下是參考範例：
 
-請按照以下JSON格式輸出：
-
-{{
-  "word_english": "{word}",
-  "word_cantonese": "粵語詞語（繁體中文）",
-  "jyutping": "完整正確的粵語拼音",
-  "definition_english": "Simple English definition for preschoolers (10-15 words)",
-  "definition_cantonese": "簡單的粵語定義，適合幼兒（10-15字）",
-  "example_english": "A simple example sentence (8-12 words)",
-  "example_cantonese": "一個簡單的粵語例句（6-10字）",
-  "difficulty": "easy|medium|hard"
-}}
-
-**範例輸出：**
+範例1 - Cat (貓):
 {{
   "word_english": "Cat",
   "word_cantonese": "貓",
@@ -95,12 +81,36 @@ Create age-appropriate vocabulary content for 3-5 year old children in both Cant
   "difficulty": "easy"
 }}
 
-**重要提醒：**
-- 確保粵語拼音正確（每個字一個音節）
-- 定義和例句要簡單易懂
-- 例句要符合香港幼兒的生活經驗
+範例2 - Apple (蘋果):
+{{
+  "word_english": "Apple",
+  "word_cantonese": "蘋果",
+  "jyutping": "ping4 gwo2",
+  "definition_english": "A round red or green fruit that is sweet and crunchy",
+  "definition_cantonese": "紅色或者綠色嘅生果，又甜又脆",
+  "example_english": "I eat an apple every day",
+  "example_cantonese": "我每日都食一個蘋果",
+  "difficulty": "easy"
+}}
 
-請直接輸出JSON，不要有其他文字："""
+範例3 - Happy (開心):
+{{
+  "word_english": "Happy",
+  "word_cantonese": "開心",
+  "jyutping": "hoi1 sam1",
+  "definition_english": "Feeling good and smiling when something nice happens",
+  "definition_cantonese": "好開心同埋會笑嘅感覺",
+  "example_english": "I feel happy when I play with friends",
+  "example_cantonese": "同朋友玩我好開心",
+  "difficulty": "easy"
+}}
+
+現在請為 "{word}" 創建同樣格式的JSON資料。記住：
+- 粵語拼音必須完全正確
+- 適合3-5歲幼兒理解
+- 例句簡單貼近香港生活
+
+直接輸出JSON，不要其他文字："""
         
         return [
             {"role": "system", "content": system_prompt},
