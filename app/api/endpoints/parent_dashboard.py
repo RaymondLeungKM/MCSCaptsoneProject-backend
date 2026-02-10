@@ -19,6 +19,7 @@ from app.models.parent_analytics import (
 )
 from app.models.vocabulary import WordProgress, Word, Category
 from app.models.analytics import LearningSession
+from app.models.daily_words import DailyWordTracking
 from app.schemas.parent_analytics import (
     DailyLearningStatsResponse,
     LearningInsightResponse,
@@ -257,42 +258,42 @@ async def get_analytics_charts(
     # Convert start_date to datetime for proper comparison with DateTime field
     start_date_dt = datetime.combine(start_date, datetime.min.time())
     
-    # ALWAYS calculate dynamically from WordProgress records with dates
-    # Get all word progress records with their practice dates
-    progress_result = await db.execute(
-        select(WordProgress, Word)
-        .join(Word, WordProgress.word_id == Word.id)
+    # Use DailyWordTracking table to get accurate word learning dates
+    # This table tracks when words were first learned each day
+    daily_tracking_result = await db.execute(
+        select(DailyWordTracking, Word)
+        .join(Word, DailyWordTracking.word_id == Word.id)
         .where(
             and_(
-                WordProgress.child_id == child_id,
-                WordProgress.last_practiced >= start_date_dt
+                DailyWordTracking.child_id == child_id,
+                DailyWordTracking.date >= start_date_dt
             )
         )
     )
-    progress_records = progress_result.all()
+    tracking_records = daily_tracking_result.all()
     
     # Group by date and category
     date_stats = {}
     category_breakdown = {}
     
-    for progress, word in progress_records:
-        if progress.last_practiced:
-            practice_date = progress.last_practiced.date()
-            if practice_date >= start_date and practice_date <= today:
+    for tracking, word in tracking_records:
+        if tracking.date:
+            learned_date = tracking.date.date()
+            if learned_date >= start_date and learned_date <= today:
                 # Initialize date entry if needed
-                if practice_date not in date_stats:
-                    date_stats[practice_date] = {
+                if learned_date not in date_stats:
+                    date_stats[learned_date] = {
                         'words_learned': set(),  # Use set to avoid duplicates
                         'xp': 0
                     }
                 
                 # Add word to this date (set prevents duplicates)
-                date_stats[practice_date]['words_learned'].add(progress.word_id)
+                date_stats[learned_date]['words_learned'].add(tracking.word_id)
                 
                 # Aggregate categories
                 if word.category not in category_breakdown:
                     category_breakdown[word.category] = set()
-                category_breakdown[word.category].add(progress.word_id)
+                category_breakdown[word.category].add(tracking.word_id)
     
     # Create time series arrays - generate a date for each day in range
     dates = []
