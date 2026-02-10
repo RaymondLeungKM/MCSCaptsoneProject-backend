@@ -399,6 +399,78 @@ async def get_analytics_charts(
     )
 
 
+@router.get("/{child_id}/words-by-date")
+async def get_words_by_date(
+    child_id: str,
+    date_str: str = Query(..., description="Date in YYYY-MM-DD format"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get all words learned by a child on a specific date
+    """
+    # Verify child belongs to parent
+    result = await db.execute(
+        select(Child).where(
+            and_(Child.id == child_id, Child.parent_id == current_user.id)
+        )
+    )
+    child = result.scalar_one_or_none()
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+    
+    # Parse date
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
+    
+    # Get words from DailyWordTracking for this date
+    start_of_day = datetime.combine(target_date, datetime.min.time())
+    end_of_day = datetime.combine(target_date, datetime.max.time())
+    
+    tracking_result = await db.execute(
+        select(DailyWordTracking, Word, Category)
+        .join(Word, DailyWordTracking.word_id == Word.id)
+        .join(Category, Word.category == Category.id)
+        .where(
+            and_(
+                DailyWordTracking.child_id == child_id,
+                DailyWordTracking.date >= start_of_day,
+                DailyWordTracking.date <= end_of_day
+            )
+        )
+        .order_by(DailyWordTracking.created_at.desc())
+    )
+    records = tracking_result.all()
+    
+    # Format response
+    words_data = []
+    for tracking, word, category in records:
+        words_data.append({
+            "id": word.id,
+            "word": word.word,
+            "word_cantonese": word.word_cantonese,
+            "jyutping": word.jyutping,
+            "image_url": word.image_url,
+            "category": category.name,
+            "category_cantonese": category.name_cantonese,
+            "definition": word.definition,
+            "definition_cantonese": word.definition_cantonese,
+            "exposure_count": tracking.exposure_count,
+            "used_actively": tracking.used_actively,
+            "mastery_confidence": tracking.mastery_confidence,
+            "created_at": tracking.created_at.isoformat() if tracking.created_at else None
+        })
+    
+    return {
+        "date": date_str,
+        "child_id": child_id,
+        "words_count": len(words_data),
+        "words": words_data
+    }
+
+
 # =============================================================================
 # LEARNING INSIGHTS
 # =============================================================================

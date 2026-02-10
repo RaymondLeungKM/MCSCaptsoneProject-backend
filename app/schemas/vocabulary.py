@@ -98,6 +98,7 @@ class WordResponse(WordBase):
     success_rate: float
     is_active: bool
     created_at: datetime
+    created_by_child_id: Optional[str] = None
     category_name: Optional[str] = None
     category_name_cantonese: Optional[str] = None
     
