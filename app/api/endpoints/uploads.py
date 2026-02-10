@@ -63,7 +63,7 @@ async def upload_image(
     ```json
     {
       "success": true,
-      "image_url": "http://localhost:8000/uploads/images/abc123.jpg",
+      "image_url": "/uploads/images/abc123.jpg",
       "filename": "abc123.jpg",
       "size": 123456,
       "content_type": "image/jpeg"
@@ -113,10 +113,8 @@ async def upload_image(
                 
                 await f.write(chunk)
         
-        # Generate URL (adjust based on your domain/deployment)
-        # In production, you might want to use environment variable for base URL
-        base_url = os.getenv("API_BASE_URL", "http://localhost:8000")
-        image_url = f"{base_url}/uploads/images/{unique_filename}"
+        # Store only the path (nginx will handle serving)
+        image_url = f"/uploads/images/{unique_filename}"
         
         return {
             "success": True,

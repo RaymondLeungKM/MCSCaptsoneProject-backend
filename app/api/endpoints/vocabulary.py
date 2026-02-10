@@ -142,7 +142,15 @@ async def get_words_with_progress(
         )
     
     # Get words with progress
-    query = select(Word).options(selectinload(Word.category_rel)).where(Word.is_active == True)
+    # Include: system words (created_by_child_id IS NULL) + user's own uploaded words
+    from sqlalchemy import or_
+    query = select(Word).options(selectinload(Word.category_rel)).where(
+        Word.is_active == True,
+        or_(
+            Word.created_by_child_id.is_(None),  # System words
+            Word.created_by_child_id == child_id  # User's uploaded words
+        )
+    )
     if category:
         query = query.where(Word.category == category)
     
@@ -416,9 +424,8 @@ async def record_external_word_learning(
                 content = await image.read()
                 await f.write(content)
             
-            # Generate URL
-            base_url = os.getenv("API_BASE_URL", "http://localhost:8000")
-            final_image_url = f"{base_url}/uploads/images/{unique_filename}"
+            # Store only the path (nginx will handle serving)
+            final_image_url = f"/uploads/images/{unique_filename}"
             print(f"[External Word Learning] Image uploaded: {final_image_url}")
         except HTTPException:
             raise
@@ -548,7 +555,8 @@ async def record_external_word_learning(
                 image_url=final_image_url,
                 audio_url=None,
                 contexts=[source],
-                related_words=[]
+                related_words=[],
+                created_by_child_id=child_id  # Mark as user-uploaded
             )
         except Exception as e:
             print(f"[External Word Learning] WARNING: AI enhancement failed: {e}")
@@ -566,7 +574,8 @@ async def record_external_word_learning(
                 image_url=final_image_url,
                 audio_url=None,
                 contexts=[source],
-                related_words=[]
+                related_words=[],
+                created_by_child_id=child_id  # Mark as user-uploaded
             )
         
         db.add(word_obj)

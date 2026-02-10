@@ -71,6 +71,9 @@ class Word(Base):
     total_exposures = Column(Integer, default=0)
     success_rate = Column(Float, default=0.0)
     
+    # Ownership - for user-uploaded words (NULL means system/shared word)
+    created_by_child_id = Column(String, ForeignKey("children.id"), nullable=True, index=True)
+    
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
