@@ -92,28 +92,33 @@ backend/
 ## 📖 API Endpoints
 
 ### Authentication
+
 - `POST /auth/register` - Register new parent account
 - `POST /auth/login` - Login
-- `GET /auth/me` - Get current user
+- `GET /users/me` - Get current user
 
 ### Children
+
 - `GET /children` - List all children for parent
 - `POST /children` - Create child profile
 - `GET /children/{id}` - Get child details
 - `PUT /children/{id}` - Update child profile
 
 ### Vocabulary
+
 - `GET /vocabulary/words` - List words (with filters)
 - `GET /vocabulary/categories` - List categories
 - `GET /vocabulary/words/{id}` - Get word details
 - `POST /vocabulary/progress` - Update learning progress
 
 ### Content
+
 - `POST /stories/generate` - Generate AI story
 - `GET /stories/{id}` - Get story details
 - `POST /sentences/generate` - Generate example sentences
 
 ### Analytics
+
 - `GET /analytics/child/{id}/daily-stats` - Daily learning stats
 - `GET /analytics/child/{id}/progress` - Overall progress
 - `GET /analytics/child/{id}/insights` - Learning insights

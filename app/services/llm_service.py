@@ -201,38 +201,41 @@ class LLMService:
             async with httpx.AsyncClient(timeout=180.0) as client:
                 response = await client.post(chat_url, json=chat_payload)
                 print(f"[LLMService] Response status: {response.status_code}")
+                if response.status_code != 200:
+                    raise ValueError(
+                        f"/api/chat returned status {response.status_code}: {response.text}"
+                    )
                 
-                if response.status_code == 200:
-                    data = response.json()
-                    print(f"[LLMService] Response keys: {list(data.keys())}")
+                data = response.json()
+                print(f"[LLMService] Response keys: {list(data.keys())}")
+                
+                # Chat API returns message in data["message"]["content"]
+                if "message" in data and "content" in data["message"]:
+                    generated_text = data["message"]["content"]
                     
-                    # Chat API returns message in data["message"]["content"]
-                    if "message" in data and "content" in data["message"]:
-                        generated_text = data["message"]["content"]
-                        
-                        # Check if content is empty but there's a 'thinking' field (qwen3 models)
-                        if (not generated_text or len(generated_text.strip()) == 0):
-                            # Check in the message object
-                            if "thinking" in data["message"]:
-                                print(f"[LLMService] Chat content empty, using message.thinking field")
-                                generated_text = data["message"]["thinking"]
-                            # Or at the top level
-                            elif "thinking" in data:
-                                print(f"[LLMService] Chat content empty, using top-level thinking field")
-                                generated_text = data["thinking"]
-                        
-                        print(f"[LLMService] Generated text length: {len(generated_text)} chars")
-                        print(f"[LLMService] Generated text preview (first 200 chars): {generated_text[:200]}")
-                        
-                        if not generated_text or len(generated_text.strip()) == 0:
-                            print(f"[LLMService] ERROR: Chat API returned empty content!")
-                            raise ValueError("Empty response from chat API")
-                        
-                        return generated_text
-                    else:
-                        print(f"[LLMService] Chat API response missing expected format")
-                        print(f"[LLMService] Full response: {data}")
-                        raise ValueError(f"Unexpected chat API response format: {list(data.keys())}")
+                    # Check if content is empty but there's a 'thinking' field (qwen3 models)
+                    if (not generated_text or len(generated_text.strip()) == 0):
+                        # Check in the message object
+                        if "thinking" in data["message"]:
+                            print(f"[LLMService] Chat content empty, using message.thinking field")
+                            generated_text = data["message"]["thinking"]
+                        # Or at the top level
+                        elif "thinking" in data:
+                            print(f"[LLMService] Chat content empty, using top-level thinking field")
+                            generated_text = data["thinking"]
+                    
+                    print(f"[LLMService] Generated text length: {len(generated_text)} chars")
+                    print(f"[LLMService] Generated text preview (first 200 chars): {generated_text[:200]}")
+                    
+                    if not generated_text or len(generated_text.strip()) == 0:
+                        print(f"[LLMService] ERROR: Chat API returned empty content!")
+                        raise ValueError("Empty response from chat API")
+                    
+                    return generated_text
+                else:
+                    print(f"[LLMService] Chat API response missing expected format")
+                    print(f"[LLMService] Full response: {data}")
+                    raise ValueError(f"Unexpected chat API response format: {list(data.keys())}")
                         
         except Exception as chat_error:
             print(f"[LLMService] Chat API failed: {str(chat_error)}")

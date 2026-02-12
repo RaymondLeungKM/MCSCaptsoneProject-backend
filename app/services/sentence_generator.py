@@ -219,33 +219,44 @@ Jyutping: go4 go1 heoi3 gung1 jyun4 waan2 (6個音節 ✓)
             temperature=temperature,
             max_tokens=1500
         )
-        
-        # Parse JSON response
-        try:
-            # Extract JSON from response (handle markdown code blocks)
-            response_clean = response.strip()
-            if response_clean.startswith("```json"):
-                response_clean = response_clean[7:]
-            if response_clean.startswith("```"):
-                response_clean = response_clean[3:]
-            if response_clean.endswith("```"):
-                response_clean = response_clean[:-3]
-            response_clean = response_clean.strip()
-            
-            data = json.loads(response_clean)
-            sentences = [GeneratedSentence(**s) for s in data["sentences"]]
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"[SentenceGenerator] Failed to parse LLM response: {e}")
-            print(f"[SentenceGenerator] Raw response: {response}")
-            # Fallback: create basic sentences using pre-extracted attributes
+
+        if not isinstance(response, str) or not response.strip():
+            print(f"[SentenceGenerator] Empty/invalid LLM response ({type(response).__name__}), using fallback sentence.")
             sentences = [
                 GeneratedSentence(
                     sentence=word_example_cantonese or word_example or f"我見到{word_cantonese}。",
                     sentence_english=word_example or f"I see a {word_text}.",
                     context="general",
-                    difficulty="easy"
+                    difficulty="easy",
                 )
             ]
+        else:
+            # Parse JSON response
+            try:
+                # Extract JSON from response (handle markdown code blocks)
+                response_clean = response.strip()
+                if response_clean.startswith("```json"):
+                    response_clean = response_clean[7:]
+                if response_clean.startswith("```"):
+                    response_clean = response_clean[3:]
+                if response_clean.endswith("```"):
+                    response_clean = response_clean[:-3]
+                response_clean = response_clean.strip()
+                
+                data = json.loads(response_clean)
+                sentences = [GeneratedSentence(**s) for s in data["sentences"]]
+            except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+                print(f"[SentenceGenerator] Failed to parse LLM response: {e}")
+                print(f"[SentenceGenerator] Raw response: {response}")
+                # Fallback: create basic sentences using pre-extracted attributes
+                sentences = [
+                    GeneratedSentence(
+                        sentence=word_example_cantonese or word_example or f"我見到{word_cantonese}。",
+                        sentence_english=word_example or f"I see a {word_text}.",
+                        context="general",
+                        difficulty="easy"
+                    )
+                ]
         
         # Save to database if requested
         if save_to_db and db is not None:

@@ -15,6 +15,7 @@ from app.models.user import Child
 from app.schemas.stories import DailyWordSummary, StoryGenerationRequest
 from app.core.config import settings
 from app.services.llm_service import LLMService, LLMProvider, LLMMessage
+from app.services.tts_service import tts_service
 
 
 class StoryGeneratorService:
@@ -353,122 +354,91 @@ class StoryGeneratorService:
         request: StoryGenerationRequest
     ) -> tuple[Optional[GeneratedStory], List[DailyWordSummary], float]:
         """Generate a bedtime story using AI"""
-        
+
         if not self.llm_service:
             raise ValueError("LLM service not initialized. Please configure an API key or run Ollama locally.")
-        
+
         start_time = time.time()
-        
-        # Get child information
+
         child_query = select(Child).where(Child.id == request.child_id)
         child_result = await db.execute(child_query)
         child = child_result.scalar_one_or_none()
-        
         if not child:
             raise ValueError(f"Child not found: {request.child_id}")
-        
-        # Get daily words
-        words = await self.get_daily_words(
-            db, 
-            request.child_id,
-            request.date,
-            limit=10
-        )
-        
+
+        words = await self.get_daily_words(db, request.child_id, request.date, limit=10)
         if len(words) == 0:
             raise ValueError("No words learned today to include in story")
-        
-        # Create prompt
+
         prompt = self._create_story_prompt(
             child_name=child.name,
             child_age=child.age,
             words=words,
             theme=request.theme,
-            word_count_target=request.word_count_target
+            word_count_target=request.word_count_target,
         )
-        
-        # Call AI API using unified LLM service
+
         try:
-            if not self.llm_service:
-                raise ValueError("LLM service not initialized. Please configure an API key or run Ollama locally.")
-            
-            # Create messages for the LLM
-            messages = [
-                LLMMessage(role="user", content=prompt)
-            ]
-            
-            # Generate story using LLM service
-            # Note: qwen3:4b uses Chain-of-Thought and needs more tokens for thinking + output
+            messages = [LLMMessage(role="user", content=prompt)]
             ai_response = await self.llm_service.generate(
                 messages=messages,
                 temperature=0.8,
-                max_tokens=5000
+                max_tokens=5000,
             )
-            
-            # Parse JSON response with robust error handling
-            story_data = self._parse_story_json(ai_response)
 
+            story_data = self._parse_story_json(ai_response)
             story_id = str(uuid.uuid4())
-            
-            # Extract and clean story content
-            # Ensure we always get a string, not None (use 'or' to handle None values)
+
             story_text_raw = story_data.get("content") or ""
-            
             if not story_text_raw:
-                print(f"[StoryGenerator] ERROR: AI did not return any content!")
-                print(f"[StoryGenerator] Full response keys: {list(story_data.keys())}")
                 raise ValueError("AI response did not contain story content. Please try again.")
-            
-            print(f"[StoryGenerator] Raw content length: {len(story_text_raw)}")
-            print(f"[StoryGenerator] Raw content preview (first 200 chars): {story_text_raw[:200]}")
-            
+
             story_text = self._clean_story_content(story_text_raw)
-            print(f"[StoryGenerator] Cleaned content length: {len(story_text)}")
-            print(f"[StoryGenerator] Cleaned content preview (first 200 chars): {story_text[:200]}")
-            
-            # If cleaning removed too much, use raw (but still fix escape sequences)
             if len(story_text) < 50 and len(story_text_raw) > 50:
-                print(f"[StoryGenerator] Warning: Cleaning removed too much content, using raw with basic fixes")
                 story_text = story_text_raw.replace('\\n', '\n').replace('\\"', '"')
-            
+
             vocab_terms = [w.word_cantonese or w.word for w in words]
             vocab_used = ", ".join(vocab_terms)
             if len(vocab_used) > 500:
                 vocab_used = vocab_used[:497] + "..."
 
-            # Filter and ensure word_usage only contains words that were actually learned
-            # Create a set of valid word keys from the words list
             valid_word_keys = {(w.word_cantonese or w.word) for w in words}
-            
-            # Get AI's word_usage and filter to only include valid words
             ai_word_usage = story_data.get("word_usage") or {}
             if not isinstance(ai_word_usage, dict):
-                print(f"[StoryGenerator] Warning: word_usage is not a dict, got {type(ai_word_usage)}")
                 ai_word_usage = {}
-            
+
             word_usage_dict = {}
-            
-            # First, add words from AI's response that match our learned words
             for word_key, usage in ai_word_usage.items():
                 if word_key in valid_word_keys:
                     word_usage_dict[word_key] = usage
-            
-            # Then, add any missing words from our learned list with default descriptions
+
             for w in words:
                 word_key = w.word_cantonese or w.word
                 if word_key not in word_usage_dict:
-                    # Add missing word with default description
-                    word_usage_dict[word_key] = w.definition_cantonese or w.example_cantonese or f"用於故事中 (Used in the story)"
-            
-            print(f"[StoryGenerator] Words learned today: {len(words)}")
-            print(f"[StoryGenerator] Words in AI response: {len(ai_word_usage)}")
-            print(f"[StoryGenerator] Final word_usage count: {len(word_usage_dict)}")
+                    word_usage_dict[word_key] = (
+                        w.definition_cantonese
+                        or w.example_cantonese
+                        or "用於故事中 (Used in the story)"
+                    )
 
-            default_audio_setting = None
-            if settings.STORY_AUDIO_VOICE_SETTINGS:
-                default_audio_setting = settings.STORY_AUDIO_VOICE_SETTINGS[0]
-            
-            # Create story record
+            default_audio_setting = settings.STORY_AUDIO_VOICE_SETTINGS[0] if settings.STORY_AUDIO_VOICE_SETTINGS else None
+
+            generated_audio = None
+            try:
+                generated_audio = tts_service.generate_audio(
+                    story_text,
+                    language="cantonese",
+                    voice_name=(
+                        default_audio_setting.get("audio_generate_voice_name")
+                        if default_audio_setting
+                        else None
+                    ),
+                    speech_rate=0.85,
+                    filename_prefix="story",
+                )
+            except Exception as audio_error:
+                print(f"[StoryGenerator] Warning: story audio generation failed: {audio_error}")
+
             story = GeneratedStory(
                 id=story_id,
                 child_id=request.child_id,
@@ -478,8 +448,8 @@ class StoryGeneratorService:
                 generated_at=datetime.utcnow(),
                 generated_by="story_generator",
                 content_cantonese=story_text,
-                content_english=None,  # TODO: Add translation if requested
-                jyutping=None,  # TODO: Add jyutping for difficult words
+                content_english=None,
+                jyutping=None,
                 vocab_used=vocab_used,
                 story_text=story_text,
                 story_text_ssml=self._build_story_ssml(story_text),
@@ -487,35 +457,43 @@ class StoryGeneratorService:
                 story_generate_model=self.llm_service.model if self.llm_service else "unknown",
                 featured_words=[w.word_id for w in words],
                 word_usage=word_usage_dict,
-                audio_url=None,  # TODO: Generate TTS audio
+                audio_url=(generated_audio["audio_url"] if generated_audio else None),
+                audio_duration_seconds=(generated_audio["audio_duration_seconds"] if generated_audio else None),
+                audio_filename=(generated_audio["audio_filename"] if generated_audio else f"story_{story_id}.mp3"),
+                audio_generate_provider=(
+                    generated_audio["audio_generate_provider"]
+                    if generated_audio
+                    else (
+                        default_audio_setting.get("audio_generate_provider")
+                        if default_audio_setting
+                        else None
+                    )
+                ),
+                audio_generate_voice_name=(
+                    generated_audio["audio_generate_voice_name"]
+                    if generated_audio
+                    else (
+                        default_audio_setting.get("audio_generate_voice_name")
+                        if default_audio_setting
+                        else None
+                    )
+                ),
                 reading_time_minutes=request.reading_time_minutes,
-                word_count=len(story_text),  # Use cleaned text length, not raw AI response
+                word_count=len(story_text),
                 difficulty_level="easy",
-                cultural_references=None,  # TODO: Extract cultural references
+                cultural_references=None,
                 ai_model=self.llm_service.model if self.llm_service else "unknown",
                 generation_prompt=prompt,
                 generation_time_seconds=time.time() - start_time,
-                audio_filename=f"story_{story_id}.mp3",
-                audio_generate_provider=(
-                    default_audio_setting.get("audio_generate_provider")
-                    if default_audio_setting
-                    else None
-                ),
-                audio_generate_voice_name=(
-                    default_audio_setting.get("audio_generate_voice_name")
-                    if default_audio_setting
-                    else None
-                )
             )
-            
-            # Save to database
+
             db.add(story)
             await db.commit()
             await db.refresh(story)
-            
+
             generation_time = time.time() - start_time
             return story, words, generation_time
-            
+
         except Exception as e:
             print(f"[StoryGenerator] Error generating story: {str(e)}")
             raise

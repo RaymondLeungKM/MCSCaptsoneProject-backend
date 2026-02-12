@@ -17,6 +17,7 @@ from app.api.endpoints import (
     analytics,
     adaptive_learning,
     parent_dashboard,
+    audio,
     uploads,
 )
 
@@ -36,4 +37,5 @@ api_router.include_router(progress.router, prefix="/progress", tags=["Progress"]
 api_router.include_router(analytics.router, prefix="/analytics", tags=["Analytics"])
 api_router.include_router(adaptive_learning.router, prefix="/adaptive", tags=["Adaptive Learning"])
 api_router.include_router(parent_dashboard.router)
+api_router.include_router(audio.router, prefix="/audio", tags=["Audio"])
 api_router.include_router(uploads.router, prefix="/uploads", tags=["File Uploads"])
