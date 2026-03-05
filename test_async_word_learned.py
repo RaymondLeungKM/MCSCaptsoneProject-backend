@@ -16,7 +16,7 @@ async def test_word_learned_performance():
     word = f"TestWord{int(time.time())}"  # Unique word
     test_data = {
         "word": word,
-        "child_id": "test-child-id-123",  # Replace with actual child ID
+        "child_id": "test-child-ui",  # Replace with actual child ID
         "source": "object_detection",
         "timestamp": datetime.now().isoformat() + "Z",
         "confidence": 0.95
