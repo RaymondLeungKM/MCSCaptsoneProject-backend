@@ -127,6 +127,7 @@ async def get_word(
 async def get_words_with_progress(
     child_id: str,
     category: Optional[str] = None,
+    own_only: bool = Query(False, description="Only return words uploaded by this child (excludes system words)"),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -142,15 +143,22 @@ async def get_words_with_progress(
         )
     
     # Get words with progress
-    # Include: system words (created_by_child_id IS NULL) + user's own uploaded words
     from sqlalchemy import or_
-    query = select(Word).options(selectinload(Word.category_rel)).where(
-        Word.is_active == True,
-        or_(
-            Word.created_by_child_id.is_(None),  # System words
-            Word.created_by_child_id == child_id  # User's uploaded words
+    if own_only:
+        # Only return words uploaded by this child (e.g., My Collection category)
+        query = select(Word).options(selectinload(Word.category_rel)).where(
+            Word.is_active == True,
+            Word.created_by_child_id == child_id
         )
-    )
+    else:
+        # Include: system words (created_by_child_id IS NULL) + user's own uploaded words
+        query = select(Word).options(selectinload(Word.category_rel)).where(
+            Word.is_active == True,
+            or_(
+                Word.created_by_child_id.is_(None),  # System words
+                Word.created_by_child_id == child_id  # User's uploaded words
+            )
+        )
     if category:
         query = query.where(Word.category == category)
     
@@ -503,25 +511,25 @@ async def record_external_word_learning(
         print(f"[External Word Learning] Creating new word with AI enhancement: '{word}'")
         word_created = True
         
-        # Ensure "general" category exists
+        # Ensure "My Collection" category exists
         result = await db.execute(
-            select(Category).where(Category.name == "general")
+            select(Category).where(Category.name == "My Collection")
         )
         general_category = result.scalar_one_or_none()
         if not general_category:
-            print(f"[External Word Learning] Creating 'general' category")
+            print(f"[External Word Learning] Creating 'My Collection' category")
             # Get count for color assignment
             result_count = await db.execute(select(Category))
             existing_count = len(result_count.scalars().all())
             
             general_category = Category(
                 id=str(uuid.uuid4()),
-                name="general",
-                name_cantonese="一般",
-                description="Words learned from external sources",
-                description_cantonese="從外部來源學習的詞語",
-                icon="📝",
-                color=get_category_color("general", existing_count),
+                name="My Collection",
+                name_cantonese="我的 My Collection",
+                description="Words and photos collected from your surroundings",
+                description_cantonese="從你的環境中收集的詞語和相片",
+                icon="📸",
+                color=get_category_color("My Collection", existing_count),
                 sort_order=99
             )
             db.add(general_category)

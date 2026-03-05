@@ -1,10 +1,10 @@
 """
 Category endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from typing import List
+from sqlalchemy import select, func
+from typing import List, Optional
 import uuid
 
 from app.db.session import get_db
@@ -19,6 +19,7 @@ router = APIRouter()
 
 @router.get("/", response_model=List[CategoryResponse])
 async def get_categories(
+    child_id: Optional[str] = Query(None, description="When provided, overrides word_count for user-owned categories with per-child counts"),
     db: AsyncSession = Depends(get_db)
 ):
     """Get all active categories"""
@@ -26,6 +27,25 @@ async def get_categories(
         select(Category).where(Category.is_active == True).order_by(Category.sort_order)
     )
     categories = result.scalars().all()
+
+    if child_id:
+        # Build a map: category_id -> count of words owned by this child
+        count_result = await db.execute(
+            select(Word.category, func.count(Word.id))
+            .where(Word.created_by_child_id == child_id, Word.is_active == True)
+            .group_by(Word.category)
+        )
+        child_counts: dict[str, int] = dict(count_result.fetchall())
+
+        response = []
+        for cat in categories:
+            cat_dict = CategoryResponse.model_validate(cat).model_dump()
+            # For "My Collection", replace the global word_count with the child-specific count
+            if cat.name == "My Collection":
+                cat_dict["word_count"] = child_counts.get(cat.id, 0)
+            response.append(cat_dict)
+        return response
+
     return categories
 
 

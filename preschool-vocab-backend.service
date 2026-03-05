@@ -1,0 +1,21 @@
+[Unit]
+Description=Preschool Vocabulary Platform Backend
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/preschool-vocab-backend
+EnvironmentFile=/home/ubuntu/preschool-vocab-backend/.env
+Environment="PATH=/home/ubuntu/preschool-vocab-backend/venv/bin"
+ExecStart=/home/ubuntu/preschool-vocab-backend/venv/bin/python main.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=preschool-vocab-backend
+
+[Install]
+WantedBy=multi-user.target
