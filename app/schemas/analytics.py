@@ -1,7 +1,7 @@
 """
 Pydantic schemas for Analytics and Learning Sessions
 """
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import List, Dict, Any, Optional
 from datetime import datetime, date
 from enum import Enum
@@ -42,9 +42,9 @@ class LearningSessionResponse(BaseModel):
     start_time: datetime
     end_time: Optional[datetime] = None
     duration_minutes: Optional[int] = None
-    words_encountered: List[str]
-    words_used_actively: List[str]
-    activities_completed: List[ActivityCompleted]
+    words_encountered: List[str] = []
+    words_used_actively: List[str] = []
+    activities_completed: List[ActivityCompleted] = []
     engagement_level: EngagementLevel
     interactions_count: int
     xp_earned: int
@@ -52,6 +52,11 @@ class LearningSessionResponse(BaseModel):
     
     class Config:
         from_attributes = True
+
+    @field_validator('words_encountered', 'words_used_actively', 'activities_completed', mode='before')
+    @classmethod
+    def coerce_none_to_list(cls, v):
+        return v if v is not None else []
 
 
 # Daily Stats schemas

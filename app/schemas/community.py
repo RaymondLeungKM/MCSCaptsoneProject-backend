@@ -42,6 +42,12 @@ class CommunityPostCreate(BaseModel):
     # image_url is filled in by the upload service
 
 
+class CommunityPostFromCollectionCreate(BaseModel):
+    """Share an existing word from the child's My Collection (no new file upload)."""
+    word_id: str
+    caption: Optional[str] = Field(None, max_length=120)
+
+
 class CommunityPostResponse(BaseModel):
     id: str
     child_id: str

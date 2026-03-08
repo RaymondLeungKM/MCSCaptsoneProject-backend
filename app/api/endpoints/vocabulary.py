@@ -525,7 +525,7 @@ async def record_external_word_learning(
             general_category = Category(
                 id=str(uuid.uuid4()),
                 name="My Collection",
-                name_cantonese="我的 My Collection",
+                name_cantonese="我的",
                 description="Words and photos collected from your surroundings",
                 description_cantonese="從你的環境中收集的詞語和相片",
                 icon="📸",

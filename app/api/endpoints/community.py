@@ -23,10 +23,12 @@ from app.models.user import User, Child
 from app.models.community import CommunityPost, PostReaction, ModerationStatus
 from app.schemas.community import (
     CommunityPostResponse,
+    CommunityPostFromCollectionCreate,
     ModerationAction,
     PostReactionCreate,
     PostReactionResponse,
 )
+from app.models.vocabulary import Word
 
 router = APIRouter()
 
@@ -115,6 +117,68 @@ async def submit_community_post(
         word_text_cantonese=word_text_cantonese,
         caption=safe_caption,
         image_url=image_url,
+        is_anonymous=True,
+        moderation_status=ModerationStatus.PENDING,
+    )
+    db.add(post)
+    await db.commit()
+    await db.refresh(post)
+    return post
+
+
+# ===========================================================================
+# 10.1.1  Share from My Collection – no new file upload required
+# ===========================================================================
+
+@router.post("/posts/{child_id}/from-collection", response_model=CommunityPostResponse, status_code=201)
+async def submit_community_post_from_collection(
+    child_id: str,
+    payload: CommunityPostFromCollectionCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Submit a community post by picking an existing word from the child's
+    My Collection.  Re-uses the word's existing image URL – no new file
+    upload is needed.
+
+    The post is created with ``moderation_status = PENDING`` and will **not**
+    appear in the public feed until a parent approves it, satisfying the
+    COPPA / GDPR-K parental-approval requirement.
+    """
+    # Verify child belongs to parent
+    await _get_child(child_id, current_user, db)
+
+    # Fetch the word and verify it belongs to this child's collection
+    word_result = await db.execute(
+        select(Word).where(Word.id == payload.word_id, Word.is_active == True)
+    )
+    word = word_result.scalar_one_or_none()
+    if not word:
+        raise HTTPException(status_code=404, detail="Word not found")
+
+    if word.created_by_child_id != child_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Word does not belong to this child's collection",
+        )
+
+    if not word.image_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected word has no image to share",
+        )
+
+    safe_caption = (payload.caption or "").strip()[:120] or None
+
+    post = CommunityPost(
+        id=str(uuid.uuid4()),
+        child_id=child_id,
+        word_id=word.id,
+        word_text=word.word,
+        word_text_cantonese=word.word_cantonese,
+        caption=safe_caption,
+        image_url=word.image_url,
         is_anonymous=True,
         moderation_status=ModerationStatus.PENDING,
     )
