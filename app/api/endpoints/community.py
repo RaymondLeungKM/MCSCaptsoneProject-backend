@@ -268,6 +268,7 @@ async def get_community_feed(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     word_id: Optional[str] = Query(None, description="Filter by vocabulary word"),
+    child_id: Optional[str] = Query(None, description="Filter by child ID"),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -285,6 +286,8 @@ async def get_community_feed(
     )
     if word_id:
         query = query.where(CommunityPost.word_id == word_id)
+    if child_id:
+        query = query.where(CommunityPost.child_id == child_id)
 
     query = query.order_by(CommunityPost.created_at.desc()).offset(offset).limit(limit)
     result = await db.execute(query)

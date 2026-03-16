@@ -17,6 +17,7 @@ import uuid
 from app.db.session import get_db
 from app.core.security import get_current_active_user
 from app.models.user import User, Child
+from app.models.vocabulary import WordProgress, Word
 from app.models.community import (
     ParentFriendship,
     FriendshipStatus,
@@ -26,6 +27,8 @@ from app.models.community import (
 )
 from app.schemas.community import (
     FriendRequestCreate,
+    FriendRequestByIdCreate,
+    UserSearchResult,
     FriendshipResponse,
     FriendshipStatusUpdate,
     FriendProgressResponse,
@@ -66,6 +69,100 @@ async def send_friend_request(
 
     if addressee.id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot add yourself as a friend")
+
+    # Check for an existing relationship in either direction
+    existing = await db.execute(
+        select(ParentFriendship).where(
+            or_(
+                and_(
+                    ParentFriendship.requester_id == current_user.id,
+                    ParentFriendship.addressee_id == addressee.id,
+                ),
+                and_(
+                    ParentFriendship.requester_id == addressee.id,
+                    ParentFriendship.addressee_id == current_user.id,
+                ),
+            )
+        )
+    )
+    existing_friendship = existing.scalar_one_or_none()
+    if existing_friendship:
+        if existing_friendship.status == FriendshipStatus.ACCEPTED:
+            raise HTTPException(status_code=409, detail="Already friends")
+        if existing_friendship.status == FriendshipStatus.PENDING:
+            raise HTTPException(status_code=409, detail="Friend request already pending")
+        if existing_friendship.status == FriendshipStatus.BLOCKED:
+            raise HTTPException(status_code=403, detail="Cannot send request – relationship is blocked")
+
+    friendship = ParentFriendship(
+        id=str(uuid.uuid4()),
+        requester_id=current_user.id,
+        addressee_id=addressee.id,
+        status=FriendshipStatus.PENDING,
+    )
+    db.add(friendship)
+    await db.commit()
+    await db.refresh(friendship)
+
+    return FriendshipResponse(
+        id=friendship.id,
+        requester_id=friendship.requester_id,
+        addressee_id=friendship.addressee_id,
+        status=friendship.status,
+        created_at=friendship.created_at,
+        updated_at=friendship.updated_at,
+        requester_name=current_user.full_name,
+        addressee_name=addressee.full_name,
+    )
+
+
+@router.get("/users/search", response_model=UserSearchResult)
+async def search_user_by_id(
+    user_id: str = Query(..., description="Exact user ID to look up"),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Look up a parent account by their exact user ID.
+
+    Returns only the user's ID and display name (no email or other PII)
+    so that a parent can confirm they found the right person before
+    sending a friend request.
+    """
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="That is your own user ID")
+
+    result = await db.execute(
+        select(User).where(User.id == user_id, User.is_active == True)
+    )
+    found = result.scalar_one_or_none()
+    if not found:
+        raise HTTPException(status_code=404, detail="No user found with that ID")
+
+    return UserSearchResult(id=found.id, full_name=found.full_name)
+
+
+@router.post("/friends/request-by-id", response_model=FriendshipResponse, status_code=201)
+async def send_friend_request_by_id(
+    payload: FriendRequestByIdCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Send a friendship request to another parent identified by their user ID.
+
+    Useful when parents share their user ID directly instead of their email
+    address.
+    """
+    if payload.addressee_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot add yourself as a friend")
+
+    result = await db.execute(
+        select(User).where(User.id == payload.addressee_id, User.is_active == True)
+    )
+    addressee = result.scalar_one_or_none()
+    if not addressee:
+        raise HTTPException(status_code=404, detail="No active user found with that ID")
 
     # Check for an existing relationship in either direction
     existing = await db.execute(
@@ -275,6 +372,19 @@ async def get_friends_progress(
 
         children_stats: List[FriendChildStats] = []
         for child in children:
+            # Fetch the 8 most recently practiced words for this child
+            recent_result = await db.execute(
+                select(Word)
+                .join(WordProgress, WordProgress.word_id == Word.id)
+                .where(WordProgress.child_id == child.id)
+                .order_by(WordProgress.last_practiced.desc().nullslast())
+                .limit(8)
+            )
+            recent_word_objs = recent_result.scalars().all()
+            recent_words = [
+                w.word_cantonese or w.word for w in recent_word_objs if w
+            ]
+
             children_stats.append(
                 FriendChildStats(
                     child_name=child.name,
@@ -283,7 +393,7 @@ async def get_friends_progress(
                     words_learned=child.words_learned,
                     current_streak=child.current_streak,
                     level=child.level,
-                    recent_words=[],  # Would be populated from word_progress in full impl
+                    recent_words=recent_words,
                 )
             )
 

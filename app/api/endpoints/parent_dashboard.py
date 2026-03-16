@@ -161,7 +161,143 @@ async def get_dashboard_summary(
         .limit(1)
     )
     latest_report = report_result.scalar_one_or_none()
-    
+
+    # --- Auto-generate a report for the current ISO week if none exists yet ---
+    today_date = date.today()
+    # ISO week starts on Monday
+    current_week_monday = today_date - timedelta(days=today_date.weekday())
+    current_week_sunday = current_week_monday + timedelta(days=6)
+
+    week_missing = (
+        latest_report is None
+        or latest_report.week_start_date < current_week_monday
+    )
+
+    if week_missing:
+        # Gather per-category breakdown for the report
+        cat_report_result = await db.execute(
+            select(
+                Word.category,
+                func.count(WordProgress.id).label("learned")
+            )
+            .join(Word, WordProgress.word_id == Word.id)
+            .where(
+                and_(
+                    WordProgress.child_id == child_id,
+                    WordProgress.last_practiced >= datetime.combine(
+                        current_week_monday, datetime.min.time()
+                    ),
+                )
+            )
+            .group_by(Word.category)
+        )
+        cat_rows = cat_report_result.all()
+
+        top_cats = []
+        for cat_id, count in sorted(cat_rows, key=lambda r: r[1], reverse=True)[:3]:
+            cat_res = await db.execute(select(Category).where(Category.id == cat_id))
+            cat_obj = cat_res.scalar_one_or_none()
+            if cat_obj:
+                top_cats.append({
+                    "category": cat_obj.name_cantonese or cat_obj.name,
+                    "words": count,
+                })
+
+        # Count active days this week
+        active_days_result = await db.execute(
+            select(func.count(func.distinct(func.date(WordProgress.last_practiced))))
+            .where(
+                and_(
+                    WordProgress.child_id == child_id,
+                    WordProgress.last_practiced >= datetime.combine(
+                        current_week_monday, datetime.min.time()
+                    ),
+                )
+            )
+        )
+        active_days = active_days_result.scalar() or 0
+
+        # Count words learned this week
+        week_words_result = await db.execute(
+            select(func.count(WordProgress.id.distinct()))
+            .where(
+                and_(
+                    WordProgress.child_id == child_id,
+                    WordProgress.last_practiced >= datetime.combine(
+                        current_week_monday, datetime.min.time()
+                    ),
+                )
+            )
+        )
+        week_words = week_words_result.scalar() or 0
+
+        # Compare to previous week
+        prev_week_monday = current_week_monday - timedelta(days=7)
+        prev_week_result = await db.execute(
+            select(func.count(WordProgress.id.distinct()))
+            .where(
+                and_(
+                    WordProgress.child_id == child_id,
+                    WordProgress.last_practiced >= datetime.combine(
+                        prev_week_monday, datetime.min.time()
+                    ),
+                    WordProgress.last_practiced < datetime.combine(
+                        current_week_monday, datetime.min.time()
+                    ),
+                )
+            )
+        )
+        prev_week_words = prev_week_result.scalar() or 0
+        if prev_week_words > 0:
+            growth = round(((week_words - prev_week_words) / prev_week_words) * 100, 1)
+        elif week_words > 0:
+            growth = 100.0
+        else:
+            growth = 0.0
+
+        # Build simple strengths / recommendations based on data
+        strengths = []
+        recommendations = []
+        if active_days >= 5:
+            strengths.append("持續學習習慣良好")
+        if week_words >= 10:
+            strengths.append("本週詞彙學習量高")
+        if top_cats:
+            strengths.append(f"在「{top_cats[0]['category']}」類別表現優秀")
+        if active_days < 3:
+            recommendations.append("嘗試每天保持至少短暫學習，建立穩定習慣")
+        if week_words < 5:
+            recommendations.append("可增加每日目標詞彙量，循序漸進提高")
+        if not recommendations:
+            recommendations.append("繼續保持，下週可嘗試挑戰更難的詞彙")
+
+        new_report = WeeklyReport(
+            id=str(uuid.uuid4()),
+            child_id=child_id,
+            week_start_date=current_week_monday,
+            week_end_date=current_week_sunday,
+            total_words_learned=week_words,
+            total_learning_time=week_words * 2,  # approx 2 min/word
+            total_sessions=active_days,
+            days_active=active_days,
+            milestones_reached=[],
+            new_badges_earned=[],
+            top_categories=top_cats,
+            strengths=strengths,
+            areas_to_improve=[],
+            recommendations=recommendations,
+            growth_percentage=growth,
+        )
+        db.add(new_report)
+        try:
+            await db.commit()
+            await db.refresh(new_report)
+            latest_report = new_report
+        except Exception:
+            await db.rollback()
+            # Non-fatal: summary still returns without report
+    # --- end auto-generate ---
+
     # Get parental control settings
     control_result = await db.execute(
         select(ParentalControl).where(ParentalControl.child_id == child_id)
@@ -425,36 +561,35 @@ async def get_words_by_date(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
     
-    # Get words from DailyWordTracking for this date
-    start_of_day = datetime.combine(target_date, datetime.min.time())
-    end_of_day = datetime.combine(target_date, datetime.max.time())
-    
+    # Match the same tracked rows and date bucketing logic used by the charts
+    # endpoint so the calendar count and the modal contents stay consistent.
     tracking_result = await db.execute(
         select(DailyWordTracking, Word, Category)
         .join(Word, DailyWordTracking.word_id == Word.id)
-        .join(Category, Word.category == Category.id)
-        .where(
-            and_(
-                DailyWordTracking.child_id == child_id,
-                DailyWordTracking.date >= start_of_day,
-                DailyWordTracking.date <= end_of_day
-            )
-        )
+        .outerjoin(Category, Word.category == Category.id)
+        .where(DailyWordTracking.child_id == child_id)
         .order_by(DailyWordTracking.created_at.desc())
     )
     records = tracking_result.all()
-    
-    # Format response
-    words_data = []
+
+    latest_records_by_word = {}
     for tracking, word, category in records:
+        if not tracking.date or tracking.date.date() != target_date:
+            continue
+        if tracking.word_id in latest_records_by_word:
+            continue
+        latest_records_by_word[tracking.word_id] = (tracking, word, category)
+
+    words_data = []
+    for tracking, word, category in latest_records_by_word.values():
         words_data.append({
             "id": word.id,
             "word": word.word,
             "word_cantonese": word.word_cantonese,
             "jyutping": word.jyutping,
             "image_url": word.image_url,
-            "category": category.name,
-            "category_cantonese": category.name_cantonese,
+            "category": category.name if category else "未分類",
+            "category_cantonese": category.name_cantonese if category else "未分類",
             "definition": word.definition,
             "definition_cantonese": word.definition_cantonese,
             "exposure_count": tracking.exposure_count,

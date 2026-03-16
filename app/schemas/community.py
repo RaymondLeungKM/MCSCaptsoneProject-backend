@@ -95,6 +95,20 @@ class FriendRequestCreate(BaseModel):
     addressee_email: str
 
 
+class FriendRequestByIdCreate(BaseModel):
+    """Identify the target parent by their user ID"""
+    addressee_id: str
+
+
+class UserSearchResult(BaseModel):
+    """Safe public profile returned when searching for a user by ID"""
+    id: str
+    full_name: str
+
+    class Config:
+        from_attributes = True
+
+
 class FriendshipResponse(BaseModel):
     id: str
     requester_id: str
