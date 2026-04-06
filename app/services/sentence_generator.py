@@ -8,7 +8,12 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
-from app.services.llm_service import get_llm_service, LLMMessage, LLMProvider
+from app.services.llm_service import (
+    LLMMessage,
+    LLMProvider,
+    get_configured_llm_provider,
+    get_llm_service,
+)
 from app.models.vocabulary import Word
 from app.models.generated_sentences import GeneratedSentence as GeneratedSentenceModel
 
@@ -46,8 +51,53 @@ class SentenceGenerator:
         {"id": "bedtime", "name": "睡覺時間", "name_en": "Bedtime", "description": "睡前時間"},
     ]
     
-    def __init__(self, provider: LLMProvider = LLMProvider.OLLAMA):
+    def __init__(self, provider: Optional[LLMProvider] = None):
         self.llm = get_llm_service(provider)
+
+    @staticmethod
+    def _build_fallback_jyutping(word_jyutping: str) -> str:
+        base = "ngo5 gin3 dou2"
+        word_part = word_jyutping.strip()
+        return f"{base} {word_part}".strip()
+
+    def _build_fallback_sentence(
+        self,
+        word_text: str,
+        word_cantonese: str,
+        word_jyutping: str,
+        context: str = "general",
+    ) -> GeneratedSentence:
+        return GeneratedSentence(
+            sentence=f"我見到{word_cantonese}。",
+            sentence_english=f"I see a {word_text}.",
+            jyutping=self._build_fallback_jyutping(word_jyutping),
+            context=context,
+            difficulty="easy",
+        )
+
+    def _normalize_generated_sentence(
+        self,
+        sentence: GeneratedSentence,
+        fallback_sentence: GeneratedSentence,
+    ) -> GeneratedSentence:
+        if not sentence.sentence or not sentence.sentence.strip():
+            return fallback_sentence
+
+        jyutping = (sentence.jyutping or "").strip()
+        if not jyutping:
+            return fallback_sentence
+
+        sentence_english = (sentence.sentence_english or "").strip() or fallback_sentence.sentence_english
+        context = (sentence.context or "").strip() or fallback_sentence.context
+        difficulty = (sentence.difficulty or "").strip() or fallback_sentence.difficulty
+
+        return GeneratedSentence(
+            sentence=sentence.sentence.strip(),
+            sentence_english=sentence_english,
+            jyutping=jyutping,
+            context=context,
+            difficulty=difficulty,
+        )
     
     def _build_generation_prompt(
         self,
@@ -199,9 +249,12 @@ Jyutping: go4 go1 heoi3 gung1 jyun4 waan2 (6個音節 ✓)
         word_text = word.word
         word_cantonese = word.word_cantonese or word.word
         word_jyutping = word.jyutping or ""
-        word_example = word.example
-        word_example_cantonese = word.example_cantonese
         category = word.category_rel.name if word.category_rel else "general"
+        fallback_sentence = self._build_fallback_sentence(
+            word_text=word_text,
+            word_cantonese=word_cantonese,
+            word_jyutping=word_jyutping,
+        )
         
         # Build prompt
         messages = self._build_generation_prompt(
@@ -222,14 +275,7 @@ Jyutping: go4 go1 heoi3 gung1 jyun4 waan2 (6個音節 ✓)
 
         if not isinstance(response, str) or not response.strip():
             print(f"[SentenceGenerator] Empty/invalid LLM response ({type(response).__name__}), using fallback sentence.")
-            sentences = [
-                GeneratedSentence(
-                    sentence=word_example_cantonese or word_example or f"我見到{word_cantonese}。",
-                    sentence_english=word_example or f"I see a {word_text}.",
-                    context="general",
-                    difficulty="easy",
-                )
-            ]
+            sentences = [fallback_sentence]
         else:
             # Parse JSON response
             try:
@@ -244,19 +290,16 @@ Jyutping: go4 go1 heoi3 gung1 jyun4 waan2 (6個音節 ✓)
                 response_clean = response_clean.strip()
                 
                 data = json.loads(response_clean)
-                sentences = [GeneratedSentence(**s) for s in data["sentences"]]
+                raw_sentences = [GeneratedSentence(**s) for s in data["sentences"]]
+                sentences = [
+                    self._normalize_generated_sentence(sentence, fallback_sentence)
+                    for sentence in raw_sentences
+                ]
             except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                 print(f"[SentenceGenerator] Failed to parse LLM response: {e}")
                 print(f"[SentenceGenerator] Raw response: {response}")
                 # Fallback: create basic sentences using pre-extracted attributes
-                sentences = [
-                    GeneratedSentence(
-                        sentence=word_example_cantonese or word_example or f"我見到{word_cantonese}。",
-                        sentence_english=word_example or f"I see a {word_text}.",
-                        context="general",
-                        difficulty="easy"
-                    )
-                ]
+                sentences = [fallback_sentence]
         
         # Save to database if requested
         if save_to_db and db is not None:
@@ -318,13 +361,13 @@ Jyutping: go4 go1 heoi3 gung1 jyun4 waan2 (6個音節 ✓)
         return result.sentences
 
 
-# Singleton instance
-_sentence_generator: Optional[SentenceGenerator] = None
+# Singleton instances keyed by provider
+_sentence_generators: Dict[LLMProvider, SentenceGenerator] = {}
 
 
-def get_sentence_generator(provider: LLMProvider = LLMProvider.OLLAMA) -> SentenceGenerator:
+def get_sentence_generator(provider: Optional[LLMProvider] = None) -> SentenceGenerator:
     """Get or create SentenceGenerator instance"""
-    global _sentence_generator
-    if _sentence_generator is None:
-        _sentence_generator = SentenceGenerator(provider=provider)
-    return _sentence_generator
+    resolved_provider = provider or get_configured_llm_provider()
+    if resolved_provider not in _sentence_generators:
+        _sentence_generators[resolved_provider] = SentenceGenerator(provider=resolved_provider)
+    return _sentence_generators[resolved_provider]

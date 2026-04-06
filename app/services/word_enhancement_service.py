@@ -6,7 +6,12 @@ from typing import Optional, Dict, Any
 import json
 from pydantic import BaseModel
 
-from app.services.llm_service import get_llm_service, LLMMessage, LLMProvider
+from app.services.llm_service import (
+    LLMMessage,
+    LLMProvider,
+    get_configured_llm_provider,
+    get_llm_service,
+)
 
 
 class EnhancedWordContent(BaseModel):
@@ -27,7 +32,7 @@ class WordEnhancementService:
     Used for words learned from external sources (object detection, etc.)
     """
     
-    def __init__(self, provider: LLMProvider = LLMProvider.OLLAMA):
+    def __init__(self, provider: Optional[LLMProvider] = None):
         self.llm = get_llm_service(provider)
     
     def _build_enhancement_prompt(
@@ -256,15 +261,15 @@ Create age-appropriate vocabulary content for 3-5 year old children in both Cant
         )
 
 
-# Global instance
-_enhancement_service: Optional[WordEnhancementService] = None
+# Global instances keyed by provider
+_enhancement_services: Dict[LLMProvider, WordEnhancementService] = {}
 
 
 def get_word_enhancement_service(
-    provider: LLMProvider = LLMProvider.OLLAMA
+    provider: Optional[LLMProvider] = None
 ) -> WordEnhancementService:
     """Get or create the word enhancement service singleton"""
-    global _enhancement_service
-    if _enhancement_service is None:
-        _enhancement_service = WordEnhancementService(provider)
-    return _enhancement_service
+    resolved_provider = provider or get_configured_llm_provider()
+    if resolved_provider not in _enhancement_services:
+        _enhancement_services[resolved_provider] = WordEnhancementService(resolved_provider)
+    return _enhancement_services[resolved_provider]

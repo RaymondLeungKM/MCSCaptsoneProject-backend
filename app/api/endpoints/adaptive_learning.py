@@ -101,13 +101,16 @@ async def get_recommendations(
     # Determine recommended activity based on learning style
     if child.learning_style == "kinesthetic":
         recommended_activity = "game"
-        reason = "Kinesthetic learner - games with physical activity recommended"
+        reason = "你適合用互動遊戲學習，邊玩邊記會更投入。"
     elif child.learning_style == "visual":
         recommended_activity = "story"
-        reason = "Visual learner - interactive stories recommended"
+        reason = "你適合用圖像和故事學習，會更容易理解新詞語。"
+    elif child.learning_style == "auditory":
+        recommended_activity = "story"
+        reason = "你適合多聽多讀，先用故事和聲音練習會更自然。"
     else:
         recommended_activity = "mixed"
-        reason = "Mixed approach for comprehensive learning"
+        reason = "今天適合用多種方式一起學，記憶會更穩固。"
     
     return {
         "next_words": next_words,
@@ -167,17 +170,18 @@ async def get_word_of_the_day(
     # Generate reason
     progress = progress_dict.get(best_word.id)
     if not progress:
-        reason = "New word to learn!"
+        reason = "這是今天很適合開始學的新詞語。"
     elif progress.exposure_count < 6:
-        reason = "Needs more practice for retention"
+        reason = "這個詞語還需要多練習幾次，會更容易記住。"
     elif not progress.mastered:
-        reason = "Almost mastered - one more push!"
+        reason = "差一點就完全掌握了，再努力一次。"
     else:
-        reason = "Review time!"
+        reason = "現在很適合重溫這個詞語。"
     
     return {
         "word_id": best_word.id,
         "word": best_word.word,
+        "word_cantonese": best_word.word_cantonese,
         "reason": reason,
         "priority_score": best_score
     }
@@ -216,7 +220,12 @@ async def get_next_activity(
         "recommended_activity": recommended,
         "learning_style": child.learning_style,
         "attention_span": child.attention_span,
-        "reason": f"Based on {child.learning_style} learning style"
+        "reason": {
+            "visual": "根據你的視覺學習風格，先用故事和圖片學習會更容易吸收。",
+            "auditory": "根據你的聽覺學習風格，先聽故事和跟讀會更自然。",
+            "kinesthetic": "根據你的動作學習風格，先玩互動遊戲會更投入。",
+            "mixed": "根據你的混合學習風格，先從互動練習開始最合適。",
+        }.get(child.learning_style, "系統根據你今天的學習節奏，幫你選好了下一步。")
     }
 
 

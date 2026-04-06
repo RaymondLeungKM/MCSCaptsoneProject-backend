@@ -35,8 +35,13 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     
     # AI/LLM Configuration
-    # LLM_PROVIDER: "openai", "anthropic", or "ollama"
-    LLM_PROVIDER: str = "ollama"  # Default to Ollama for local testing
+    # Primary switch for AI features. Supported values: "ollama", "openrouter", "openai", "anthropic"
+    LLM_PROVIDER: str = "ollama"
+
+    # OpenRouter (hosted models via OpenAI-compatible API)
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_MODEL: str = "openai/gpt-4o-mini"
     
     # OpenAI
     OPENAI_API_KEY: str = ""

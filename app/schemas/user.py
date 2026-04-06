@@ -81,6 +81,7 @@ class ChildUpdate(BaseModel):
     language_preference: Optional[LanguagePreference] = None
     attention_span: Optional[int] = None
     preferred_time_of_day: Optional[TimeOfDay] = None
+    interests: Optional[List[str]] = None
 
 
 class ChildResponse(ChildBase):

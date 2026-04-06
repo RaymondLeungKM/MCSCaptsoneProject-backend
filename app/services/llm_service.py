@@ -1,18 +1,33 @@
 """
 LLM Service for AI-powered content generation
-Supports multiple providers: OpenAI, Anthropic Claude, Ollama
+Supports multiple providers: OpenAI, Anthropic Claude, Ollama, OpenRouter
 """
-from typing import Optional, List, Dict, Any
-import os
 from enum import Enum
+from typing import Any, Dict, List, Optional
+
 import httpx
 from pydantic import BaseModel
+
+from app.core.config import settings
 
 
 class LLMProvider(str, Enum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
     OLLAMA = "ollama"
+    OPENROUTER = "openrouter"
+
+
+def get_configured_llm_provider() -> LLMProvider:
+    """Resolve the default provider from application settings."""
+    provider_name = settings.LLM_PROVIDER.strip().lower()
+    try:
+        return LLMProvider(provider_name)
+    except ValueError as exc:
+        supported = ", ".join(provider.value for provider in LLMProvider)
+        raise ValueError(
+            f"Unsupported LLM_PROVIDER '{settings.LLM_PROVIDER}'. Expected one of: {supported}"
+        ) from exc
 
 
 class LLMMessage(BaseModel):
@@ -27,42 +42,90 @@ class LLMService:
     
     def __init__(
         self, 
-        provider: LLMProvider = LLMProvider.OLLAMA,
+        provider: Optional[LLMProvider] = None,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         base_url: Optional[str] = None
     ):
-        self.provider = provider
+        self.provider = provider or get_configured_llm_provider()
         self.api_key = api_key or self._get_default_api_key()
         self.model = model or self._get_default_model()
         self.base_url = base_url or self._get_default_base_url()
         
         if self.provider != LLMProvider.OLLAMA and not self.api_key:
-            raise ValueError(f"API key required for {provider}. Set OPENAI_API_KEY or ANTHROPIC_API_KEY environment variable.")
+            raise ValueError(
+                f"API key required for {self.provider.value}. "
+                f"Set {self._get_api_key_setting_name()} in .env."
+            )
+
+    def _get_api_key_setting_name(self) -> str:
+        if self.provider == LLMProvider.OPENAI:
+            return "OPENAI_API_KEY"
+        if self.provider == LLMProvider.ANTHROPIC:
+            return "ANTHROPIC_API_KEY"
+        if self.provider == LLMProvider.OPENROUTER:
+            return "OPENROUTER_API_KEY"
+        return ""
     
     def _get_default_base_url(self) -> str:
         """Get default base URL for the provider"""
         if self.provider == LLMProvider.OLLAMA:
-            return os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+            return settings.OLLAMA_BASE_URL
+        if self.provider == LLMProvider.OPENROUTER:
+            return settings.OPENROUTER_BASE_URL
         return ""
     
     def _get_default_api_key(self) -> Optional[str]:
         if self.provider == LLMProvider.OPENAI:
-            return os.getenv("OPENAI_API_KEY")
-        elif self.provider == LLMProvider.ANTHROPIC:
-            return os.getenv("ANTHROPIC_API_KEY")
+            return settings.OPENAI_API_KEY
+        if self.provider == LLMProvider.ANTHROPIC:
+            return settings.ANTHROPIC_API_KEY
+        if self.provider == LLMProvider.OPENROUTER:
+            return settings.OPENROUTER_API_KEY
         return None
     
     def _get_default_model(self) -> str:
         if self.provider == LLMProvider.OPENAI:
             return "gpt-4o"  # or "gpt-4o-mini" for cheaper
-        elif self.provider == LLMProvider.ANTHROPIC:
+        if self.provider == LLMProvider.ANTHROPIC:
             return "claude-3-5-sonnet-20241022"
-        elif self.provider == LLMProvider.OLLAMA:
+        if self.provider == LLMProvider.OPENROUTER:
+            return settings.OPENROUTER_MODEL
+        if self.provider == LLMProvider.OLLAMA:
             # Read from environment variable, default to qwen2.5:1.5b (best for Cantonese)
             # To change: Update OLLAMA_MODEL in .env file
-            return os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b")
+            return settings.OLLAMA_MODEL
         return "gpt-4o"
+
+    @staticmethod
+    def _coerce_text_content(content: Any) -> Optional[str]:
+        """Normalize provider response content into a plain string."""
+        if isinstance(content, str):
+            text = content.strip()
+            return text or None
+
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    stripped = item.strip()
+                    if stripped:
+                        parts.append(stripped)
+                    continue
+
+                if not isinstance(item, dict):
+                    continue
+
+                text_value = item.get("text") or item.get("content")
+                if isinstance(text_value, str):
+                    stripped = text_value.strip()
+                    if stripped:
+                        parts.append(stripped)
+
+            if parts:
+                return "\n".join(parts)
+
+        return None
     
     async def generate(
         self, 
@@ -88,6 +151,8 @@ class LLMService:
             return await self._generate_anthropic(messages, temperature, max_tokens, **kwargs)
         elif self.provider == LLMProvider.OLLAMA:
             return await self._generate_ollama(messages, temperature, max_tokens, **kwargs)
+        elif self.provider == LLMProvider.OPENROUTER:
+            return await self._generate_openrouter(messages, temperature, max_tokens, **kwargs)
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
     
@@ -160,6 +225,57 @@ class LLMService:
             response.raise_for_status()
             data = response.json()
             return data["content"][0]["text"]
+
+    async def _generate_openrouter(
+        self,
+        messages: List[LLMMessage],
+        temperature: float,
+        max_tokens: int,
+        **kwargs
+    ) -> str:
+        """Generate using OpenRouter's OpenAI-compatible chat completions API."""
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "X-Title": settings.PROJECT_NAME,
+        }
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **kwargs,
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            choices = data.get("choices") or []
+            if not choices:
+                raise ValueError(f"OpenRouter returned no choices for model '{self.model}'.")
+
+            choice = choices[0]
+            message = choice.get("message") or {}
+
+            generated_text = (
+                self._coerce_text_content(message.get("content"))
+                or self._coerce_text_content(choice.get("text"))
+                or self._coerce_text_content(message.get("reasoning"))
+                or self._coerce_text_content(choice.get("reasoning"))
+            )
+
+            if not generated_text:
+                finish_reason = choice.get("finish_reason")
+                raise ValueError(
+                    f"OpenRouter returned empty content for model '{self.model}'. "
+                    f"finish_reason={finish_reason}, message_keys={list(message.keys())}"
+                )
+
+            return generated_text
     
     async def _generate_ollama(
         self, 
@@ -347,29 +463,18 @@ class LLMService:
                 raise ValueError(f"Ollama error: {str(e)}")
 
 
-# Singleton instances
-_openai_service: Optional[LLMService] = None
-_anthropic_service: Optional[LLMService] = None
-_ollama_service: Optional[LLMService] = None
+
+# Singleton instances keyed by provider
+_service_instances: Dict[LLMProvider, LLMService] = {}
 
 
-def get_llm_service(provider: LLMProvider = LLMProvider.OLLAMA) -> LLMService:
+def get_llm_service(provider: Optional[LLMProvider] = None) -> LLMService:
     """
     Get or create LLM service instance (singleton pattern)
     """
-    global _openai_service, _anthropic_service, _ollama_service
-    
-    if provider == LLMProvider.OPENAI:
-        if _openai_service is None:
-            _openai_service = LLMService(provider=LLMProvider.OPENAI)
-        return _openai_service
-    elif provider == LLMProvider.ANTHROPIC:
-        if _anthropic_service is None:
-            _anthropic_service = LLMService(provider=LLMProvider.ANTHROPIC)
-        return _anthropic_service
-    elif provider == LLMProvider.OLLAMA:
-        if _ollama_service is None:
-            _ollama_service = LLMService(provider=LLMProvider.OLLAMA)
-        return _ollama_service
-    else:
-        raise ValueError(f"Unsupported provider: {provider}")
+    resolved_provider = provider or get_configured_llm_provider()
+
+    if resolved_provider not in _service_instances:
+        _service_instances[resolved_provider] = LLMService(provider=resolved_provider)
+
+    return _service_instances[resolved_provider]

@@ -11,7 +11,6 @@ Key safety constraints
 * The endpoint requires a valid parent JWT so parents can supervise.
 * All responses are tagged safe_mode=True (content policy enforced via prompt).
 """
-import os
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -21,7 +20,7 @@ from app.models.user import User, Child
 from app.models.vocabulary import Word
 from app.core.security import get_current_active_user
 from app.schemas.phase8 import TutorChatRequest, TutorChatResponse
-from app.services.llm_service import LLMService, LLMProvider, LLMMessage
+from app.services.llm_service import LLMService, LLMMessage, get_llm_service
 
 router = APIRouter()
 
@@ -29,11 +28,7 @@ MAX_HISTORY_TURNS = 10  # keep context window small
 
 
 def _build_llm_service() -> LLMService:
-    if os.getenv("ANTHROPIC_API_KEY"):
-        return LLMService(provider=LLMProvider.ANTHROPIC)
-    if os.getenv("OPENAI_API_KEY"):
-        return LLMService(provider=LLMProvider.OPENAI)
-    return LLMService(provider=LLMProvider.OLLAMA)
+    return get_llm_service()
 
 
 SYSTEM_PROMPT = """你是「小博士」，一個親切、有耐心的廣東話詞彙學習助手，專門幫助3至6歲的幼兒學習廣東話。
@@ -94,6 +89,8 @@ async def tutor_chat(
     try:
         llm = _build_llm_service()
         answer = await llm.generate(messages, temperature=0.6, max_tokens=300)
+        if not isinstance(answer, str) or not answer.strip():
+            raise ValueError("LLM returned an empty tutor response")
     except Exception as exc:
         # Graceful degradation – return a canned fallback instead of a 500
         answer = (

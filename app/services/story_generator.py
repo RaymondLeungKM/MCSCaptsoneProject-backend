@@ -1,7 +1,6 @@
 """
 AI-powered bedtime story generation service
 """
-import os
 import time
 import uuid
 from typing import List, Dict, Any, Optional
@@ -14,7 +13,12 @@ from app.models.vocabulary import Word
 from app.models.user import Child
 from app.schemas.stories import DailyWordSummary, StoryGenerationRequest
 from app.core.config import settings
-from app.services.llm_service import LLMService, LLMProvider, LLMMessage
+from app.services.llm_service import (
+    LLMMessage,
+    LLMProvider,
+    get_configured_llm_provider,
+    get_llm_service,
+)
 from app.services.tts_service import tts_service
 
 
@@ -22,24 +26,11 @@ class StoryGeneratorService:
     """Service for generating AI-powered bedtime stories"""
     
     def __init__(self, provider: Optional[LLMProvider] = None):
-        # Determine which LLM provider to use
-        # Priority: config setting > environment variable > Ollama (for local testing)
-        if provider:
-            self.provider = provider
-        elif hasattr(settings, 'LLM_PROVIDER') and settings.LLM_PROVIDER:
-            self.provider = LLMProvider(settings.LLM_PROVIDER)
-        elif os.getenv("ANTHROPIC_API_KEY"):
-            self.provider = LLMProvider.ANTHROPIC
-        elif os.getenv("OPENAI_API_KEY"):
-            self.provider = LLMProvider.OPENAI
-        else:
-            # Default to Ollama for local testing
-            self.provider = LLMProvider.OLLAMA
-            print("[StoryGenerator] Using Ollama for local story generation")
+        self.provider = provider or get_configured_llm_provider()
         
         try:
-            self.llm_service = LLMService(provider=self.provider)
-            print(f"[StoryGenerator] Initialized with provider: {self.provider}")
+            self.llm_service = get_llm_service(self.provider)
+            print(f"[StoryGenerator] Initialized with provider: {self.provider.value}")
         except Exception as e:
             print(f"[StoryGenerator] Warning: Could not initialize LLM service: {e}")
             self.llm_service = None
@@ -356,7 +347,10 @@ class StoryGeneratorService:
         """Generate a bedtime story using AI"""
 
         if not self.llm_service:
-            raise ValueError("LLM service not initialized. Please configure an API key or run Ollama locally.")
+            raise ValueError(
+                f"LLM service not initialized for provider '{self.provider.value}'. "
+                "Check LLM_PROVIDER and the corresponding credentials/configuration in .env."
+            )
 
         start_time = time.time()
 

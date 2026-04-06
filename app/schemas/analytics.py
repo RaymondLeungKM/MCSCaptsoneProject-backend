@@ -96,6 +96,23 @@ class ProgressStatsResponse(BaseModel):
     multi_sensory_engagement: float  # Percentage
 
 
+class LearningControlStatusResponse(BaseModel):
+    child_id: str
+    local_date: date
+    today_minutes: int
+    active_session_minutes: int
+    session_count: int
+    has_activity_today: bool
+    daily_screen_time_limit: Optional[int] = None
+    screen_time_warning_threshold: int = 20
+    enable_time_limits: bool = False
+    remaining_minutes: Optional[int] = None
+    warning_reached: bool = False
+    limit_reached: bool = False
+    daily_reminder_enabled: bool = True
+    daily_reminder_time: str = "18:00"
+
+
 # Achievement schemas
 class AchievementCriteria(BaseModel):
     type: str  # "words_mastered", "streak", "xp_total", etc.
@@ -146,5 +163,6 @@ class AdaptiveLearningRecommendation(BaseModel):
 class WordOfTheDayResponse(BaseModel):
     word_id: str
     word: str
+    word_cantonese: Optional[str] = None
     reason: str
     priority_score: int

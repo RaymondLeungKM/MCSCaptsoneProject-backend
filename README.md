@@ -135,12 +135,17 @@ ASYNC_DATABASE_URL=postgresql+asyncpg://user:password@localhost/dbname
 # Security
 SECRET_KEY=your-secret-key-here
 
-# CORS (comma-separated)
-ALLOWED_ORIGINS=http://localhost:3000,http://localhost:3001
+# AI provider switch
+LLM_PROVIDER=ollama
 
-# Ollama (optional - for AI content generation)
+# Ollama (local AI content generation)
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.2:1b
+
+# OpenRouter (hosted AI content generation)
+OPENROUTER_API_KEY=sk-or-your-openrouter-key
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_MODEL=openai/gpt-4o-mini
 ```
 
 ## 🗄️ Database Models
