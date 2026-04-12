@@ -113,8 +113,8 @@ backend/
 
 ### Content
 
-- `POST /stories/generate` - Generate AI story
-- `GET /stories/{id}` - Get story details
+- `POST /bedtime-stories/generate` - Generate AI bedtime story
+- `GET /bedtime-stories/{child_id}/{story_id}` - Get generated bedtime story details
 - `POST /sentences/generate` - Generate example sentences
 
 ### Analytics
@@ -156,7 +156,7 @@ OPENROUTER_MODEL=openai/gpt-4o-mini
 - **Word** - Vocabulary words with Cantonese/English
 - **WordProgress** - Individual word learning progress
 - **LearningSession** - Learning activity sessions
-- **Story** - Generated stories
+- **GeneratedStory** - AI-generated bedtime stories
 - **GeneratedSentence** - Example sentences
 - **DailyLearningStats** - Daily aggregated statistics
 - **WeeklyReport** - Weekly progress reports
@@ -241,12 +241,12 @@ This project is for educational purposes.
 - `GET /api/v1/categories/{category_id}/words` - Get words in category
 - `POST /api/v1/categories` - Create category (admin)
 
-### Stories
+### Bedtime Stories
 
-- `GET /api/v1/stories` - List stories
-- `GET /api/v1/stories/{story_id}` - Get story with pages
-- `GET /api/v1/stories/child/{child_id}` - Get stories with progress
-- `POST /api/v1/stories/{story_id}/progress` - Update story progress
+- `GET /api/v1/bedtime-stories/daily-words/{child_id}` - Get words tracked for bedtime story generation
+- `POST /api/v1/bedtime-stories/track-word` - Track a word for bedtime story generation
+- `POST /api/v1/bedtime-stories/generate` - Generate a bedtime story
+- `GET /api/v1/bedtime-stories/list/{child_id}` - List generated bedtime stories
 
 ### Games
 

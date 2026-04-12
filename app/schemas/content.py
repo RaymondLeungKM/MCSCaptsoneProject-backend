@@ -1,17 +1,10 @@
 """
-Pydantic schemas for Content (Stories, Games, Missions)
+Pydantic schemas for content domains still exposed by the API.
 """
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 from datetime import datetime
 from enum import Enum
-
-
-class PromptType(str, Enum):
-    OPEN_ENDED = "open-ended"
-    RECALL = "recall"
-    PREDICTION = "prediction"
-    CONNECTION = "connection"
 
 
 class GameType(str, Enum):
@@ -31,70 +24,6 @@ class MissionContext(str, Enum):
     OUTDOOR = "outdoor"
     SHOPPING = "shopping"
     GENERAL = "general"
-
-
-# Story schemas
-class DialogicPrompt(BaseModel):
-    id: str
-    type: PromptType
-    question: str
-    target_words: List[str]
-    acceptable_responses: Optional[List[str]] = None
-
-
-class StoryPage(BaseModel):
-    id: str
-    text: str
-    highlighted_words: List[str]
-    emoji: str
-    dialogic_prompts: Optional[List[DialogicPrompt]] = None
-    physical_action: Optional[str] = None
-
-
-class StoryBase(BaseModel):
-    title: str
-    cover_image_url: Optional[str] = None
-    duration: str = "5 min"
-    description: Optional[str] = None
-    difficulty: str = "easy"
-
-
-class StoryCreate(StoryBase):
-    pages: List[StoryPage]
-    target_words: List[str]
-    comprehension_questions: Optional[List[DialogicPrompt]] = None
-
-
-class StoryUpdate(BaseModel):
-    title: Optional[str] = None
-    cover_image_url: Optional[str] = None
-    duration: Optional[str] = None
-    description: Optional[str] = None
-    pages: Optional[List[StoryPage]] = None
-    target_words: Optional[List[str]] = None
-
-
-class StoryResponse(StoryBase):
-    id: str
-    pages: List[StoryPage]
-    target_words: List[str]
-    comprehension_questions: Optional[List[DialogicPrompt]] = None
-    is_active: bool
-    created_at: datetime
-    
-    class Config:
-        from_attributes = True
-
-
-class StoryProgressResponse(BaseModel):
-    story_id: str
-    completed: bool
-    repeat_count: int
-    last_read: Optional[datetime] = None
-    pages_completed: int
-    
-    class Config:
-        from_attributes = True
 
 
 # Game schemas
