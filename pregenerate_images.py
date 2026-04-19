@@ -86,6 +86,9 @@ async def pregenerate_all(force: bool = False, limit: int | None = None):
             _save_cache(cache_key, image_bytes, content_type)
             generated += 1
             print(f"✅ ({elapsed:.1f}s, {len(image_bytes)//1024}KB)")
+            # Respect 2 IPM limit: wait 31s before next request (unless last word)
+            if i < total:
+                time.sleep(31)
         else:
             failed += 1
             print(f"❌ failed ({elapsed:.1f}s)")

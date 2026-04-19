@@ -21,6 +21,7 @@ from app.api.endpoints import (
     uploads,
     images,
     pronunciation,
+    community,
 )
 
 api_router = APIRouter()
@@ -43,3 +44,4 @@ api_router.include_router(audio.router, prefix="/audio", tags=["Audio"])
 api_router.include_router(uploads.router, prefix="/uploads", tags=["File Uploads"])
 api_router.include_router(images.router, prefix="/images", tags=["Image Generation"])
 api_router.include_router(pronunciation.router, prefix="/audio", tags=["Audio"])
+api_router.include_router(community.router, prefix="/community", tags=["Community"])
