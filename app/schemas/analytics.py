@@ -13,6 +13,38 @@ class EngagementLevel(str, Enum):
     HIGH = "high"
 
 
+# ── Game Session schemas ─────────────────────────────────────────────────────
+
+class GameSessionCreate(BaseModel):
+    """Body sent by the frontend when a mini-game ends"""
+    child_id: str
+    score: int = 0
+    max_score: int = 0
+    duration_seconds: int = 0
+    words_seen: List[str] = []      # word IDs shown to child
+    words_correct: List[str] = []   # word IDs answered correctly
+    stars: int = 1                  # 1–3
+
+
+class GameSessionResponse(BaseModel):
+    id: int
+    child_id: str
+    game_id: str
+    score: int
+    max_score: int
+    duration_seconds: int
+    words_seen: List[str] = []
+    words_correct: List[str] = []
+    stars: int
+    xp_earned: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ── Learning Session schemas ─────────────────────────────────────────────────
+
 # Learning Session schemas
 class ActivityCompleted(BaseModel):
     type: str  # "story", "game", "mission"
@@ -42,9 +74,9 @@ class LearningSessionResponse(BaseModel):
     start_time: datetime
     end_time: Optional[datetime] = None
     duration_minutes: Optional[int] = None
-    words_encountered: List[str]
-    words_used_actively: List[str]
-    activities_completed: List[ActivityCompleted]
+    words_encountered: List[str] = []
+    words_used_actively: List[str] = []
+    activities_completed: List[ActivityCompleted] = []
     engagement_level: EngagementLevel
     interactions_count: int
     xp_earned: int

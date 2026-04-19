@@ -59,9 +59,9 @@ class LLMService:
         elif self.provider == LLMProvider.ANTHROPIC:
             return "claude-3-5-sonnet-20241022"
         elif self.provider == LLMProvider.OLLAMA:
-            # Read from environment variable, default to qwen2.5:1.5b (best for Cantonese)
+            # Read from environment variable, default to qwen2.5:7b (best for Cantonese)
             # To change: Update OLLAMA_MODEL in .env file
-            return os.getenv("OLLAMA_MODEL", "qwen2.5:1.5b")
+            return os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
         return "gpt-4o"
     
     async def generate(

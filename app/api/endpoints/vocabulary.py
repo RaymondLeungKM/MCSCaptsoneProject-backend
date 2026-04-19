@@ -28,10 +28,177 @@ from app.models.generated_sentences import GeneratedSentence as GeneratedSentenc
 from app.models.user import User, Child
 from app.core.security import get_current_active_user
 from app.core.category_colors import get_category_color
+from app.core.config import settings
 from app.services.sentence_generator import get_sentence_generator, SentenceGenerationResult
 from app.services.word_enhancement_service import get_word_enhancement_service
 
 router = APIRouter()
+
+
+def _mongo_to_word_response(doc: dict, child_id: str) -> dict:
+    """Convert MongoDB camera-capture document into WordResponse-compatible payload."""
+    word = (doc.get("word") or doc.get("label") or doc.get("detected_word") or "Object").strip()
+    word_cantonese = (doc.get("word_cantonese") or doc.get("label_cantonese") or doc.get("word_zh") or None)
+    image_url = doc.get("image_url") or doc.get("imageUrl") or doc.get("image_path")
+    source = doc.get("source") or "object_detection"
+    category = doc.get("category") or "general"
+    created_at = doc.get("timestamp") or doc.get("created_at") or datetime.utcnow()
+
+    # Ensure created_at is datetime
+    if isinstance(created_at, str):
+        try:
+            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except Exception:
+            created_at = datetime.utcnow()
+
+    return {
+        "id": f"mongo-{str(doc.get('_id', uuid.uuid4()))}",
+        "word": word,
+        "word_cantonese": word_cantonese,
+        "jyutping": doc.get("jyutping"),
+        "category": category,
+        "category_name": category,
+        "category_name_cantonese": doc.get("category_cantonese"),
+        "pronunciation": doc.get("pronunciation"),
+        "definition": doc.get("definition") or f"Word captured from camera ({source})",
+        "definition_cantonese": doc.get("definition_cantonese"),
+        "example": doc.get("example") or f"I saw a {word.lower()}.",
+        "example_cantonese": doc.get("example_cantonese"),
+        "difficulty": (doc.get("difficulty") or "easy").lower(),
+        "physical_action": doc.get("physical_action"),
+        "image_url": image_url,
+        "audio_url": doc.get("audio_url"),
+        "audio_url_english": doc.get("audio_url_english"),
+        "contexts": doc.get("contexts") or [source],
+        "related_words": doc.get("related_words") or [],
+        "total_exposures": int(doc.get("total_exposures") or doc.get("exposure_count") or 1),
+        "success_rate": float(doc.get("success_rate") or 1.0),
+        "is_active": bool(doc.get("is_active", True)),
+        "created_at": created_at,
+        "created_by_child_id": child_id,
+    }
+
+
+async def _fetch_mongo_captured_words(child_id: str, limit: int) -> List[dict]:
+    """Fetch camera-captured words from MongoDB when configured."""
+    if not settings.MONGODB_ENABLED or not settings.MONGODB_URI:
+        return []
+
+    try:
+        from pymongo import MongoClient  # type: ignore
+    except Exception:
+        # pymongo not installed - return gracefully
+        return []
+
+    docs: List[dict] = []
+    client = None
+    try:
+        client = MongoClient(settings.MONGODB_URI, serverSelectionTimeoutMS=2000)
+        collection = client[settings.MONGODB_DATABASE][settings.MONGODB_CAMERA_COLLECTION]
+
+        cursor = (
+            collection.find({"child_id": child_id})
+            .sort("timestamp", -1)
+            .limit(limit)
+        )
+        docs = list(cursor)
+    except Exception as e:
+        print(f"[Mongo Capture] Failed to read MongoDB captures: {e}")
+        docs = []
+    finally:
+        if client:
+            client.close()
+
+    return [_mongo_to_word_response(doc, child_id) for doc in docs]
+
+
+@router.get("/external/captured/{child_id}", response_model=List[WordResponse])
+async def get_external_captured_words(
+    child_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    include_mongodb: bool = Query(False, description="Merge camera captures from MongoDB if configured"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get camera-captured/user-uploaded words for a child (PostgreSQL + optional MongoDB)."""
+    # Verify child exists
+    child_result = await db.execute(select(Child).where(Child.id == child_id))
+    child = child_result.scalar_one_or_none()
+    if not child:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Child not found: {child_id}",
+        )
+
+    query = (
+        select(Word)
+        .options(selectinload(Word.category_rel))
+        .where(Word.is_active == True, Word.created_by_child_id == child_id)
+        .order_by(Word.created_at.desc())
+        .limit(limit)
+    )
+    result = await db.execute(query)
+    sql_words = result.scalars().all()
+
+    response_words: List[dict] = []
+    for word in sql_words:
+        word_dict = WordResponse.model_validate(word).model_dump()
+        word_dict["category_name"] = word.category_rel.name if word.category_rel else None
+        word_dict["category_name_cantonese"] = word.category_rel.name_cantonese if word.category_rel else None
+        response_words.append(word_dict)
+
+    if include_mongodb:
+        mongo_words = await _fetch_mongo_captured_words(child_id=child_id, limit=limit)
+
+        # Dedupe by normalized word text + image URL; keep SQL rows first
+        seen = {
+            f"{(w.get('word') or '').strip().lower()}|{w.get('image_url') or ''}"
+            for w in response_words
+        }
+        for mw in mongo_words:
+            key = f"{(mw.get('word') or '').strip().lower()}|{mw.get('image_url') or ''}"
+            if key not in seen:
+                response_words.append(mw)
+                seen.add(key)
+
+    return response_words[:limit]
+
+
+@router.get("/community", response_model=List[WordResponse])
+async def get_community_words(
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Return recent camera-captured words from children with community sharing enabled.
+    
+    child_id is intentionally omitted from the response to protect child privacy.
+    """
+    # Join Word → Child; filter on community_sharing_enabled
+    query = (
+        select(Word)
+        .join(Child, Word.created_by_child_id == Child.id)
+        .options(selectinload(Word.category_rel))
+        .where(
+            Word.is_active == True,
+            Word.created_by_child_id.isnot(None),
+            Child.community_sharing_enabled == True,
+        )
+        .order_by(Word.created_at.desc())
+        .limit(limit)
+    )
+    result = await db.execute(query)
+    words = result.scalars().all()
+
+    response = []
+    for word in words:
+        word_dict = WordResponse.model_validate(word).model_dump()
+        word_dict["category_name"] = word.category_rel.name if word.category_rel else None
+        word_dict["category_name_cantonese"] = word.category_rel.name_cantonese if word.category_rel else None
+        # Anonymise — do not expose which child captured this word
+        word_dict["created_by_child_id"] = None
+        response.append(word_dict)
+
+    return response
 
 
 # Background task for sentence generation
@@ -77,18 +244,39 @@ async def generate_sentences_background(word_id: str, word_text: str):
 async def get_words(
     category: Optional[str] = None,
     difficulty: Optional[str] = None,
-    limit: int = Query(50, le=100),
+    child_id: Optional[str] = None,
+    include_external: bool = Query(True, description="Include child uploaded/captured words when child_id is provided"),
+    include_mongodb: bool = Query(False, description="Merge camera captures from MongoDB when child_id is provided"),
+    limit: int = Query(50, le=250),
     offset: int = 0,
     db: AsyncSession = Depends(get_db)
 ):
     """Get list of words with optional filters"""
     query = select(Word).options(selectinload(Word.category_rel)).where(Word.is_active == True)
+
+    # By default, keep system words; when child_id provided, optionally include child's external words too.
+    if child_id and include_external:
+        from sqlalchemy import or_
+        query = query.where(
+            or_(
+                Word.created_by_child_id.is_(None),
+                Word.created_by_child_id == child_id,
+            )
+        )
+    else:
+        query = query.where(Word.created_by_child_id.is_(None))
     
     if category:
         query = query.where(Word.category == category)
     if difficulty:
         query = query.where(Word.difficulty == difficulty)
     
+    # Prefer child-specific words first when child_id is provided.
+    if child_id and include_external:
+        query = query.order_by(Word.created_by_child_id.desc().nullslast(), Word.created_at.desc())
+    else:
+        query = query.order_by(Word.created_at.desc())
+
     query = query.limit(limit).offset(offset)
     
     result = await db.execute(query)
@@ -102,7 +290,19 @@ async def get_words(
         word_dict['category_name_cantonese'] = word.category_rel.name_cantonese if word.category_rel else None
         response_words.append(word_dict)
     
-    return response_words
+    if child_id and include_mongodb:
+        mongo_words = await _fetch_mongo_captured_words(child_id=child_id, limit=limit)
+        seen = {
+            f"{(w.get('word') or '').strip().lower()}|{w.get('image_url') or ''}"
+            for w in response_words
+        }
+        for mw in mongo_words:
+            key = f"{(mw.get('word') or '').strip().lower()}|{mw.get('image_url') or ''}"
+            if key not in seen:
+                response_words.append(mw)
+                seen.add(key)
+
+    return response_words[:limit]
 
 
 @router.get("/{word_id}", response_model=WordResponse)
@@ -769,6 +969,12 @@ async def generate_word_sentences(
         print(f"[GenerateSentences] ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
+        error_str = str(e)
+        if any(kw in error_str for kw in ["Cannot connect to Ollama", "ollama", "Ollama", "connect", "Connection refused"]):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI service unavailable. Please ensure Ollama is running: ollama serve"
+            )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate sentences: {str(e)}"

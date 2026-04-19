@@ -64,7 +64,7 @@ async def get_current_user(
         user_id: str = payload.get("sub")
         if user_id is None:
             raise credentials_exception
-    except JWTError:
+    except Exception:
         raise credentials_exception
     
     # Get user from database

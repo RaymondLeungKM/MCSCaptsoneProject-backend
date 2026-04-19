@@ -37,7 +37,13 @@ class TTSService:
         lang = (language or "cantonese").lower()
 
         if lang in {"cantonese", "yue", "zh-hk"}:
-            return [("yue", "com.hk"), ("zh-tw", "com.tw"), ("zh-cn", "com")]
+            # IMPORTANT: Never fall back to zh-tw / zh-cn — those give Mandarin
+            # pronunciation (書面語) instead of Cantonese 口語.
+            return [
+                ("yue", "com.hk"),   # Native Cantonese (preferred)
+                ("yue", "com"),      # Native Cantonese, global domain
+                ("zh", "com.hk"),    # Chinese via HK domain — usually Cantonese
+            ]
         if lang in {"english", "en"}:
             return [("en", "com"), ("en", "co.uk")]
         if lang in {"mandarin", "zh", "zh-cn", "zh-tw"}:

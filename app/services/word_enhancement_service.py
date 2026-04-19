@@ -4,6 +4,7 @@ Automatically generate bilingual content (Cantonese + English) for words using A
 """
 from typing import Optional, Dict, Any
 import json
+import re
 from pydantic import BaseModel
 
 from app.services.llm_service import get_llm_service, LLMMessage, LLMProvider
@@ -30,6 +31,19 @@ class WordEnhancementService:
     def __init__(self, provider: LLMProvider = LLMProvider.OLLAMA):
         self.llm = get_llm_service(provider)
     
+    @staticmethod
+    def _is_valid_jyutping(jyutping: str) -> bool:
+        """
+        Validate that a jyutping string is genuine Cantonese romanisation.
+        Real Jyutping always contains at least one tone digit (1-6).
+        Mandarin Pinyin uses diacritics (ā á ǎ etc.) and no tone digits.
+        """
+        if not jyutping or not jyutping.strip():
+            return False
+        has_tone_digit = bool(re.search(r'[1-6]', jyutping))
+        has_pinyin_diacritic = bool(re.search(r'[āáǎàōóǒūúǔùīíǐìēéěèǖǘǚǜ]', jyutping, re.IGNORECASE))
+        return has_tone_digit and not has_pinyin_diacritic
+
     def _build_enhancement_prompt(
         self,
         word: str,
@@ -41,27 +55,29 @@ class WordEnhancementService:
         system_prompt = """你是一位專業的香港幼兒教育專家和雙語詞彙專家。
 你的任務是為3-5歲幼兒創建適合他們年齡的詞彙資料，包括粵語和英語兩種語言。
 
+⚠️ **最重要嘅要求：所有粵語內容必須用廣東話口語（spoken Cantonese），唔好用書面語（written Chinese）！**
+
+✅ 正確（口語）：「我睇到一隻貓」「呢個好靚」「佢鍾意食蘋果」「你識唔識呀」
+❌ 錯誤（書面語）：「我看到一隻貓」「這個很漂亮」「他喜歡吃蘋果」「你認識嗎」
+
+**常見廣東話 vs 普通話用詞：**
+- 睇(看) 食(吃) 飲(喝) 嘢(東西) 佢(他/她) 咗(了) 喺(在) 嗰(那) 呢(這)
+- 靚(漂亮) 嘢食(食物) 返屋企(回家) 落雨(下雨) 攞(拿) 俾(給) 揾(找)
+- 好似(好像) 點解(為什麼) 咩(什麼) 幾時(什麼時候) 邊度(哪裡)
+- 馬騮(猴子) 雀仔(小鳥) 遮(雨傘) 荷包(錢包) 雪櫃(冰箱)
+
 **重要要求：**
 1. 定義必須簡單易懂，適合3-5歲幼兒
 2. 粵語拼音 (Jyutping) 必須100%正確
 3. 例句要貼近香港幼兒的日常生活
 4. 例句長度：6-10個字
 5. 詞彙難度評估：easy (基本日常詞), medium (需要學習), hard (抽象概念)
+6. word_cantonese 要用香港人日常講嘅口語詞，唔好用書面語詞
 
 **標準粵語拼音參考：**
 我=ngo5 你=nei5 佢=keoi5 係=hai6 喺=hai2 見=gin3 到=dou2/dou3
 媽=maa1/maa4 爸=baa1/baa4 哥=go1/go4 姐=ze1/ze2 細=sai3
-食=sik6 飲=jam2 玩=waan2 睇=tai2 有=jau5 冇=mou5
-
-You are a professional Hong Kong early childhood educator and bilingual vocabulary expert.
-Create age-appropriate vocabulary content for 3-5 year old children in both Cantonese and English.
-
-**Requirements:**
-1. Definitions must be simple and suitable for preschoolers
-2. Cantonese Jyutping must be 100% accurate
-3. Example sentences should reflect Hong Kong children's daily life
-4. Sentence length: 6-10 characters
-5. Difficulty: easy (daily basics), medium (learning required), hard (abstract concepts)"""
+食=sik6 飲=jam2 玩=waan2 睇=tai2 有=jau5 冇=mou5"""
         
         context_info = f"這個詞語是透過{source}學習的" if source != "object_detection" else "這個詞語是透過物件識別學習的"
         
@@ -201,7 +217,13 @@ Create age-appropriate vocabulary content for 3-5 year old children in both Cant
                 if missing_fields:
                     print(f"[WordEnhancement] WARNING: Missing fields: {missing_fields}")
                     raise ValueError(f"Missing required fields: {missing_fields}")
-                
+
+                # Validate jyutping — reject Mandarin Pinyin (diacritics, no tone digits)
+                jyutping_val = data.get("jyutping", "")
+                if not self._is_valid_jyutping(jyutping_val):
+                    print(f"[WordEnhancement] ❌ Invalid jyutping detected (likely Mandarin Pinyin): '{jyutping_val}'")
+                    raise ValueError(f"Invalid jyutping (appears to be Pinyin, not Jyutping): '{jyutping_val}'")
+
                 # Create result
                 result = EnhancedWordContent(**data)
                 
@@ -249,9 +271,9 @@ Create age-appropriate vocabulary content for 3-5 year old children in both Cant
             word_cantonese=word,  # Use English as fallback
             jyutping="",
             definition_english=f"A word learned through observation",
-            definition_cantonese=f"透過觀察學習的詞語",
+            definition_cantonese=f"透過睇嘢學識嘅詞語",
             example_english=f"I learned about {word.lower()}",
-            example_cantonese=f"我學習了{word}",
+            example_cantonese=f"我學識咗{word}",
             difficulty="easy"
         )
 

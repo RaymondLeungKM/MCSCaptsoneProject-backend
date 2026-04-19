@@ -19,6 +19,8 @@ from app.api.endpoints import (
     parent_dashboard,
     audio,
     uploads,
+    images,
+    pronunciation,
 )
 
 api_router = APIRouter()
@@ -39,3 +41,5 @@ api_router.include_router(adaptive_learning.router, prefix="/adaptive", tags=["A
 api_router.include_router(parent_dashboard.router)
 api_router.include_router(audio.router, prefix="/audio", tags=["Audio"])
 api_router.include_router(uploads.router, prefix="/uploads", tags=["File Uploads"])
+api_router.include_router(images.router, prefix="/images", tags=["Image Generation"])
+api_router.include_router(pronunciation.router, prefix="/audio", tags=["Audio"])

@@ -46,11 +46,20 @@ class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
 
 
+class ConsentUpdate(BaseModel):
+    consent_camera: bool
+    consent_microphone: bool
+    consent_analytics: bool
+    community_sharing_enabled: Optional[bool] = False
+
+
 class UserResponse(UserBase):
     id: str
     role: UserRole
     is_active: bool
     created_at: datetime
+    consent_given: bool = False
+    consent_given_at: Optional[datetime] = None
     
     class Config:
         from_attributes = True
@@ -81,6 +90,7 @@ class ChildUpdate(BaseModel):
     language_preference: Optional[LanguagePreference] = None
     attention_span: Optional[int] = None
     preferred_time_of_day: Optional[TimeOfDay] = None
+    community_sharing_enabled: Optional[bool] = None
 
 
 class ChildResponse(ChildBase):
@@ -94,6 +104,7 @@ class ChildResponse(ChildBase):
     created_at: datetime
     last_active: Optional[datetime] = None
     interests: List[str] = []
+    community_sharing_enabled: bool = False
     
     class Config:
         from_attributes = True

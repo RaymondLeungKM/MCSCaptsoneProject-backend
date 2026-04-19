@@ -16,7 +16,7 @@ from app.db.base import Base
 from app.models.user import User, Child, ChildInterest
 from app.models.vocabulary import Category, Word, WordProgress
 from app.models.content import Story, StoryProgress, Game, Mission, MissionProgress
-from app.models.analytics import LearningSession, DailyStats, Achievement, ChildAchievement
+from app.models.analytics import LearningSession, DailyStats, Achievement, ChildAchievement, GameSession
 from app.models.daily_words import DailyWordTracking, GeneratedStory
 from app.models.parent_analytics import DailyLearningStats, LearningInsight, WeeklyReport, ParentalControl
 
@@ -30,8 +30,9 @@ if config.config_file_name is not None:
 # Set target metadata for autogenerate
 target_metadata = Base.metadata
 
-# Set sqlalchemy.url from settings
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# Set sqlalchemy.url from settings — Alembic needs a *sync* driver
+sync_url = settings.DATABASE_URL.replace("+asyncpg", "")
+config.set_main_option("sqlalchemy.url", sync_url)
 
 
 def run_migrations_offline() -> None:

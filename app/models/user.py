@@ -46,6 +46,13 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    # Privacy consent
+    consent_given = Column(Boolean, default=False)
+    consent_given_at = Column(DateTime(timezone=True), nullable=True)
+    consent_camera = Column(Boolean, default=True)
+    consent_microphone = Column(Boolean, default=True)
+    consent_analytics = Column(Boolean, default=True)
     
     # Relationships
     children = relationship("Child", back_populates="parent", cascade="all, delete-orphan")
@@ -76,6 +83,9 @@ class Child(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     last_active = Column(DateTime(timezone=True))
+
+    # Community
+    community_sharing_enabled = Column(Boolean, default=False)
     
     # Relationships
     parent = relationship("User", back_populates="children")

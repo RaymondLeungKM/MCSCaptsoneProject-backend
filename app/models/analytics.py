@@ -10,6 +10,25 @@ import enum
 from app.db.base import Base
 
 
+class GameSession(Base):
+    """Individual mini-game play session"""
+    __tablename__ = "game_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    child_id = Column(String, ForeignKey("children.id", ondelete="CASCADE"), nullable=False, index=True)
+    game_id = Column(String, nullable=False)           # "quiz" | "matching" | "speaking"
+    score = Column(Integer, default=0)                 # correct answers / pairs found
+    max_score = Column(Integer, default=0)             # total rounds / pairs
+    duration_seconds = Column(Integer, default=0)
+    words_seen = Column(JSONB, default=list)           # word IDs shown to child
+    words_correct = Column(JSONB, default=list)        # word IDs answered correctly
+    stars = Column(Integer, default=1)                 # 1–3 stars
+    xp_earned = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    child = relationship("Child")
+
+
 class EngagementLevel(str, enum.Enum):
     LOW = "low"
     MEDIUM = "medium"

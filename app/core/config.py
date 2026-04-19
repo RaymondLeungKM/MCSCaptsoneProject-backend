@@ -28,6 +28,13 @@ class Settings(BaseSettings):
     
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
+
+    # Optional MongoDB (camera capture store + pre-generated images)
+    MONGODB_ENABLED: bool = False
+    MONGODB_URI: str = "mongodb://localhost:27017"
+    MONGODB_DATABASE: str = "preschool_vocab"
+    MONGODB_CAMERA_COLLECTION: str = "camera_captures"
+    MONGODB_IMAGES_COLLECTION: str = "word_images"
     
     # Security
     SECRET_KEY: str = "your-secret-key-change-in-production"
@@ -50,7 +57,14 @@ class Settings(BaseSettings):
     # Alternatives: qwen3:4b, qwen2.5:7b, qwen2.5:14b
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen2.5:1.5b"  # Default model for Cantonese content
-    
+
+    # Hugging Face (image generation via FLUX.1)
+    HF_API_TOKEN: str = ""
+    HF_IMAGE_MODEL: str = "stabilityai/stable-diffusion-xl-base-1.0"
+
+    # Silicon Flow (image generation via Kolors)
+    SILICONFLOW_API_KEY: str = ""
+
     # AWS S3
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
