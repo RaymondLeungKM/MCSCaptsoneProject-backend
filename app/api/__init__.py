@@ -9,7 +9,6 @@ from app.api.endpoints import (
     children,
     vocabulary,
     categories,
-    stories,
     bedtime_stories,
     games,
     missions,
@@ -19,9 +18,9 @@ from app.api.endpoints import (
     parent_dashboard,
     audio,
     uploads,
-    images,
-    pronunciation,
     community,
+    social,
+    tutor_chat,
 )
 
 api_router = APIRouter()
@@ -32,7 +31,6 @@ api_router.include_router(users.router, prefix="/users", tags=["Users"])
 api_router.include_router(children.router, prefix="/children", tags=["Children"])
 api_router.include_router(vocabulary.router, prefix="/vocabulary", tags=["Vocabulary"])
 api_router.include_router(categories.router, prefix="/categories", tags=["Categories"])
-api_router.include_router(stories.router, prefix="/stories", tags=["Stories"])
 api_router.include_router(bedtime_stories.router, prefix="/bedtime-stories", tags=["Bedtime Stories"])
 api_router.include_router(games.router, prefix="/games", tags=["Games"])
 api_router.include_router(missions.router, prefix="/missions", tags=["Missions"])
@@ -42,6 +40,7 @@ api_router.include_router(adaptive_learning.router, prefix="/adaptive", tags=["A
 api_router.include_router(parent_dashboard.router)
 api_router.include_router(audio.router, prefix="/audio", tags=["Audio"])
 api_router.include_router(uploads.router, prefix="/uploads", tags=["File Uploads"])
-api_router.include_router(images.router, prefix="/images", tags=["Image Generation"])
-api_router.include_router(pronunciation.router, prefix="/audio", tags=["Audio"])
 api_router.include_router(community.router, prefix="/community", tags=["Community"])
+api_router.include_router(social.router, prefix="/social", tags=["Social"])
+# Phase 8: AI Tutor Chat
+api_router.include_router(tutor_chat.router, prefix="/tutor", tags=["AI Tutor Chat"])
