@@ -20,7 +20,6 @@ from app.api.endpoints import (
     uploads,
     community,
     social,
-    tutor_chat,
 )
 
 api_router = APIRouter()
@@ -42,5 +41,3 @@ api_router.include_router(audio.router, prefix="/audio", tags=["Audio"])
 api_router.include_router(uploads.router, prefix="/uploads", tags=["File Uploads"])
 api_router.include_router(community.router, prefix="/community", tags=["Community"])
 api_router.include_router(social.router, prefix="/social", tags=["Social"])
-# Phase 8: AI Tutor Chat
-api_router.include_router(tutor_chat.router, prefix="/tutor", tags=["AI Tutor Chat"])
