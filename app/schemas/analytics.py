@@ -1,7 +1,7 @@
 """
 Pydantic schemas for Analytics and Learning Sessions
 """
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import List, Dict, Any, Optional
 from datetime import datetime, date
 from enum import Enum
@@ -13,17 +13,16 @@ class EngagementLevel(str, Enum):
     HIGH = "high"
 
 
-# ── Game Session schemas ─────────────────────────────────────────────────────
-
+# Game Session schemas
 class GameSessionCreate(BaseModel):
     """Body sent by the frontend when a mini-game ends"""
     child_id: str
     score: int = 0
     max_score: int = 0
     duration_seconds: int = 0
-    words_seen: List[str] = []      # word IDs shown to child
-    words_correct: List[str] = []   # word IDs answered correctly
-    stars: int = 1                  # 1–3
+    words_seen: List[str] = []
+    words_correct: List[str] = []
+    stars: int = 1
 
 
 class GameSessionResponse(BaseModel):
@@ -42,8 +41,11 @@ class GameSessionResponse(BaseModel):
     class Config:
         from_attributes = True
 
+    @field_validator('words_seen', 'words_correct', mode='before')
+    @classmethod
+    def coerce_game_lists(cls, value):
+        return value if value is not None else []
 
-# ── Learning Session schemas ─────────────────────────────────────────────────
 
 # Learning Session schemas
 class ActivityCompleted(BaseModel):
@@ -85,6 +87,11 @@ class LearningSessionResponse(BaseModel):
     class Config:
         from_attributes = True
 
+    @field_validator('words_encountered', 'words_used_actively', 'activities_completed', mode='before')
+    @classmethod
+    def coerce_none_to_list(cls, v):
+        return v if v is not None else []
+
 
 # Daily Stats schemas
 class DailyStatsResponse(BaseModel):
@@ -121,6 +128,23 @@ class ProgressStatsResponse(BaseModel):
     category_progress: List[CategoryProgress]
     average_exposures_per_word: float
     multi_sensory_engagement: float  # Percentage
+
+
+class LearningControlStatusResponse(BaseModel):
+    child_id: str
+    local_date: date
+    today_minutes: int
+    active_session_minutes: int
+    session_count: int
+    has_activity_today: bool
+    daily_screen_time_limit: Optional[int] = None
+    screen_time_warning_threshold: int = 20
+    enable_time_limits: bool = False
+    remaining_minutes: Optional[int] = None
+    warning_reached: bool = False
+    limit_reached: bool = False
+    daily_reminder_enabled: bool = True
+    daily_reminder_time: str = "18:00"
 
 
 # Achievement schemas
@@ -173,5 +197,6 @@ class AdaptiveLearningRecommendation(BaseModel):
 class WordOfTheDayResponse(BaseModel):
     word_id: str
     word: str
+    word_cantonese: Optional[str] = None
     reason: str
     priority_score: int

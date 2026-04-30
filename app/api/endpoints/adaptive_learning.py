@@ -1,16 +1,31 @@
 """
 Adaptive learning recommendation endpoints
+Phase 8 extensions: knowledge-graph recommendations, spaced repetition,
+learning-style assessment, and learning-speed profiling.
 """
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import List
 
 from app.db.session import get_db
 from app.schemas.analytics import AdaptiveLearningRecommendation, WordOfTheDayResponse
+from app.schemas.phase8 import (
+    WordRelationshipCreate, WordRelationshipResponse,
+    WordGraphResponse, GraphRecommendationResponse,
+    ReviewQueueResponse, ReviewResultRequest, ReviewResultResponse,
+    LearningStyleAssessment, LearningStyleResponse,
+)
 from app.models.user import User, Child
 from app.models.vocabulary import Word, WordProgress
+from app.models.phase8 import WordRelationship, RelationshipType
 from app.core.security import get_current_active_user
+from app.services.word_graph_service import (
+    get_word_graph, get_graph_recommendations, add_relationship
+)
+from app.services.spaced_repetition_service import (
+    get_review_queue, process_review, get_learning_speed_profile
+)
 
 router = APIRouter()
 
@@ -86,13 +101,16 @@ async def get_recommendations(
     # Determine recommended activity based on learning style
     if child.learning_style == "kinesthetic":
         recommended_activity = "game"
-        reason = "Kinesthetic learner - games with physical activity recommended"
+        reason = "你適合用互動遊戲學習，邊玩邊記會更投入。"
     elif child.learning_style == "visual":
         recommended_activity = "story"
-        reason = "Visual learner - interactive stories recommended"
+        reason = "你適合用圖像和故事學習，會更容易理解新詞語。"
+    elif child.learning_style == "auditory":
+        recommended_activity = "story"
+        reason = "你適合多聽多讀，先用故事和聲音練習會更自然。"
     else:
         recommended_activity = "mixed"
-        reason = "Mixed approach for comprehensive learning"
+        reason = "今天適合用多種方式一起學，記憶會更穩固。"
     
     return {
         "next_words": next_words,
@@ -152,17 +170,18 @@ async def get_word_of_the_day(
     # Generate reason
     progress = progress_dict.get(best_word.id)
     if not progress:
-        reason = "New word to learn!"
+        reason = "這是今天很適合開始學的新詞語。"
     elif progress.exposure_count < 6:
-        reason = "Needs more practice for retention"
+        reason = "這個詞語還需要多練習幾次，會更容易記住。"
     elif not progress.mastered:
-        reason = "Almost mastered - one more push!"
+        reason = "差一點就完全掌握了，再努力一次。"
     else:
-        reason = "Review time!"
+        reason = "現在很適合重溫這個詞語。"
     
     return {
         "word_id": best_word.id,
         "word": best_word.word,
+        "word_cantonese": best_word.word_cantonese,
         "reason": reason,
         "priority_score": best_score
     }
@@ -201,5 +220,230 @@ async def get_next_activity(
         "recommended_activity": recommended,
         "learning_style": child.learning_style,
         "attention_span": child.attention_span,
-        "reason": f"Based on {child.learning_style} learning style"
+        "reason": {
+            "visual": "根據你的視覺學習風格，先用故事和圖片學習會更容易吸收。",
+            "auditory": "根據你的聽覺學習風格，先聽故事和跟讀會更自然。",
+            "kinesthetic": "根據你的動作學習風格，先玩互動遊戲會更投入。",
+            "mixed": "根據你的混合學習風格，先從互動練習開始最合適。",
+        }.get(child.learning_style, "系統根據你今天的學習節奏，幫你選好了下一步。")
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 – Epic 8.1: Knowledge Graph endpoints
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{child_id}/word-graph/{word_id}",
+    response_model=WordGraphResponse,
+    summary="Get word knowledge sub-graph",
+)
+async def get_word_knowledge_graph(
+    child_id: str,
+    word_id: str,
+    depth: int = 1,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return the neighbourhood of *word_id* in the vocabulary knowledge graph.
+    ``depth=1`` returns direct neighbours; ``depth=2`` extends one hop further.
+    """
+    result = await db.execute(
+        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    return await get_word_graph(db, word_id, child_id, depth=max(1, min(depth, 2)))
+
+
+@router.get(
+    "/{child_id}/graph-recommendations",
+    response_model=GraphRecommendationResponse,
+    summary="Get graph-based vocabulary recommendations",
+)
+async def get_vocabulary_graph_recommendations(
+    child_id: str,
+    limit: int = 5,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Walk the knowledge graph from the child's current vocabulary and recommend
+    highly-connected unmastered words.
+    """
+    result = await db.execute(
+        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    return await get_graph_recommendations(db, child_id, limit=limit)
+
+
+@router.post(
+    "/word-relationships",
+    response_model=WordRelationshipResponse,
+    status_code=201,
+    summary="Add a word relationship (admin / AI pipeline use)",
+)
+async def create_word_relationship(
+    payload: WordRelationshipCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Insert a directed edge into the vocabulary knowledge graph.
+    A reverse edge is automatically inserted for symmetric relationships.
+    """
+    await add_relationship(
+        db,
+        payload.word_id,
+        payload.related_word_id,
+        RelationshipType(payload.relationship_type),
+        payload.strength,
+        source=str(current_user.id),
+        bidirectional=True,
+    )
+    # Return the newly created (or existing) edge
+    result = await db.execute(
+        select(WordRelationship).where(
+            WordRelationship.word_id == payload.word_id,
+            WordRelationship.related_word_id == payload.related_word_id,
+        )
+    )
+    rel = result.scalar_one_or_none()
+    if not rel:
+        raise HTTPException(status_code=500, detail="Failed to create relationship")
+    return rel
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 – Epic 8.2: Spaced Repetition endpoints
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{child_id}/review-queue",
+    response_model=ReviewQueueResponse,
+    summary="Get spaced-repetition review queue",
+)
+async def get_sr_review_queue(
+    child_id: str,
+    max_cards: int = 20,
+    max_new: int = 5,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return all vocabulary cards due for SM-2 review today, plus up to
+    *max_new* newly-introduced cards.
+    """
+    result = await db.execute(
+        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    return await get_review_queue(db, child_id, max_cards=max_cards, max_new=max_new)
+
+
+@router.post(
+    "/{child_id}/review",
+    response_model=ReviewResultResponse,
+    summary="Submit a spaced-repetition review result",
+)
+async def submit_review_result(
+    child_id: str,
+    payload: ReviewResultRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Apply the SM-2 algorithm to a reviewed card.
+    The client submits a quality rating (0-5) and receives the new schedule.
+    """
+    result = await db.execute(
+        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    return await process_review(db, child_id, payload.word_id, payload.quality)
+
+
+@router.get(
+    "/{child_id}/learning-speed",
+    summary="Get child's learning speed profile",
+)
+async def get_child_learning_speed(
+    child_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return a summary of the child's SM-2 statistics: average EF, average
+    interval, graduation rate, and a plain-language assessment.
+    """
+    result = await db.execute(
+        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    return await get_learning_speed_profile(db, child_id)
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 – Epic 8.2.3: Learning Style Detection endpoint
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{child_id}/learning-style",
+    response_model=LearningStyleResponse,
+    summary="Update child learning style from observed session data",
+)
+async def update_learning_style(
+    child_id: str,
+    payload: LearningStyleAssessment,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    The frontend sends aggregated engagement scores per style dimension.
+    The highest score wins; the child record is updated and the new style
+    is returned with a confidence measure.
+    """
+    result = await db.execute(
+        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+    )
+    child = result.scalar_one_or_none()
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    scores = {
+        "kinesthetic": payload.kinesthetic_score,
+        "visual":      payload.visual_score,
+        "auditory":    payload.auditory_score,
+    }
+    best_style     = max(scores, key=scores.get)  # type: ignore[arg-type]
+    best_score     = scores[best_style]
+    second_best    = sorted(scores.values(), reverse=True)[1]
+    confidence     = best_score - second_best  # rough margin
+
+    # Update child record
+    child.learning_style = best_style  # type: ignore[assignment]
+    await db.commit()
+
+    explanations = {
+        "visual":      "透過視覺（圖片、卡片、配對遊戲）學習效果最佳",
+        "auditory":    "透過聆聽（故事、發音、音樂）學習效果最佳",
+        "kinesthetic": "透過活動（肢體動作、遊戲、尋寶）學習效果最佳",
+    }
+
+    return LearningStyleResponse(
+        child_id=child_id,
+        learning_style=best_style,
+        confidence=round(confidence, 3),
+        explanation=explanations.get(best_style, "混合學習方式"),
+    )

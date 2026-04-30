@@ -1,9 +1,9 @@
 """
 Pydantic schemas for Content (Stories, Games, Missions)
 """
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 
 
@@ -31,6 +31,33 @@ class MissionContext(str, Enum):
     OUTDOOR = "outdoor"
     SHOPPING = "shopping"
     GENERAL = "general"
+
+
+class MissionStatus(str, Enum):
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    ARCHIVED = "archived"
+
+
+class MissionSurface(str, Enum):
+    CHILD = "child"
+    PARENT = "parent"
+    BOTH = "both"
+
+
+class MissionAssignmentSource(str, Enum):
+    SYSTEM = "system"
+    ADMIN = "admin"
+    PARENT = "parent"
+    SEED = "seed"
+
+
+class MissionAssignmentStatus(str, Enum):
+    ASSIGNED = "assigned"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    EXPIRED = "expired"
 
 
 # Story schemas
@@ -142,30 +169,58 @@ class GameResponse(GameBase):
 
 # Mission schemas
 class MissionBase(BaseModel):
+    slug: str
     title: str
     description: str
     context: MissionContext = MissionContext.GENERAL
     is_offline: bool = False
+    status: MissionStatus = MissionStatus.DRAFT
+    locale: str = "zh-HK"
+    age_min: Optional[int] = None
+    age_max: Optional[int] = None
+    difficulty: Optional[str] = None
+    surface: MissionSurface = MissionSurface.PARENT
+    sort_order: int = 0
+    selection_tags: List[str] = Field(default_factory=list)
+    catalog_metadata: Optional[Dict[str, Any]] = None
+    published_at: Optional[datetime] = None
+    archived_at: Optional[datetime] = None
 
 
 class MissionCreate(MissionBase):
-    target_words: List[str]
-    conversation_prompts: List[str]
+    target_words: List[str] = Field(default_factory=list)
+    conversation_prompts: List[str] = Field(default_factory=list)
 
 
 class MissionUpdate(BaseModel):
+    slug: Optional[str] = None
     title: Optional[str] = None
     description: Optional[str] = None
+    context: Optional[MissionContext] = None
+    is_offline: Optional[bool] = None
+    status: Optional[MissionStatus] = None
+    locale: Optional[str] = None
+    age_min: Optional[int] = None
+    age_max: Optional[int] = None
+    difficulty: Optional[str] = None
+    surface: Optional[MissionSurface] = None
+    sort_order: Optional[int] = None
+    selection_tags: Optional[List[str]] = None
+    catalog_metadata: Optional[Dict[str, Any]] = None
+    published_at: Optional[datetime] = None
+    archived_at: Optional[datetime] = None
     target_words: Optional[List[str]] = None
     conversation_prompts: Optional[List[str]] = None
+    is_active: Optional[bool] = None
 
 
 class MissionResponse(MissionBase):
     id: str
-    target_words: List[str]
-    conversation_prompts: List[str]
+    target_words: List[str] = Field(default_factory=list)
+    conversation_prompts: List[str] = Field(default_factory=list)
     is_active: bool
     created_at: datetime
+    updated_at: Optional[datetime] = None
     
     class Config:
         from_attributes = True
@@ -184,3 +239,53 @@ class MissionProgressResponse(BaseModel):
 class MissionProgressUpdate(BaseModel):
     completed: bool
     parent_notes: Optional[str] = None
+
+
+class MissionAssignmentBase(BaseModel):
+    child_id: str
+    mission_id: str
+    assignment_date: date
+    source: MissionAssignmentSource = MissionAssignmentSource.SYSTEM
+    status: MissionAssignmentStatus = MissionAssignmentStatus.ASSIGNED
+    surface: MissionSurface = MissionSurface.PARENT
+    priority: int = 100
+    selection_reason: Optional[str] = None
+    selection_metadata: Optional[Dict[str, Any]] = None
+    available_from: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    skipped_at: Optional[datetime] = None
+    completion_notes: Optional[str] = None
+
+
+class MissionAssignmentCreate(MissionAssignmentBase):
+    pass
+
+
+class MissionAssignmentUpdate(BaseModel):
+    source: Optional[MissionAssignmentSource] = None
+    status: Optional[MissionAssignmentStatus] = None
+    surface: Optional[MissionSurface] = None
+    priority: Optional[int] = None
+    selection_reason: Optional[str] = None
+    selection_metadata: Optional[Dict[str, Any]] = None
+    available_from: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    skipped_at: Optional[datetime] = None
+    completion_notes: Optional[str] = None
+
+
+class MissionAssignmentResponse(MissionAssignmentBase):
+    id: str
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AssignedMissionResponse(MissionResponse):
+    assignment: MissionAssignmentResponse
