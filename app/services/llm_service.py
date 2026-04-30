@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 class LLMProvider(str, Enum):
     OPENAI = "openai"
+    OPENROUTER = "openrouter"
     ANTHROPIC = "anthropic"
     OLLAMA = "ollama"
 
@@ -38,10 +39,14 @@ class LLMService:
         self.base_url = base_url or self._get_default_base_url()
         
         if self.provider != LLMProvider.OLLAMA and not self.api_key:
-            raise ValueError(f"API key required for {provider}. Set OPENAI_API_KEY or ANTHROPIC_API_KEY environment variable.")
+            raise ValueError(
+                f"API key required for {provider}. Set the matching environment variable for the selected provider."
+            )
     
     def _get_default_base_url(self) -> str:
         """Get default base URL for the provider"""
+        if self.provider == LLMProvider.OPENROUTER:
+            return os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         if self.provider == LLMProvider.OLLAMA:
             return os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         return ""
@@ -49,6 +54,8 @@ class LLMService:
     def _get_default_api_key(self) -> Optional[str]:
         if self.provider == LLMProvider.OPENAI:
             return os.getenv("OPENAI_API_KEY")
+        elif self.provider == LLMProvider.OPENROUTER:
+            return os.getenv("OPENROUTER_API_KEY")
         elif self.provider == LLMProvider.ANTHROPIC:
             return os.getenv("ANTHROPIC_API_KEY")
         return None
@@ -56,6 +63,8 @@ class LLMService:
     def _get_default_model(self) -> str:
         if self.provider == LLMProvider.OPENAI:
             return "gpt-4o"  # or "gpt-4o-mini" for cheaper
+        elif self.provider == LLMProvider.OPENROUTER:
+            return os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
         elif self.provider == LLMProvider.ANTHROPIC:
             return "claude-3-5-sonnet-20241022"
         elif self.provider == LLMProvider.OLLAMA:
@@ -84,6 +93,8 @@ class LLMService:
         """
         if self.provider == LLMProvider.OPENAI:
             return await self._generate_openai(messages, temperature, max_tokens, **kwargs)
+        elif self.provider == LLMProvider.OPENROUTER:
+            return await self._generate_openrouter(messages, temperature, max_tokens, **kwargs)
         elif self.provider == LLMProvider.ANTHROPIC:
             return await self._generate_anthropic(messages, temperature, max_tokens, **kwargs)
         elif self.provider == LLMProvider.OLLAMA:
@@ -113,6 +124,34 @@ class LLMService:
             **kwargs
         }
         
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+
+    async def _generate_openrouter(
+        self,
+        messages: List[LLMMessage],
+        temperature: float,
+        max_tokens: int,
+        **kwargs
+    ) -> str:
+        """Generate using OpenRouter's OpenAI-compatible chat completions API"""
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **kwargs,
+        }
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(url, headers=headers, json=payload)
             response.raise_for_status()
@@ -349,6 +388,7 @@ class LLMService:
 
 # Singleton instances
 _openai_service: Optional[LLMService] = None
+_openrouter_service: Optional[LLMService] = None
 _anthropic_service: Optional[LLMService] = None
 _ollama_service: Optional[LLMService] = None
 
@@ -357,12 +397,16 @@ def get_llm_service(provider: LLMProvider = LLMProvider.OLLAMA) -> LLMService:
     """
     Get or create LLM service instance (singleton pattern)
     """
-    global _openai_service, _anthropic_service, _ollama_service
+    global _openai_service, _openrouter_service, _anthropic_service, _ollama_service
     
     if provider == LLMProvider.OPENAI:
         if _openai_service is None:
             _openai_service = LLMService(provider=LLMProvider.OPENAI)
         return _openai_service
+    elif provider == LLMProvider.OPENROUTER:
+        if _openrouter_service is None:
+            _openrouter_service = LLMService(provider=LLMProvider.OPENROUTER)
+        return _openrouter_service
     elif provider == LLMProvider.ANTHROPIC:
         if _anthropic_service is None:
             _anthropic_service = LLMService(provider=LLMProvider.ANTHROPIC)

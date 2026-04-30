@@ -16,10 +16,14 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        'children',
-        sa.Column('community_sharing_enabled', sa.Boolean(), nullable=False, server_default='false')
-    )
+    inspector = sa.inspect(op.get_bind())
+    columns = {column['name'] for column in inspector.get_columns('children')}
+
+    if 'community_sharing_enabled' not in columns:
+        op.add_column(
+            'children',
+            sa.Column('community_sharing_enabled', sa.Boolean(), nullable=False, server_default='false')
+        )
 
 
 def downgrade() -> None:

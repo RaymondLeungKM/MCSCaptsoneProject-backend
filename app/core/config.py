@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     
     # OpenAI
     OPENAI_API_KEY: str = ""
+
+    # OpenRouter
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_MODEL: str = "openai/gpt-4o-mini"
     
     # Anthropic Claude
     ANTHROPIC_API_KEY: str = ""

@@ -15,11 +15,19 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column('users', sa.Column('consent_given', sa.Boolean(), nullable=False, server_default='false'))
-    op.add_column('users', sa.Column('consent_given_at', sa.DateTime(timezone=True), nullable=True))
-    op.add_column('users', sa.Column('consent_camera', sa.Boolean(), nullable=False, server_default='true'))
-    op.add_column('users', sa.Column('consent_microphone', sa.Boolean(), nullable=False, server_default='true'))
-    op.add_column('users', sa.Column('consent_analytics', sa.Boolean(), nullable=False, server_default='true'))
+    inspector = sa.inspect(op.get_bind())
+    columns = {column['name'] for column in inspector.get_columns('users')}
+
+    if 'consent_given' not in columns:
+        op.add_column('users', sa.Column('consent_given', sa.Boolean(), nullable=False, server_default='false'))
+    if 'consent_given_at' not in columns:
+        op.add_column('users', sa.Column('consent_given_at', sa.DateTime(timezone=True), nullable=True))
+    if 'consent_camera' not in columns:
+        op.add_column('users', sa.Column('consent_camera', sa.Boolean(), nullable=False, server_default='true'))
+    if 'consent_microphone' not in columns:
+        op.add_column('users', sa.Column('consent_microphone', sa.Boolean(), nullable=False, server_default='true'))
+    if 'consent_analytics' not in columns:
+        op.add_column('users', sa.Column('consent_analytics', sa.Boolean(), nullable=False, server_default='true'))
 
 
 def downgrade() -> None:
