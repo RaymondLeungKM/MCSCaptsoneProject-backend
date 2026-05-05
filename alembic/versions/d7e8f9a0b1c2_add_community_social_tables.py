@@ -25,6 +25,9 @@ depends_on = None
 
 
 def upgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    tables = set(inspector.get_table_names())
+
     # ------------------------------------------------------------------
     # Enum types (PostgreSQL) – use PL/pgSQL exception block so this is
     # idempotent even if a previous (failed) run already created the type.
@@ -57,98 +60,120 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     # community_posts
     # ------------------------------------------------------------------
-    op.create_table(
-        'community_posts',
-        sa.Column('id', sa.String(), primary_key=True),
-        sa.Column('child_id', sa.String(), sa.ForeignKey('children.id', ondelete='CASCADE'), nullable=False),
-        sa.Column('word_id', sa.String(), sa.ForeignKey('words.id', ondelete='SET NULL'), nullable=True),
-        sa.Column('image_url', sa.String(), nullable=False),
-        sa.Column('word_text', sa.String(), nullable=True),
-        sa.Column('word_text_cantonese', sa.String(), nullable=True),
-        sa.Column('caption', sa.String(), nullable=True),
-        sa.Column('is_anonymous', sa.Boolean(), nullable=False, server_default='true'),
-        sa.Column('moderation_status', moderationstatus, nullable=False, server_default='pending'),
-        sa.Column('moderated_by', sa.String(), sa.ForeignKey('users.id', ondelete='SET NULL'), nullable=True),
-        sa.Column('moderated_at', sa.DateTime(timezone=True), nullable=True),
-        sa.Column('moderation_note', sa.String(), nullable=True),
-        sa.Column('reaction_count', sa.Integer(), nullable=False, server_default='0'),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
-        sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
-    )
-    op.create_index('ix_community_posts_id', 'community_posts', ['id'], unique=False)
-    op.create_index('ix_community_posts_child_id', 'community_posts', ['child_id'], unique=False)
-    op.create_index('ix_community_posts_moderation_status', 'community_posts', ['moderation_status'], unique=False)
+    if 'community_posts' not in tables:
+        op.create_table(
+            'community_posts',
+            sa.Column('id', sa.String(), primary_key=True),
+            sa.Column('child_id', sa.String(), sa.ForeignKey('children.id', ondelete='CASCADE'), nullable=False),
+            sa.Column('word_id', sa.String(), sa.ForeignKey('words.id', ondelete='SET NULL'), nullable=True),
+            sa.Column('image_url', sa.String(), nullable=False),
+            sa.Column('word_text', sa.String(), nullable=True),
+            sa.Column('word_text_cantonese', sa.String(), nullable=True),
+            sa.Column('caption', sa.String(), nullable=True),
+            sa.Column('is_anonymous', sa.Boolean(), nullable=False, server_default='true'),
+            sa.Column('moderation_status', moderationstatus, nullable=False, server_default='pending'),
+            sa.Column('moderated_by', sa.String(), sa.ForeignKey('users.id', ondelete='SET NULL'), nullable=True),
+            sa.Column('moderated_at', sa.DateTime(timezone=True), nullable=True),
+            sa.Column('moderation_note', sa.String(), nullable=True),
+            sa.Column('reaction_count', sa.Integer(), nullable=False, server_default='0'),
+            sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
+            sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+        )
+    community_posts_indexes = {index['name'] for index in inspector.get_indexes('community_posts')}
+    if 'ix_community_posts_id' not in community_posts_indexes:
+        op.create_index('ix_community_posts_id', 'community_posts', ['id'], unique=False)
+    if 'ix_community_posts_child_id' not in community_posts_indexes:
+        op.create_index('ix_community_posts_child_id', 'community_posts', ['child_id'], unique=False)
+    if 'ix_community_posts_moderation_status' not in community_posts_indexes:
+        op.create_index('ix_community_posts_moderation_status', 'community_posts', ['moderation_status'], unique=False)
 
     # ------------------------------------------------------------------
     # post_reactions
     # ------------------------------------------------------------------
-    op.create_table(
-        'post_reactions',
-        sa.Column('id', sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column('post_id', sa.String(), sa.ForeignKey('community_posts.id', ondelete='CASCADE'), nullable=False),
-        sa.Column('child_id', sa.String(), sa.ForeignKey('children.id', ondelete='CASCADE'), nullable=False),
-        sa.Column('reaction_type', sa.String(), nullable=False, server_default='star'),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
-        sa.UniqueConstraint('post_id', 'child_id', name='uq_reaction_post_child'),
-    )
-    op.create_index('ix_post_reactions_post_id', 'post_reactions', ['post_id'], unique=False)
+    if 'post_reactions' not in tables:
+        op.create_table(
+            'post_reactions',
+            sa.Column('id', sa.Integer(), primary_key=True, autoincrement=True),
+            sa.Column('post_id', sa.String(), sa.ForeignKey('community_posts.id', ondelete='CASCADE'), nullable=False),
+            sa.Column('child_id', sa.String(), sa.ForeignKey('children.id', ondelete='CASCADE'), nullable=False),
+            sa.Column('reaction_type', sa.String(), nullable=False, server_default='star'),
+            sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
+            sa.UniqueConstraint('post_id', 'child_id', name='uq_reaction_post_child'),
+        )
+    post_reactions_indexes = {index['name'] for index in inspector.get_indexes('post_reactions')}
+    if 'ix_post_reactions_post_id' not in post_reactions_indexes:
+        op.create_index('ix_post_reactions_post_id', 'post_reactions', ['post_id'], unique=False)
 
     # ------------------------------------------------------------------
     # parent_friendships
     # ------------------------------------------------------------------
-    op.create_table(
-        'parent_friendships',
-        sa.Column('id', sa.String(), primary_key=True),
-        sa.Column('requester_id', sa.String(), sa.ForeignKey('users.id', ondelete='CASCADE'), nullable=False),
-        sa.Column('addressee_id', sa.String(), sa.ForeignKey('users.id', ondelete='CASCADE'), nullable=False),
-        sa.Column('status', friendshipstatus, nullable=False, server_default='pending'),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
-        sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
-        sa.UniqueConstraint('requester_id', 'addressee_id', name='uq_friendship_pair'),
-    )
-    op.create_index('ix_parent_friendships_id', 'parent_friendships', ['id'], unique=False)
-    op.create_index('ix_parent_friendships_requester_id', 'parent_friendships', ['requester_id'], unique=False)
-    op.create_index('ix_parent_friendships_addressee_id', 'parent_friendships', ['addressee_id'], unique=False)
+    if 'parent_friendships' not in tables:
+        op.create_table(
+            'parent_friendships',
+            sa.Column('id', sa.String(), primary_key=True),
+            sa.Column('requester_id', sa.String(), sa.ForeignKey('users.id', ondelete='CASCADE'), nullable=False),
+            sa.Column('addressee_id', sa.String(), sa.ForeignKey('users.id', ondelete='CASCADE'), nullable=False),
+            sa.Column('status', friendshipstatus, nullable=False, server_default='pending'),
+            sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
+            sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+            sa.UniqueConstraint('requester_id', 'addressee_id', name='uq_friendship_pair'),
+        )
+    parent_friendships_indexes = {index['name'] for index in inspector.get_indexes('parent_friendships')}
+    if 'ix_parent_friendships_id' not in parent_friendships_indexes:
+        op.create_index('ix_parent_friendships_id', 'parent_friendships', ['id'], unique=False)
+    if 'ix_parent_friendships_requester_id' not in parent_friendships_indexes:
+        op.create_index('ix_parent_friendships_requester_id', 'parent_friendships', ['requester_id'], unique=False)
+    if 'ix_parent_friendships_addressee_id' not in parent_friendships_indexes:
+        op.create_index('ix_parent_friendships_addressee_id', 'parent_friendships', ['addressee_id'], unique=False)
 
     # ------------------------------------------------------------------
     # community_challenges
     # ------------------------------------------------------------------
-    op.create_table(
-        'community_challenges',
-        sa.Column('id', sa.String(), primary_key=True),
-        sa.Column('title', sa.String(), nullable=False),
-        sa.Column('title_zh', sa.String(), nullable=True),
-        sa.Column('description', sa.Text(), nullable=True),
-        sa.Column('description_zh', sa.Text(), nullable=True),
-        sa.Column('target_count', sa.Integer(), nullable=False, server_default='5'),
-        sa.Column('category', sa.String(), nullable=True),
-        sa.Column('emoji', sa.String(), nullable=False, server_default='🏆'),
-        sa.Column('status', challengestatus, nullable=False, server_default='active'),
-        sa.Column('starts_at', sa.DateTime(timezone=True), nullable=False),
-        sa.Column('ends_at', sa.DateTime(timezone=True), nullable=False),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
-    )
-    op.create_index('ix_community_challenges_id', 'community_challenges', ['id'], unique=False)
-    op.create_index('ix_community_challenges_status', 'community_challenges', ['status'], unique=False)
+    if 'community_challenges' not in tables:
+        op.create_table(
+            'community_challenges',
+            sa.Column('id', sa.String(), primary_key=True),
+            sa.Column('title', sa.String(), nullable=False),
+            sa.Column('title_zh', sa.String(), nullable=True),
+            sa.Column('description', sa.Text(), nullable=True),
+            sa.Column('description_zh', sa.Text(), nullable=True),
+            sa.Column('target_count', sa.Integer(), nullable=False, server_default='5'),
+            sa.Column('category', sa.String(), nullable=True),
+            sa.Column('emoji', sa.String(), nullable=False, server_default='🏆'),
+            sa.Column('status', challengestatus, nullable=False, server_default='active'),
+            sa.Column('starts_at', sa.DateTime(timezone=True), nullable=False),
+            sa.Column('ends_at', sa.DateTime(timezone=True), nullable=False),
+            sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
+        )
+    community_challenges_indexes = {index['name'] for index in inspector.get_indexes('community_challenges')}
+    if 'ix_community_challenges_id' not in community_challenges_indexes:
+        op.create_index('ix_community_challenges_id', 'community_challenges', ['id'], unique=False)
+    if 'ix_community_challenges_status' not in community_challenges_indexes:
+        op.create_index('ix_community_challenges_status', 'community_challenges', ['status'], unique=False)
 
     # ------------------------------------------------------------------
     # challenge_participations
     # ------------------------------------------------------------------
-    op.create_table(
-        'challenge_participations',
-        sa.Column('id', sa.String(), primary_key=True),
-        sa.Column('challenge_id', sa.String(), sa.ForeignKey('community_challenges.id', ondelete='CASCADE'), nullable=False),
-        sa.Column('child_id', sa.String(), sa.ForeignKey('children.id', ondelete='CASCADE'), nullable=False),
-        sa.Column('progress', sa.Integer(), nullable=False, server_default='0'),
-        sa.Column('is_completed', sa.Boolean(), nullable=False, server_default='false'),
-        sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
-        sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
-        sa.UniqueConstraint('challenge_id', 'child_id', name='uq_participation_challenge_child'),
-    )
-    op.create_index('ix_challenge_participations_id', 'challenge_participations', ['id'], unique=False)
-    op.create_index('ix_challenge_participations_challenge_id', 'challenge_participations', ['challenge_id'], unique=False)
-    op.create_index('ix_challenge_participations_child_id', 'challenge_participations', ['child_id'], unique=False)
+    if 'challenge_participations' not in tables:
+        op.create_table(
+            'challenge_participations',
+            sa.Column('id', sa.String(), primary_key=True),
+            sa.Column('challenge_id', sa.String(), sa.ForeignKey('community_challenges.id', ondelete='CASCADE'), nullable=False),
+            sa.Column('child_id', sa.String(), sa.ForeignKey('children.id', ondelete='CASCADE'), nullable=False),
+            sa.Column('progress', sa.Integer(), nullable=False, server_default='0'),
+            sa.Column('is_completed', sa.Boolean(), nullable=False, server_default='false'),
+            sa.Column('completed_at', sa.DateTime(timezone=True), nullable=True),
+            sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()')),
+            sa.Column('updated_at', sa.DateTime(timezone=True), nullable=True),
+            sa.UniqueConstraint('challenge_id', 'child_id', name='uq_participation_challenge_child'),
+        )
+    challenge_participations_indexes = {index['name'] for index in inspector.get_indexes('challenge_participations')}
+    if 'ix_challenge_participations_id' not in challenge_participations_indexes:
+        op.create_index('ix_challenge_participations_id', 'challenge_participations', ['id'], unique=False)
+    if 'ix_challenge_participations_challenge_id' not in challenge_participations_indexes:
+        op.create_index('ix_challenge_participations_challenge_id', 'challenge_participations', ['challenge_id'], unique=False)
+    if 'ix_challenge_participations_child_id' not in challenge_participations_indexes:
+        op.create_index('ix_challenge_participations_child_id', 'challenge_participations', ['child_id'], unique=False)
 
 
 def downgrade() -> None:
