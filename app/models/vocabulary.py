@@ -100,6 +100,8 @@ class WordProgress(Base):
     mastered = Column(Boolean, default=False)
     mastered_at = Column(DateTime(timezone=True))
     last_practiced = Column(DateTime(timezone=True))
+    pending_active_vocab_approval = Column(Boolean, default=False)
+    active_vocab_requested_at = Column(DateTime(timezone=True))
     
     # Performance metrics
     correct_attempts = Column(Integer, default=0)

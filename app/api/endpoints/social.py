@@ -17,6 +17,7 @@ import uuid
 from app.db.session import get_db
 from app.core.security import get_current_active_user
 from app.models.user import User, Child
+from app.core.child_age import calculate_child_age
 from app.models.vocabulary import WordProgress, Word
 from app.models.community import (
     ParentFriendship,
@@ -389,7 +390,11 @@ async def get_friends_progress(
                 FriendChildStats(
                     child_name=child.name,
                     avatar=child.avatar or "🧒",
-                    age=child.age,
+                    age=calculate_child_age(
+                        stored_age=child.age,
+                        birth_year=child.birth_year,
+                        birth_month=child.birth_month,
+                    ),
                     words_learned=child.words_learned,
                     current_streak=child.current_streak,
                     level=child.level,

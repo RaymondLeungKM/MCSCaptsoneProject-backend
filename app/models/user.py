@@ -67,6 +67,8 @@ class Child(Base):
     name = Column(String, nullable=False)
     avatar = Column(String, default="👧")
     age = Column(Integer, nullable=False)
+    birth_year = Column(Integer)
+    birth_month = Column(Integer)
     level = Column(Integer, default=1)
     xp = Column(Integer, default=0)
     words_learned = Column(Integer, default=0)

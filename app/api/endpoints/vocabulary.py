@@ -3,7 +3,7 @@ Vocabulary word endpoints
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Query, File, UploadFile, Form, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, and_, or_
 from sqlalchemy.orm import selectinload
 from typing import List, Optional, Dict
 import uuid
@@ -15,24 +15,70 @@ import json
 
 from app.db.session import get_db, AsyncSessionLocal
 from app.schemas.vocabulary import (
+    AdminWordResponse,
     WordCreate, 
     WordUpdate, 
     WordResponse, 
     WordWithProgress,
+    WordProgressResponse,
     WordProgressUpdate,
+    ActiveVocabularyApprovalRequestResponse,
     ExternalWordLearning,
     ExternalWordLearningResponse
 )
 from app.models.vocabulary import Word, WordProgress, Category
+from app.models.daily_words import DailyWordTracking
 from app.models.generated_sentences import GeneratedSentence as GeneratedSentenceModel
 from app.models.user import User, Child
-from app.core.security import get_current_active_user
+from app.core.security import get_current_active_user, get_current_admin_user
 from app.core.category_colors import get_category_color
 from app.core.config import settings
 from app.services.sentence_generator import get_sentence_generator, SentenceGenerationResult
 from app.services.word_enhancement_service import get_word_enhancement_service
 
 router = APIRouter()
+
+ACTIVE_VOCAB_REQUEST_MIN_EXPOSURES = 6
+
+
+async def _get_category_or_404(category_id: str, db: AsyncSession) -> Category:
+    result = await db.execute(select(Category).where(Category.id == category_id))
+    category = result.scalar_one_or_none()
+    if not category:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Category not found",
+        )
+    return category
+
+
+async def _ensure_admin_editable_word(word_id: str, db: AsyncSession) -> Word:
+    result = await db.execute(select(Word).where(Word.id == word_id))
+    word = result.scalar_one_or_none()
+
+    if not word:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Word not found",
+        )
+
+    if word.created_by_child_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='Words from "My Collection" cannot be edited in the admin panel',
+        )
+
+    return word
+
+
+async def _recount_category_word_count(category_id: str, db: AsyncSession) -> None:
+    count_result = await db.execute(
+        select(func.count())
+        .select_from(Word)
+        .where(Word.category == category_id, Word.is_active == True)
+    )
+    category = await _get_category_or_404(category_id, db)
+    category.word_count = count_result.scalar_one()
 
 
 def _mongo_to_word_response(doc: dict, child_id: str) -> dict:
@@ -305,6 +351,70 @@ async def get_words(
     return response_words[:limit]
 
 
+@router.get("/admin/all", response_model=List[AdminWordResponse])
+async def get_admin_words(
+    category: Optional[str] = None,
+    difficulty: Optional[str] = None,
+    creator_search: Optional[str] = Query(
+        None,
+        description="Filter My Collection words by creator user ID or email",
+    ),
+    limit: int = Query(250, ge=1, le=500),
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_admin_user),
+):
+    """Get admin vocabulary list, including My Collection words and creator metadata."""
+    query = (
+        select(
+            Word,
+            Child.name.label("creator_child_name"),
+            User.id.label("creator_user_id"),
+            User.email.label("creator_user_email"),
+        )
+        .outerjoin(Child, Word.created_by_child_id == Child.id)
+        .outerjoin(User, Child.parent_id == User.id)
+        .options(selectinload(Word.category_rel))
+        .where(Word.is_active == True)
+    )
+
+    if category:
+        query = query.where(Word.category == category)
+    if difficulty:
+        query = query.where(Word.difficulty == difficulty)
+    if creator_search:
+        normalized_search = f"%{creator_search.strip()}%"
+        query = query.where(
+            or_(
+                User.id.ilike(normalized_search),
+                User.email.ilike(normalized_search),
+            )
+        )
+
+    query = query.order_by(
+        Word.created_by_child_id.is_not(None).desc(),
+        Word.created_at.desc(),
+    ).limit(limit).offset(offset)
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    response_words = []
+    for word, creator_child_name, creator_user_id, creator_user_email in rows:
+        word_dict = AdminWordResponse.model_validate(word).model_dump()
+        word_dict["category_name"] = word.category_rel.name if word.category_rel else None
+        word_dict["category_name_cantonese"] = (
+            word.category_rel.name_cantonese if word.category_rel else None
+        )
+        word_dict["creator_user_id"] = creator_user_id
+        word_dict["creator_user_email"] = creator_user_email
+        word_dict["creator_child_name"] = creator_child_name
+        word_dict["is_user_uploaded"] = word.created_by_child_id is not None
+        response_words.append(word_dict)
+
+    return response_words
+
+
 @router.get("/{word_id}", response_model=WordResponse)
 async def get_word(
     word_id: str,
@@ -379,29 +489,264 @@ async def get_words_with_progress(
     return words_with_progress
 
 
+@router.get(
+    "/child/{child_id}/active-vocab/pending",
+    response_model=List[ActiveVocabularyApprovalRequestResponse],
+)
+async def get_pending_active_vocab_requests(
+    child_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List child words that are waiting for parent confirmation before becoming active vocabulary."""
+    result = await db.execute(
+        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+    )
+    if not result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Child not found"
+        )
+
+    pending_result = await db.execute(
+        select(WordProgress, Word)
+        .join(Word, Word.id == WordProgress.word_id)
+        .where(
+            WordProgress.child_id == child_id,
+            WordProgress.pending_active_vocab_approval.is_(True),
+            WordProgress.active_vocab_requested_at.is_not(None),
+        )
+        .order_by(WordProgress.active_vocab_requested_at.desc())
+    )
+
+    return [
+        {
+            "child_id": child_id,
+            "word_id": word.id,
+            "word": word.word,
+            "word_cantonese": word.word_cantonese,
+            "image_url": word.image_url,
+            "requested_at": progress.active_vocab_requested_at,
+            "exposure_count": progress.exposure_count or 0,
+            "last_practiced": progress.last_practiced,
+        }
+        for progress, word in pending_result.all()
+    ]
+
+
+@router.post("/{word_id}/progress/{child_id}/request-active-vocab", response_model=WordProgressResponse)
+async def request_active_vocab_approval(
+    word_id: str,
+    child_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Request parent confirmation before a word is counted as active vocabulary."""
+    result = await db.execute(
+        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+    )
+    child = result.scalar_one_or_none()
+    if not child:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Child not found"
+        )
+
+    word_result = await db.execute(select(Word).where(Word.id == word_id))
+    word = word_result.scalar_one_or_none()
+    if not word:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Word not found"
+        )
+
+    progress_result = await db.execute(
+        select(WordProgress).where(
+            WordProgress.child_id == child_id,
+            WordProgress.word_id == word_id,
+        )
+    )
+    progress = progress_result.scalar_one_or_none()
+
+    if not progress:
+        progress = WordProgress(child_id=child_id, word_id=word_id)
+        db.add(progress)
+
+    if progress.mastered:
+        return progress
+
+    exposure_count = progress.exposure_count or 0
+    if exposure_count < ACTIVE_VOCAB_REQUEST_MIN_EXPOSURES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Collect {ACTIVE_VOCAB_REQUEST_MIN_EXPOSURES} memory stars before requesting parent confirmation"
+        )
+
+    progress.pending_active_vocab_approval = True
+    progress.active_vocab_requested_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(progress)
+
+    return progress
+
+
+@router.post("/{word_id}/progress/{child_id}/approve-active-vocab", response_model=WordProgressResponse)
+async def approve_active_vocab_request(
+    word_id: str,
+    child_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Approve a pending active-vocabulary request for a child."""
+    result = await db.execute(
+        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+    )
+    child = result.scalar_one_or_none()
+    if not child:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Child not found"
+        )
+
+    progress_result = await db.execute(
+        select(WordProgress).where(
+            WordProgress.child_id == child_id,
+            WordProgress.word_id == word_id,
+        )
+    )
+    progress = progress_result.scalar_one_or_none()
+    if not progress:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Word progress not found"
+        )
+
+    progress.pending_active_vocab_approval = False
+    progress.active_vocab_requested_at = None
+    if not progress.mastered:
+        progress.mastered = True
+        progress.mastered_at = datetime.utcnow()
+
+    now = datetime.utcnow()
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    tracking_result = await db.execute(
+        select(DailyWordTracking).where(
+            and_(
+                DailyWordTracking.child_id == child_id,
+                DailyWordTracking.word_id == word_id,
+                DailyWordTracking.date >= start_of_day,
+                DailyWordTracking.date <= end_of_day,
+            )
+        )
+    )
+    tracking = tracking_result.scalar_one_or_none()
+
+    if tracking:
+        tracking.used_actively = True
+        tracking.mastery_confidence = max(tracking.mastery_confidence or 0.0, 1.0)
+        tracking.learned_context = {
+            **(tracking.learned_context or {}),
+            "activity": "parent_confirmed_active_vocab",
+            "source": "parent_dashboard",
+        }
+        tracking.story_priority = max(tracking.story_priority or 0, 8)
+    else:
+        tracking = DailyWordTracking(
+            child_id=child_id,
+            word_id=word_id,
+            date=now,
+            exposure_count=0,
+            used_actively=True,
+            mastery_confidence=1.0,
+            learned_context={
+                "activity": "parent_confirmed_active_vocab",
+                "source": "parent_dashboard",
+            },
+            include_in_story=True,
+            story_priority=8,
+        )
+        db.add(tracking)
+
+    await db.commit()
+    await db.refresh(progress)
+
+    return progress
+
+
+@router.post("/{word_id}/progress/{child_id}/reject-active-vocab", response_model=WordProgressResponse)
+async def reject_active_vocab_request(
+    word_id: str,
+    child_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Reject a pending active-vocabulary request for a child."""
+    result = await db.execute(
+        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+    )
+    child = result.scalar_one_or_none()
+    if not child:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Child not found"
+        )
+
+    progress_result = await db.execute(
+        select(WordProgress).where(
+            WordProgress.child_id == child_id,
+            WordProgress.word_id == word_id,
+        )
+    )
+    progress = progress_result.scalar_one_or_none()
+    if not progress:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Word progress not found"
+        )
+
+    progress.pending_active_vocab_approval = False
+    progress.active_vocab_requested_at = None
+
+    await db.commit()
+    await db.refresh(progress)
+
+    return progress
+
+
 @router.post("/", response_model=WordResponse, status_code=status.HTTP_201_CREATED)
 async def create_word(
     word_data: WordCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(get_current_admin_user)
 ):
     """Create new word (admin only)"""
+    await _get_category_or_404(word_data.category, db)
+
     word = Word(
         id=str(uuid.uuid4()),
         word=word_data.word,
+        word_cantonese=word_data.word_cantonese,
         category=word_data.category,
         pronunciation=word_data.pronunciation,
+        jyutping=word_data.jyutping,
         definition=word_data.definition,
+        definition_cantonese=word_data.definition_cantonese,
         example=word_data.example,
+        example_cantonese=word_data.example_cantonese,
         difficulty=word_data.difficulty,
         physical_action=word_data.physical_action,
         image_url=word_data.image_url,
         audio_url=word_data.audio_url,
+        audio_url_english=word_data.audio_url_english,
         contexts=word_data.contexts or [],
         related_words=word_data.related_words or [],
     )
     
     db.add(word)
+    await _recount_category_word_count(word.category, db)
     await db.commit()
     await db.refresh(word)
     
@@ -413,26 +758,45 @@ async def update_word(
     word_id: str,
     word_data: WordUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(get_current_admin_user)
 ):
     """Update word (admin only)"""
-    result = await db.execute(select(Word).where(Word.id == word_id))
-    word = result.scalar_one_or_none()
-    
-    if not word:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Word not found"
-        )
+    word = await _ensure_admin_editable_word(word_id, db)
     
     update_data = word_data.dict(exclude_unset=True)
+
+    old_category_id = word.category
+    if "category" in update_data:
+        await _get_category_or_404(update_data["category"], db)
+
     for field, value in update_data.items():
         setattr(word, field, value)
+
+    await _recount_category_word_count(word.category, db)
+    if old_category_id != word.category:
+        await _recount_category_word_count(old_category_id, db)
     
     await db.commit()
     await db.refresh(word)
     
     return word
+
+
+@router.delete("/{word_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_word(
+    word_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_admin_user)
+):
+    """Soft-delete a shared vocabulary word (admin only)."""
+    word = await _ensure_admin_editable_word(word_id, db)
+
+    if word.is_active:
+        word.is_active = False
+        await _recount_category_word_count(word.category, db)
+        await db.commit()
+
+    return None
 
 
 @router.post("/{word_id}/progress/{child_id}")
@@ -474,8 +838,13 @@ async def update_word_progress(
         db.add(progress)
     
     # Update progress
-    old_exposure_count = progress.exposure_count or 0
     update_data = progress_data.dict(exclude_unset=True)
+    if "mastered" in update_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Use the active vocabulary approval flow to change mastery status"
+        )
+
     for field, value in update_data.items():
         setattr(progress, field, value)
     

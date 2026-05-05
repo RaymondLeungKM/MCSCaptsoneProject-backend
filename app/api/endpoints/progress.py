@@ -6,7 +6,7 @@ import uuid
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
@@ -18,9 +18,10 @@ from app.schemas.analytics import (
     ProgressStatsResponse
 )
 from app.models.analytics import LearningSession
+from app.models.daily_words import DailyWordTracking
 from app.models.parent_analytics import ParentalControl
 from app.models.user import User, Child
-from app.models.vocabulary import WordProgress
+from app.models.vocabulary import Category, Word, WordProgress
 from app.core.security import get_current_active_user
 
 router = APIRouter()
@@ -196,23 +197,153 @@ async def get_progress_stats(
     mastered_words = sum(1 for p in all_progress if p.mastered)
     total_words = len(all_progress)
     
-    # Calculate active vs passive vocabulary
-    active_vocab = sum(1 for p in all_progress if p.kinesthetic_exposures > 0)
+    # Calculate active vs passive vocabulary from explicit output signals.
+    progress_word_ids = {p.word_id for p in all_progress}
+
+    active_word_ids: set[str] = set()
+
+    active_tracking_result = await db.execute(
+        select(DailyWordTracking.word_id)
+        .where(
+            and_(
+                DailyWordTracking.child_id == child_id,
+                DailyWordTracking.used_actively == True,
+            )
+        )
+        .distinct()
+    )
+    active_word_ids.update(
+        word_id for word_id in active_tracking_result.scalars().all()
+        if word_id in progress_word_ids
+    )
+
+    active_sessions_result = await db.execute(
+        select(LearningSession.words_used_actively).where(
+            and_(
+                LearningSession.child_id == child_id,
+                LearningSession.words_used_actively.is_not(None),
+            )
+        )
+    )
+    for words_used_actively in active_sessions_result.scalars().all():
+        if not words_used_actively:
+            continue
+
+        active_word_ids.update(
+            word_id for word_id in words_used_actively
+            if word_id in progress_word_ids
+        )
+
+    active_vocab = len(active_word_ids)
     passive_vocab = total_words - active_vocab
-    
-    # TODO: Implement full statistics calculation
-    # This is a simplified version
+
+    average_exposures_per_word = sum(
+        p.exposure_count or 0 for p in all_progress
+    ) / max(total_words, 1)
+
+    weekly_dates = [date.today() - timedelta(days=offset) for offset in range(6, -1, -1)]
+    weekly_counts = {day: 0 for day in weekly_dates}
+    for progress in all_progress:
+        if progress.last_practiced is None:
+            continue
+
+        practiced_day = progress.last_practiced.date()
+        if practiced_day in weekly_counts:
+            weekly_counts[practiced_day] += 1
+
+    weekly_progress = [weekly_counts[day] for day in weekly_dates]
+
+    modality_coverage_total = 0.0
+    modality_tracked_words = 0
+    for progress in all_progress:
+        modalities_used = 0
+        if (progress.visual_exposures or 0) > 0:
+            modalities_used += 1
+        if (progress.auditory_exposures or 0) > 0:
+            modalities_used += 1
+        if (progress.kinesthetic_exposures or 0) > 0:
+            modalities_used += 1
+
+        if modalities_used == 0:
+            continue
+
+        modality_tracked_words += 1
+        modality_coverage_total += modalities_used / 3
+
+    multi_sensory_engagement = round(
+        (modality_coverage_total / max(modality_tracked_words, 1)) * 100,
+        1,
+    ) if modality_tracked_words > 0 else 0.0
+
+    category_progress_result = await db.execute(
+        select(
+            Category.id.label("category_id"),
+            Category.name.label("category_name"),
+            Category.name_cantonese.label("category_name_cantonese"),
+            func.count(WordProgress.id).label("learned_words"),
+            func.count(WordProgress.id).filter(
+                WordProgress.mastered.is_(True)
+            ).label("mastered_words"),
+        )
+        .select_from(WordProgress)
+        .join(Word, WordProgress.word_id == Word.id)
+        .join(Category, Word.category == Category.id)
+        .where(
+            and_(
+                WordProgress.child_id == child_id,
+                WordProgress.exposure_count >= 1,
+                Word.is_active == True,
+                Category.is_active == True,
+            )
+        )
+        .group_by(Category.id, Category.name, Category.name_cantonese)
+    )
+
+    learned_category_rows = category_progress_result.all()
+    category_progress = []
+    if learned_category_rows:
+        category_ids = [row.category_id for row in learned_category_rows]
+        total_words_result = await db.execute(
+            select(
+                Word.category.label("category_id"),
+                func.count(Word.id).label("total_words"),
+            )
+            .where(
+                and_(
+                    Word.category.in_(category_ids),
+                    Word.is_active == True,
+                )
+            )
+            .group_by(Word.category)
+        )
+        total_words_by_category = {
+            row.category_id: row.total_words for row in total_words_result.all()
+        }
+
+        for row in learned_category_rows:
+            total_for_category = total_words_by_category.get(row.category_id, 0)
+            progress_percentage = round(
+                ((row.mastered_words or 0) / total_for_category) * 100,
+            ) if total_for_category > 0 else 0
+            category_progress.append(
+                {
+                    "category": row.category_name_cantonese or row.category_name,
+                    "progress": int(progress_percentage),
+                    "mastered": row.mastered_words or 0,
+                    "total": total_for_category,
+                }
+            )
     
     return {
         "total_words": total_words,
         "mastered_words": mastered_words,
         "active_vocabulary": active_vocab,
         "passive_vocabulary": passive_vocab,
-        "weekly_progress": [0, 0, 0, 0, 0, 0, 0],  # Placeholder
+        "weekly_progress": weekly_progress,
         "streak_days": child.current_streak,
-        "category_progress": [],  # Placeholder
-        "average_exposures_per_word": sum(p.exposure_count for p in all_progress) / max(total_words, 1),
-        "multi_sensory_engagement": 0.0  # Placeholder
+        "category_progress": category_progress,
+        "average_exposures_per_word": average_exposures_per_word,
+        "multi_sensory_engagement": multi_sensory_engagement,
     }
 
 

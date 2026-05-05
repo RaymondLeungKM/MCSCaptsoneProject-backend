@@ -10,7 +10,14 @@ from datetime import date, datetime
 import uuid
 
 from app.db.session import get_db
-from app.schemas.content import AssignedMissionResponse, MissionProgressResponse, MissionProgressUpdate
+from app.schemas.content import (
+    AssignedMissionResponse,
+    MissionCreate,
+    MissionProgressResponse,
+    MissionProgressUpdate,
+    MissionResponse,
+    MissionUpdate,
+)
 from app.models.content import (
     Mission,
     MissionAssignment,
@@ -21,12 +28,140 @@ from app.models.content import (
     MissionSurface,
 )
 from app.models.user import User, Child
-from app.core.security import get_current_active_user
+from app.core.child_age import calculate_child_age
+from app.core.security import get_current_active_user, get_current_admin_user
 
 router = APIRouter()
 
 MAX_DAILY_ASSIGNMENTS = 3
 MAX_OFFLINE_ASSIGNMENTS = 6
+
+
+async def _get_mission_by_id(mission_id: str, db: AsyncSession) -> Mission:
+    result = await db.execute(select(Mission).where(Mission.id == mission_id))
+    mission = result.scalar_one_or_none()
+    if not mission:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Mission not found",
+        )
+    return mission
+
+
+async def _ensure_unique_slug(
+    slug: str,
+    db: AsyncSession,
+    *,
+    exclude_mission_id: str | None = None,
+) -> None:
+    slug_query = select(Mission).where(Mission.slug == slug)
+    if exclude_mission_id:
+        slug_query = slug_query.where(Mission.id != exclude_mission_id)
+
+    existing_result = await db.execute(slug_query)
+    if existing_result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Mission slug already exists",
+        )
+
+
+def _apply_mission_lifecycle_defaults(
+    mission: Mission,
+    *,
+    previous_status: MissionStatus | None = None,
+) -> None:
+    now = datetime.utcnow()
+
+    if mission.status == MissionStatus.PUBLISHED:
+        if mission.published_at is None:
+            mission.published_at = now
+        mission.archived_at = None
+    elif mission.status == MissionStatus.ARCHIVED:
+        if mission.archived_at is None:
+            mission.archived_at = now
+    elif previous_status == MissionStatus.ARCHIVED:
+        mission.archived_at = None
+
+
+@router.get("/admin/catalog", response_model=List[MissionResponse])
+async def list_admin_missions(
+    include_inactive: bool = True,
+    current_user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List mission catalog entries for admin management."""
+    mission_query = select(Mission)
+    if not include_inactive:
+        mission_query = mission_query.where(Mission.is_active == True)
+
+    result = await db.execute(
+        mission_query.order_by(Mission.sort_order.asc(), Mission.created_at.desc())
+    )
+    return result.scalars().all()
+
+
+@router.post("/admin/catalog", response_model=MissionResponse, status_code=status.HTTP_201_CREATED)
+async def create_admin_mission(
+    mission_data: MissionCreate,
+    current_user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a mission catalog entry."""
+    await _ensure_unique_slug(mission_data.slug, db)
+
+    mission = Mission(
+        id=str(uuid.uuid4()),
+        slug=mission_data.slug,
+        title=mission_data.title,
+        description=mission_data.description,
+        context=mission_data.context,
+        is_offline=mission_data.is_offline,
+        status=mission_data.status,
+        locale=mission_data.locale,
+        age_min=mission_data.age_min,
+        age_max=mission_data.age_max,
+        difficulty=mission_data.difficulty,
+        surface=mission_data.surface,
+        sort_order=mission_data.sort_order,
+        selection_tags=mission_data.selection_tags,
+        catalog_metadata=mission_data.catalog_metadata,
+        published_at=mission_data.published_at,
+        archived_at=mission_data.archived_at,
+        target_words=mission_data.target_words,
+        conversation_prompts=mission_data.conversation_prompts,
+    )
+    _apply_mission_lifecycle_defaults(mission)
+
+    db.add(mission)
+    await db.commit()
+    await db.refresh(mission)
+    return mission
+
+
+@router.patch("/admin/catalog/{mission_id}", response_model=MissionResponse)
+async def update_admin_mission(
+    mission_id: str,
+    mission_data: MissionUpdate,
+    current_user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a mission catalog entry."""
+    mission = await _get_mission_by_id(mission_id, db)
+    update_data = mission_data.dict(exclude_unset=True)
+
+    if "slug" in update_data:
+        await _ensure_unique_slug(update_data["slug"], db, exclude_mission_id=mission_id)
+
+    previous_status = mission.status
+    for field, value in update_data.items():
+        setattr(mission, field, value)
+
+    _apply_mission_lifecycle_defaults(mission, previous_status=previous_status)
+
+    await db.commit()
+    await db.refresh(mission)
+    return mission
 
 
 async def _ensure_child_belongs_to_user(
@@ -162,6 +297,13 @@ async def _generate_assignments_for_date(
     surfaces: list[MissionSurface],
     db: AsyncSession,
 ) -> None:
+    child_age = calculate_child_age(
+        stored_age=child.age,
+        birth_year=child.birth_year,
+        birth_month=child.birth_month,
+        as_of=assignment_date,
+    )
+
     catalog_result = await db.execute(
         select(Mission)
         .where(
@@ -169,8 +311,8 @@ async def _generate_assignments_for_date(
             Mission.status == MissionStatus.PUBLISHED,
             Mission.is_active == True,
             Mission.surface.in_(surfaces),
-            sa.or_(Mission.age_min.is_(None), Mission.age_min <= child.age),
-            sa.or_(Mission.age_max.is_(None), Mission.age_max >= child.age),
+            sa.or_(Mission.age_min.is_(None), Mission.age_min <= child_age),
+            sa.or_(Mission.age_max.is_(None), Mission.age_max >= child_age),
         )
         .order_by(Mission.sort_order.asc(), Mission.created_at.asc())
     )

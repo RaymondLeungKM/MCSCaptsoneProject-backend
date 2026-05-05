@@ -30,6 +30,172 @@ from app.services.spaced_repetition_service import (
 router = APIRouter()
 
 
+def _normalize_learning_style(value: str | None) -> str:
+    return value or "mixed"
+
+
+def _style_activity_templates(style: str) -> List[str]:
+    return {
+        "kinesthetic": [
+            "做動作猜謎",
+            "實物尋寶",
+            "角色扮演",
+            "肢體動作遊戲",
+        ],
+        "visual": [
+            "圖像配對遊戲",
+            "彩色閃卡",
+            "繪本閱讀",
+            "繪畫與填色",
+        ],
+        "auditory": [
+            "朗讀故事",
+            "兒歌與韻律",
+            "聲音配對",
+            "口語重複練習",
+        ],
+        "mixed": [
+            "綜合活動",
+            "講故事",
+            "互動遊戲",
+            "美勞創作",
+        ],
+    }.get(style, ["綜合活動", "講故事", "互動遊戲", "美勞創作"])
+
+
+def _build_style_explanation(
+    child: Child,
+    priority_words: List[Word],
+    progress_dict: dict[str, WordProgress],
+) -> str:
+    style = _normalize_learning_style(child.learning_style)
+    needs_repetition = 0
+    almost_mastered = 0
+
+    for word in priority_words:
+        progress = progress_dict.get(word.id)
+        if not progress or progress.exposure_count < 6:
+            needs_repetition += 1
+        elif not progress.mastered:
+            almost_mastered += 1
+
+    if style == "kinesthetic":
+        return (
+            f"{child.name} 目前有 {needs_repetition} 個重點詞彙仍在建立記憶，"
+            "配合動作、實物和走動式練習，通常會比單純看卡片更投入。"
+        )
+
+    if style == "visual":
+        return (
+            f"{child.name} 這一輪聚焦的 {len(priority_words)} 個詞彙中，"
+            f"有 {needs_repetition} 個適合用圖片、顏色提示和視覺配對去加深印象。"
+        )
+
+    if style == "auditory":
+        return (
+            f"{child.name} 現在的重點詞彙較適合透過聽故事、跟讀和節奏重複來鞏固，"
+            f"當中有 {almost_mastered or needs_repetition} 個詞語適合多聽幾次。"
+        )
+
+    return (
+        f"{child.name} 目前的重點詞彙同時包含新詞和待鞏固詞彙，"
+        "交替使用故事、互動遊戲和動手創作，會比單一方式更容易記住。"
+    )
+
+
+def _build_recommendation_reason(
+    child: Child,
+    priority_words: List[Word],
+    progress_dict: dict[str, WordProgress],
+    recommended_activity: str,
+) -> str:
+    needs_repetition = sum(
+        1
+        for word in priority_words
+        if (progress := progress_dict.get(word.id)) is None or progress.exposure_count < 6
+    )
+    almost_mastered = sum(
+        1
+        for word in priority_words
+        if (progress := progress_dict.get(word.id)) is not None
+        and progress.exposure_count >= 6
+        and not progress.mastered
+    )
+
+    if recommended_activity == "game":
+        return (
+            f"這次挑出的 {len(priority_words)} 個重點詞彙中，有 {needs_repetition} 個仍需要加強練習，"
+            f"先用互動遊戲帶 {child.name} 重複接觸，通常更容易維持投入感。"
+        )
+
+    if recommended_activity == "story":
+        return (
+            f"這次的重點詞彙裡有 {almost_mastered or needs_repetition} 個很適合放進故事情境中重溫，"
+            f"讓 {child.name} 先透過圖片和語境理解，再進一步開口使用。"
+        )
+
+    return (
+        f"目前有 {needs_repetition} 個詞彙需要更多重複接觸，"
+        "交替使用多種學習方式可以同時照顧理解、記憶和主動輸出。"
+    )
+
+
+def _build_suggested_activities(
+    child: Child,
+    priority_words: List[Word],
+    progress_dict: dict[str, WordProgress],
+) -> List[str]:
+    style = _normalize_learning_style(child.learning_style)
+    suggestions = list(_style_activity_templates(style))
+
+    needs_repetition = sum(
+        1
+        for word in priority_words
+        if (progress := progress_dict.get(word.id)) is None or progress.exposure_count < 6
+    )
+    has_physical_action = any(word.physical_action for word in priority_words)
+    has_almost_mastered = any(
+        (progress := progress_dict.get(word.id)) is not None
+        and progress.exposure_count >= 6
+        and not progress.mastered
+        for word in priority_words
+    )
+
+    if needs_repetition >= 3:
+        if style == "visual":
+            suggestions.insert(0, "圖片配對重複練習")
+        elif style == "auditory":
+            suggestions.insert(0, "慢速跟讀與節奏複誦")
+        elif style == "kinesthetic":
+            suggestions.insert(0, "走動式重複練習")
+        else:
+            suggestions.insert(0, "綜合主題小任務")
+
+    if has_physical_action:
+        suggestions.insert(1, "做動作猜謎")
+
+    if has_almost_mastered:
+        suggestions.append("生活情境對話")
+
+    unique_suggestions: List[str] = []
+    for suggestion in suggestions:
+        if suggestion not in unique_suggestions:
+            unique_suggestions.append(suggestion)
+
+    return unique_suggestions[:4]
+
+
+def _build_next_activity_reason(child: Child) -> str:
+    style = _normalize_learning_style(child.learning_style)
+    if style == "visual":
+        return "根據目前的視覺學習偏好，先用故事和圖片進入主題會更容易吸收。"
+    if style == "auditory":
+        return "根據目前的聽覺學習偏好，先聽故事和跟讀會更自然。"
+    if style == "kinesthetic":
+        return "根據目前的動作學習偏好，先玩互動遊戲會更投入。"
+    return "根據目前的混合學習偏好，先從互動練習開始，再切換故事或創作會更合適。"
+
+
 def calculate_word_priority(word: Word, progress: WordProgress, child: Child) -> int:
     """Calculate priority score for a word"""
     priority = 0
@@ -96,28 +262,47 @@ async def get_recommendations(
     scored_words.sort(key=lambda x: x[1], reverse=True)
     
     # Select top 5 words
-    next_words = [word.id for word, _ in scored_words[:5]]
+    priority_words = [word for word, _ in scored_words[:5]]
+    next_words = [word.id for word in priority_words]
     
     # Determine recommended activity based on learning style
-    if child.learning_style == "kinesthetic":
+    learning_style = _normalize_learning_style(child.learning_style)
+
+    if learning_style == "kinesthetic":
         recommended_activity = "game"
-        reason = "你適合用互動遊戲學習，邊玩邊記會更投入。"
-    elif child.learning_style == "visual":
+    elif learning_style == "visual":
         recommended_activity = "story"
-        reason = "你適合用圖像和故事學習，會更容易理解新詞語。"
-    elif child.learning_style == "auditory":
+    elif learning_style == "auditory":
         recommended_activity = "story"
-        reason = "你適合多聽多讀，先用故事和聲音練習會更自然。"
     else:
         recommended_activity = "mixed"
-        reason = "今天適合用多種方式一起學，記憶會更穩固。"
+
+    reason = _build_recommendation_reason(
+        child,
+        priority_words,
+        progress_dict,
+        recommended_activity,
+    )
+    style_explanation = _build_style_explanation(
+        child,
+        priority_words,
+        progress_dict,
+    )
+    suggested_activities = _build_suggested_activities(
+        child,
+        priority_words,
+        progress_dict,
+    )
     
     return {
         "next_words": next_words,
         "recommended_activity": recommended_activity,
         "difficulty": "easy" if child.level < 3 else "medium",
         "reason": reason,
-        "estimated_duration": child.attention_span
+        "estimated_duration": child.attention_span,
+        "learning_style": learning_style,
+        "style_explanation": style_explanation,
+        "suggested_activities": suggested_activities,
     }
 
 
@@ -220,12 +405,7 @@ async def get_next_activity(
         "recommended_activity": recommended,
         "learning_style": child.learning_style,
         "attention_span": child.attention_span,
-        "reason": {
-            "visual": "根據你的視覺學習風格，先用故事和圖片學習會更容易吸收。",
-            "auditory": "根據你的聽覺學習風格，先聽故事和跟讀會更自然。",
-            "kinesthetic": "根據你的動作學習風格，先玩互動遊戲會更投入。",
-            "mixed": "根據你的混合學習風格，先從互動練習開始最合適。",
-        }.get(child.learning_style, "系統根據你今天的學習節奏，幫你選好了下一步。")
+        "reason": _build_next_activity_reason(child)
     }
 
 

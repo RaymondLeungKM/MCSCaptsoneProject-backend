@@ -4,7 +4,7 @@ Dashboard, insights, reports, and parental controls
 """
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, desc, or_
+from sqlalchemy import select, func, and_, desc, or_, case
 from typing import List, Optional
 from datetime import datetime, date, timedelta
 import uuid
@@ -38,6 +38,371 @@ from app.core.security import get_current_user
 router = APIRouter(prefix="/parent-dashboard", tags=["parent-dashboard"])
 
 
+def _get_preferred_time_label(child: Child) -> str:
+    time_of_day = getattr(child.preferred_time_of_day, "value", child.preferred_time_of_day)
+    return {
+        "morning": "早上",
+        "afternoon": "下午",
+        "evening": "晚上",
+    }.get(time_of_day, "固定時段")
+
+
+def _get_learning_style_label(child: Child) -> str:
+    learning_style = getattr(child.learning_style, "value", child.learning_style)
+    return {
+        "visual": "視覺提示",
+        "auditory": "聽覺提示",
+        "kinesthetic": "動作參與",
+        "mixed": "多元活動",
+    }.get(learning_style, "多元活動")
+
+
+def _get_mode_label(mode: str) -> str:
+    return {
+        "visual": "視覺",
+        "auditory": "聽覺",
+        "kinesthetic": "動作",
+    }.get(mode, mode)
+
+
+def _get_category_practice_tip(category_name: str) -> str:
+    normalized = category_name.strip()
+    if normalized in {"動物", "Animals"}:
+        return "可用玩偶、故事書或角色扮演，讓孩子邊看邊說出動物名稱。"
+    if normalized in {"食物", "Food"}:
+        return "可在用餐時做實物指認，讓孩子描述顏色、味道和用途。"
+    if normalized in {"顏色", "Colors"}:
+        return "可做顏色尋寶或物件配對，把詞彙放進家中的真實情境。"
+    if normalized in {"大自然", "Nature"}:
+        return "可到公園觀察實物，邊看邊說名稱和特徵，幫助記憶更穩定。"
+    if normalized in {"交通工具", "Vehicles"}:
+        return "可用玩具車或街景圖片做分類與命名，增加生活連結。"
+    if normalized in {"家庭", "Family"}:
+        return "可用家庭照片做人物稱呼和關係配對，增加口語輸出機會。"
+    return "可用圖片、實物或動作配對，把這個主題放進日常情境中反覆練習。"
+
+
+def _build_learning_insight(
+    *,
+    child_id: str,
+    insight_type: str,
+    priority: str,
+    title: str,
+    description: str,
+    action_items: List[str],
+    category: Optional[str] = None,
+    data: Optional[dict] = None,
+) -> LearningInsight:
+    timestamp = datetime.utcnow().isoformat()
+    return LearningInsight(
+        id=str(uuid.uuid4()),
+        child_id=child_id,
+        insight_type=insight_type,
+        priority=priority,
+        category=category,
+        title=title,
+        description=description,
+        action_items=action_items,
+        data=data or {},
+        generated_at=timestamp,
+        created_at=timestamp,
+    )
+
+
+async def _generate_default_learning_insights(
+    child: Child,
+    db: AsyncSession,
+) -> List[LearningInsight]:
+    weekly_window_start = datetime.combine(
+        date.today() - timedelta(days=6),
+        datetime.min.time(),
+    )
+
+    learned_words_result = await db.execute(
+        select(func.count(WordProgress.id))
+        .where(
+            and_(
+                WordProgress.child_id == child.id,
+                WordProgress.exposure_count >= 1,
+            )
+        )
+    )
+    learned_words = learned_words_result.scalar() or 0
+
+    mastered_words_result = await db.execute(
+        select(func.count(WordProgress.id))
+        .where(
+            and_(
+                WordProgress.child_id == child.id,
+                WordProgress.mastered == True,
+            )
+        )
+    )
+    mastered_words = mastered_words_result.scalar() or 0
+
+    active_days_result = await db.execute(
+        select(func.count(func.distinct(func.date(WordProgress.last_practiced))))
+        .where(
+            and_(
+                WordProgress.child_id == child.id,
+                WordProgress.last_practiced.is_not(None),
+                WordProgress.last_practiced >= weekly_window_start,
+            )
+        )
+    )
+    active_days = active_days_result.scalar() or 0
+
+    exposure_mode_result = await db.execute(
+        select(
+            func.coalesce(func.sum(WordProgress.visual_exposures), 0),
+            func.coalesce(func.sum(WordProgress.auditory_exposures), 0),
+            func.coalesce(func.sum(WordProgress.kinesthetic_exposures), 0),
+        ).where(WordProgress.child_id == child.id)
+    )
+    visual_exposures, auditory_exposures, kinesthetic_exposures = (
+        exposure_mode_result.one()
+    )
+
+    category_progress_result = await db.execute(
+        select(
+            Category.id,
+            Category.name,
+            Category.name_cantonese,
+            func.count(Word.id).label("total_words"),
+            func.count(WordProgress.id).label("learned_words"),
+        )
+        .select_from(Category)
+        .join(
+            Word,
+            and_(
+                Word.category == Category.id,
+                Word.is_active == True,
+            ),
+        )
+        .outerjoin(
+            WordProgress,
+            and_(
+                WordProgress.word_id == Word.id,
+                WordProgress.child_id == child.id,
+                WordProgress.exposure_count >= 1,
+            ),
+        )
+        .where(Category.is_active == True)
+        .group_by(Category.id, Category.name, Category.name_cantonese)
+    )
+
+    category_progress = []
+    for category_id, category_name, category_name_cantonese, total_words, learned_count in category_progress_result.all():
+        progress_percentage = (
+            learned_count / total_words * 100 if total_words else 0
+        )
+        category_progress.append(
+            {
+                "category_id": category_id,
+                "category_name": category_name,
+                "category_name_cantonese": category_name_cantonese or category_name,
+                "total_words": total_words,
+                "learned_words": learned_count,
+                "progress_percentage": progress_percentage,
+            }
+        )
+
+    category_progress.sort(key=lambda item: item["progress_percentage"])
+    weakest_category = next(
+        (item for item in category_progress if item["learned_words"] < item["total_words"]),
+        category_progress[0] if category_progress else None,
+    )
+
+    insights: List[LearningInsight] = []
+
+    if learned_words == 0:
+        insights.append(
+            _build_learning_insight(
+                child_id=child.id,
+                insight_type="recommendation",
+                priority="high",
+                title="先建立第一個每日學習節奏",
+                description=(
+                    f"{child.name} 目前還未累積詞彙學習紀錄，建議先從 1 至 2 個日常詞彙開始，"
+                    "讓孩子先建立成功感。"
+                ),
+                action_items=[
+                    f"優先安排在{_get_preferred_time_label(child)}做 5 至 10 分鐘短練習，先完成每日目標。",
+                ],
+                data={"source": "auto-bootstrap", "kind": "onboarding"},
+            )
+        )
+        insights.append(
+            _build_learning_insight(
+                child_id=child.id,
+                insight_type="recommendation",
+                priority="medium",
+                title="從生活情境開始最容易建立詞彙連結",
+                description="先從吃飯、玩具、家庭成員等每天都會碰到的內容開始，比一次塞太多新詞更有效。",
+                action_items=[
+                    "可以指著身邊的實物說名稱，再請孩子跟讀或做對應動作。",
+                ],
+                data={"source": "auto-bootstrap", "kind": "context"},
+            )
+        )
+        insights.append(
+            _build_learning_insight(
+                child_id=child.id,
+                insight_type="recommendation",
+                priority="medium",
+                title="一開始就加入多感官提示",
+                description=(
+                    f"{child.name} 的學習偏好較適合配合{_get_learning_style_label(child)}，"
+                    "同一個詞彙若能同時看、聽、做，會更容易記住。"
+                ),
+                action_items=[
+                    "可把圖片、口頭提示和身體動作放在同一次練習中一起使用。",
+                ],
+                data={"source": "auto-bootstrap", "kind": "learning-style"},
+            )
+        )
+        return insights
+
+    if child.current_streak >= 3:
+        title = f"已連續學習 {child.current_streak} 天，節奏開始穩定"
+        description = (
+            f"{child.name} 這段時間已建立連續學習習慣，現在是把已接觸詞彙轉成主動輸出的好時機。"
+        )
+        action_item = f"維持在{_get_preferred_time_label(child)}安排短練習，避免一次拉太長。"
+    else:
+        title = f"已接觸 {learned_words} 個詞彙，可開始加強穩定度"
+        description = (
+            f"目前已有 {mastered_words} 個詞彙達到較穩定掌握，持續小步前進會比集中衝刺更有效。"
+        )
+        action_item = "每天固定完成少量高頻複習，比偶爾做一次大量練習更容易留住記憶。"
+
+    insights.append(
+        _build_learning_insight(
+            child_id=child.id,
+            insight_type="milestone" if child.current_streak >= 3 else "strength",
+            priority="high",
+            title=title,
+            description=description,
+            action_items=[action_item],
+            data={
+                "source": "auto-bootstrap",
+                "learned_words": learned_words,
+                "mastered_words": mastered_words,
+                "active_days": active_days,
+            },
+        )
+    )
+
+    if weakest_category:
+        weakest_name = weakest_category["category_name_cantonese"]
+        remaining_words = max(
+            weakest_category["total_words"] - weakest_category["learned_words"],
+            0,
+        )
+        insights.append(
+            _build_learning_insight(
+                child_id=child.id,
+                insight_type="weakness",
+                priority="high"
+                if weakest_category["progress_percentage"] < 50
+                else "medium",
+                title=f"可優先加強「{weakest_name}」主題",
+                description=(
+                    f"目前此主題已接觸 {weakest_category['learned_words']} / {weakest_category['total_words']} 個詞彙，"
+                    f"尚有 {remaining_words} 個詞彙可再加強。"
+                ),
+                action_items=[_get_category_practice_tip(weakest_name)],
+                category=weakest_category["category_name"],
+                data={
+                    "source": "auto-bootstrap",
+                    "progress_percentage": weakest_category["progress_percentage"],
+                    "remaining_words": remaining_words,
+                },
+            )
+        )
+
+    exposure_totals = {
+        "visual": visual_exposures,
+        "auditory": auditory_exposures,
+        "kinesthetic": kinesthetic_exposures,
+    }
+    total_exposures = sum(exposure_totals.values())
+    dominant_mode = max(exposure_totals, key=exposure_totals.get)
+    dominant_ratio = (
+        exposure_totals[dominant_mode] / total_exposures if total_exposures else 0
+    )
+
+    if total_exposures == 0 or dominant_ratio >= 0.65:
+        mode_label = _get_mode_label(dominant_mode)
+        insights.append(
+            _build_learning_insight(
+                child_id=child.id,
+                insight_type="recommendation",
+                priority="medium",
+                title="可再增加多感官學習提示",
+                description=(
+                    f"目前練習較偏向{mode_label}提示，若能加入圖片、聲音和動作的交替使用，"
+                    "通常更有助於幼兒記住新詞。"
+                ),
+                action_items=[
+                    "同一個詞彙可先看圖，再聽讀音，最後配合一個動作或生活情境練習。",
+                ],
+                data={
+                    "source": "auto-bootstrap",
+                    "dominant_mode": dominant_mode,
+                    "dominant_ratio": dominant_ratio,
+                },
+            )
+        )
+    else:
+        insights.append(
+            _build_learning_insight(
+                child_id=child.id,
+                insight_type="strength",
+                priority="medium",
+                title="多感官接觸分布較平均",
+                description=(
+                    f"{child.name} 最近的練習同時包含圖片、聽覺和動作元素，這種搭配對穩定記憶有幫助。"
+                ),
+                action_items=[
+                    "可把已熟悉的詞彙加入口語輸出或小故事，幫助從辨認走向主動使用。",
+                ],
+                data={"source": "auto-bootstrap", "total_exposures": total_exposures},
+            )
+        )
+
+    return insights[:3]
+
+
+async def _ensure_learning_insights_exist(
+    child: Child,
+    db: AsyncSession,
+) -> None:
+    existing_result = await db.execute(
+        select(LearningInsight.id)
+        .where(LearningInsight.child_id == child.id)
+        .limit(1)
+    )
+    if existing_result.scalar_one_or_none():
+        return
+
+    generated_insights = await _generate_default_learning_insights(child, db)
+    if not generated_insights:
+        return
+
+    db.add_all(generated_insights)
+    await db.commit()
+
+
+def _learning_insight_priority_order():
+    return case(
+        (LearningInsight.priority == "high", 0),
+        (LearningInsight.priority == "medium", 1),
+        (LearningInsight.priority == "low", 2),
+        else_=3,
+    )
+
+
 # =============================================================================
 # DASHBOARD SUMMARY
 # =============================================================================
@@ -60,6 +425,8 @@ async def get_dashboard_summary(
     child = result.scalar_one_or_none()
     if not child:
         raise HTTPException(status_code=404, detail="Child not found")
+
+    await _ensure_learning_insights_exist(child, db)
     
     # Calculate actual words learned from WordProgress table
     words_learned_result = await db.execute(
@@ -146,6 +513,7 @@ async def get_dashboard_summary(
             )
         )
         .order_by(
+            _learning_insight_priority_order(),
             LearningInsight.is_read.asc(),
             desc(LearningInsight.generated_at)
         )
@@ -493,8 +861,11 @@ async def get_learning_insights(
             and_(Child.id == child_id, Child.parent_id == current_user.id)
         )
     )
-    if not result.scalar_one_or_none():
+    child = result.scalar_one_or_none()
+    if not child:
         raise HTTPException(status_code=404, detail="Child not found")
+
+    await _ensure_learning_insights_exist(child, db)
     
     # Build query
     conditions = [LearningInsight.child_id == child_id]
@@ -507,7 +878,7 @@ async def get_learning_insights(
         select(LearningInsight)
         .where(and_(*conditions))
         .order_by(
-            LearningInsight.priority.desc(),
+            _learning_insight_priority_order(),
             desc(LearningInsight.generated_at)
         )
         .limit(limit)

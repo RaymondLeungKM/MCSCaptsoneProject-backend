@@ -7,13 +7,24 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from typing import List
 import uuid
+from datetime import date
 
 from app.db.session import get_db
 from app.schemas.user import ChildCreate, ChildUpdate, ChildResponse, ChildProfileResponse
 from app.models.user import User, Child
 from app.core.security import get_current_active_user
+from app.core.child_age import calculate_child_age, infer_birth_year_from_age
 
 router = APIRouter()
+
+
+def _apply_effective_age(child: Child, *, as_of: date | None = None) -> None:
+    child.age = calculate_child_age(
+        stored_age=child.age,
+        birth_year=child.birth_year,
+        birth_month=child.birth_month,
+        as_of=as_of,
+    )
 
 
 @router.post("/", response_model=ChildResponse, status_code=status.HTTP_201_CREATED)
@@ -23,11 +34,20 @@ async def create_child(
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new child profile"""
+    birth_year = child_data.birth_year
+    birth_month = child_data.birth_month
+    if birth_year is None:
+        birth_year, inferred_birth_month = infer_birth_year_from_age(child_data.age)
+        if birth_month is None:
+            birth_month = inferred_birth_month
+
     child = Child(
         id=str(uuid.uuid4()),
         parent_id=current_user.id,
         name=child_data.name,
         age=child_data.age,
+        birth_year=birth_year,
+        birth_month=birth_month,
         avatar=child_data.avatar,
         daily_goal=child_data.daily_goal,
         learning_style=child_data.learning_style,
@@ -38,6 +58,7 @@ async def create_child(
     db.add(child)
     await db.commit()
     await db.refresh(child, ["interests"])
+    _apply_effective_age(child)
     
     return child
 
@@ -79,6 +100,9 @@ async def get_children(
             child.today_progress = today_count
     
     await db.commit()
+
+    for child in children:
+        _apply_effective_age(child, as_of=today)
     
     return children
 
@@ -127,6 +151,8 @@ async def get_child(
         child.today_progress = today_count
         await db.commit()
         await db.refresh(child)
+
+    _apply_effective_age(child, as_of=today)
     
     return child
 
@@ -154,11 +180,20 @@ async def update_child(
     
     # Update fields
     update_data = child_data.dict(exclude_unset=True)
+
+    if "age" in update_data and "birth_year" not in update_data:
+        update_data["birth_year"], inferred_birth_month = infer_birth_year_from_age(
+            update_data["age"]
+        )
+        if "birth_month" not in update_data:
+            update_data["birth_month"] = inferred_birth_month
+
     for field, value in update_data.items():
         setattr(child, field, value)
     
     await db.commit()
     await db.refresh(child, ["interests"])
+    _apply_effective_age(child)
     
     return child
 

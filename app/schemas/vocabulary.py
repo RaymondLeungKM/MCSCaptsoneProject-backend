@@ -24,7 +24,8 @@ class CategoryBase(BaseModel):
 
 
 class CategoryCreate(CategoryBase):
-    pass
+    is_active: bool = True
+    sort_order: Optional[int] = None
 
 
 class CategoryUpdate(BaseModel):
@@ -34,12 +35,15 @@ class CategoryUpdate(BaseModel):
     color: Optional[str] = None
     description: Optional[str] = None
     description_cantonese: Optional[str] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
 
 
 class CategoryResponse(CategoryBase):
     id: str
     word_count: int
     is_active: bool
+    sort_order: int = 0
     
     class Config:
         from_attributes = True
@@ -111,6 +115,13 @@ class WordResponse(WordBase):
         from_attributes = True
 
 
+class AdminWordResponse(WordResponse):
+    creator_user_id: Optional[str] = None
+    creator_user_email: Optional[str] = None
+    creator_child_name: Optional[str] = None
+    is_user_uploaded: bool = False
+
+
 # Word Progress schemas
 class WordProgressBase(BaseModel):
     word_id: str
@@ -124,6 +135,8 @@ class WordProgressResponse(BaseModel):
     mastered: bool
     mastered_at: Optional[datetime] = None
     last_practiced: Optional[datetime] = None
+    pending_active_vocab_approval: bool = False
+    active_vocab_requested_at: Optional[datetime] = None
     correct_attempts: int
     total_attempts: int
     success_rate: float
@@ -174,6 +187,17 @@ class ExternalWordLearningResponse(BaseModel):
 class WordWithProgress(WordResponse):
     """Word with child's progress data"""
     progress: Optional[WordProgressResponse] = None
+
+
+class ActiveVocabularyApprovalRequestResponse(BaseModel):
+    child_id: str
+    word_id: str
+    word: str
+    word_cantonese: Optional[str] = None
+    image_url: Optional[str] = None
+    requested_at: datetime
+    exposure_count: int
+    last_practiced: Optional[datetime] = None
 
 
 # Sentence generation schemas

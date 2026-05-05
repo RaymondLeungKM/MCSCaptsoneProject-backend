@@ -69,6 +69,8 @@ class UserResponse(UserBase):
 class ChildBase(BaseModel):
     name: str
     age: int
+    birth_year: Optional[int] = None
+    birth_month: Optional[int] = None
     avatar: str = "👧"
     daily_goal: int = 5
     learning_style: LearningStyle = LearningStyle.MIXED
@@ -84,6 +86,8 @@ class ChildCreate(ChildBase):
 class ChildUpdate(BaseModel):
     name: Optional[str] = None
     age: Optional[int] = None
+    birth_year: Optional[int] = None
+    birth_month: Optional[int] = None
     avatar: Optional[str] = None
     daily_goal: Optional[int] = None
     learning_style: Optional[LearningStyle] = None

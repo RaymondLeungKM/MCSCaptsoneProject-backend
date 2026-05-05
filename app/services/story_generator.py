@@ -12,6 +12,7 @@ from sqlalchemy import select, and_, func
 from app.models.daily_words import DailyWordTracking, GeneratedStory
 from app.models.vocabulary import Word
 from app.models.user import Child
+from app.core.child_age import calculate_child_age
 from app.schemas.stories import DailyWordSummary, StoryGenerationRequest
 from app.core.config import settings
 from app.services.llm_service import LLMService, LLMProvider, LLMMessage
@@ -372,7 +373,12 @@ class StoryGeneratorService:
 
         prompt = self._create_story_prompt(
             child_name=child.name,
-            child_age=child.age,
+            child_age=calculate_child_age(
+                stored_age=child.age,
+                birth_year=child.birth_year,
+                birth_month=child.birth_month,
+                as_of=request.date.date() if isinstance(request.date, datetime) else None,
+            ),
             words=words,
             theme=request.theme,
             word_count_target=request.word_count_target,

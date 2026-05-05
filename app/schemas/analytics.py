@@ -192,6 +192,9 @@ class AdaptiveLearningRecommendation(BaseModel):
     difficulty: str
     reason: str
     estimated_duration: int  # minutes
+    learning_style: Optional[str] = None
+    style_explanation: Optional[str] = None
+    suggested_activities: List[str] = []
 
 
 class WordOfTheDayResponse(BaseModel):
