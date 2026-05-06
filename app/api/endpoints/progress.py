@@ -241,17 +241,39 @@ async def get_progress_stats(
         p.exposure_count or 0 for p in all_progress
     ) / max(total_words, 1)
 
-    weekly_dates = [date.today() - timedelta(days=offset) for offset in range(6, -1, -1)]
-    weekly_counts = {day: 0 for day in weekly_dates}
-    for progress in all_progress:
-        if progress.last_practiced is None:
-            continue
+    today = date.today()
+    week_start = today - timedelta(days=today.weekday())
+    week_dates = [week_start + timedelta(days=offset) for offset in range(7)]
+    weekly_counts = {day: 0 for day in week_dates}
 
-        practiced_day = progress.last_practiced.date()
-        if practiced_day in weekly_counts:
-            weekly_counts[practiced_day] += 1
+    weekly_tracking_result = await db.execute(
+        select(
+            func.date(DailyWordTracking.date).label("tracked_day"),
+            func.count(func.distinct(DailyWordTracking.word_id)).label("tracked_words"),
+        )
+        .where(
+            and_(
+                DailyWordTracking.child_id == child_id,
+                DailyWordTracking.date >= datetime.combine(week_start, time.min),
+                DailyWordTracking.date < datetime.combine(
+                    week_start + timedelta(days=7),
+                    time.min,
+                ),
+            )
+        )
+        .group_by(func.date(DailyWordTracking.date))
+    )
 
-    weekly_progress = [weekly_counts[day] for day in weekly_dates]
+    for tracked_day, tracked_words in weekly_tracking_result.all():
+        if isinstance(tracked_day, str):
+            resolved_day = date.fromisoformat(tracked_day)
+        else:
+            resolved_day = tracked_day
+
+        if resolved_day in weekly_counts:
+            weekly_counts[resolved_day] = tracked_words or 0
+
+    weekly_progress = [weekly_counts[day] for day in week_dates]
 
     modality_coverage_total = 0.0
     modality_tracked_words = 0
