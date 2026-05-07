@@ -437,6 +437,10 @@ async def get_word(
 async def get_words_with_progress(
     child_id: str,
     category: Optional[str] = None,
+    own_only: bool = Query(
+        False,
+        description="Only return words created by this child",
+    ),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -451,16 +455,23 @@ async def get_words_with_progress(
             detail="Child not found"
         )
     
-    # Get words with progress
-    # Include: system words (created_by_child_id IS NULL) + user's own uploaded words
-    from sqlalchemy import or_
+    # Get words with progress.
+    # Default: system words + this child's uploaded words.
+    # own_only=true: only this child's uploaded words (used for My Collection).
     query = select(Word).options(selectinload(Word.category_rel)).where(
         Word.is_active == True,
-        or_(
-            Word.created_by_child_id.is_(None),  # System words
-            Word.created_by_child_id == child_id  # User's uploaded words
-        )
     )
+
+    if own_only:
+        query = query.where(Word.created_by_child_id == child_id)
+    else:
+        query = query.where(
+            or_(
+                Word.created_by_child_id.is_(None),
+                Word.created_by_child_id == child_id,
+            )
+        )
+
     if category:
         query = query.where(Word.category == category)
     

@@ -1,10 +1,10 @@
 """
 Category endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from typing import List
+from sqlalchemy import func, select
+from typing import List, Optional
 import uuid
 
 from app.db.session import get_db
@@ -17,8 +17,22 @@ from app.core.category_colors import get_category_color
 router = APIRouter()
 
 
+def _is_my_collection_category(category: Category) -> bool:
+    normalized_name = (category.name or "").strip().lower()
+    normalized_cantonese = (category.name_cantonese or "").strip()
+
+    return normalized_name == "my collection" or normalized_cantonese in {
+        "我的",
+        "我的收藏",
+    }
+
+
 @router.get("/", response_model=List[CategoryResponse])
 async def get_categories(
+    child_id: Optional[str] = Query(
+        None,
+        description="Optional child ID for per-child My Collection counts",
+    ),
     db: AsyncSession = Depends(get_db)
 ):
     """Get all active categories for frontend/public use."""
@@ -26,7 +40,28 @@ async def get_categories(
         select(Category).where(Category.is_active == True).order_by(Category.sort_order)
     )
     categories = result.scalars().all()
-    return categories
+
+    if not child_id:
+        return categories
+
+    child_count_result = await db.execute(
+        select(Word.category, func.count())
+        .where(Word.is_active == True, Word.created_by_child_id == child_id)
+        .group_by(Word.category)
+    )
+    child_counts_by_category = {
+        category_id: word_count
+        for category_id, word_count in child_count_result.all()
+    }
+
+    response_categories = []
+    for category in categories:
+        category_payload = CategoryResponse.model_validate(category).model_dump()
+        if _is_my_collection_category(category):
+            category_payload["word_count"] = child_counts_by_category.get(category.id, 0)
+        response_categories.append(category_payload)
+
+    return response_categories
 
 
 @router.get("/admin/all", response_model=List[CategoryResponse])
