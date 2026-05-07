@@ -44,21 +44,18 @@ async def get_categories(
     if not child_id:
         return categories
 
-    child_count_result = await db.execute(
-        select(Word.category, func.count())
+    child_total_result = await db.execute(
+        select(func.count())
+        .select_from(Word)
         .where(Word.is_active == True, Word.created_by_child_id == child_id)
-        .group_by(Word.category)
     )
-    child_counts_by_category = {
-        category_id: word_count
-        for category_id, word_count in child_count_result.all()
-    }
+    child_total_uploaded_words = child_total_result.scalar_one() or 0
 
     response_categories = []
     for category in categories:
         category_payload = CategoryResponse.model_validate(category).model_dump()
         if _is_my_collection_category(category):
-            category_payload["word_count"] = child_counts_by_category.get(category.id, 0)
+            category_payload["word_count"] = child_total_uploaded_words
         response_categories.append(category_payload)
 
     return response_categories
