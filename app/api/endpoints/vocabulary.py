@@ -1212,6 +1212,71 @@ async def record_external_word_learning(
         if child.xp >= child.level * 100:
             child.level += 1
             leveled_up = True
+
+    tracking_start = timestamp_dt.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    tracking_end = timestamp_dt.replace(
+        hour=23,
+        minute=59,
+        second=59,
+        microsecond=999999,
+    )
+    tracking_context: dict[str, object] = {
+        "activity": source,
+        "source": "external_word_learning",
+    }
+
+    if confidence is not None:
+        tracking_context["confidence"] = confidence
+
+    if metadata_dict:
+        tracking_context["metadata"] = metadata_dict
+
+    tracking_result = await db.execute(
+        select(DailyWordTracking).where(
+            and_(
+                DailyWordTracking.child_id == child_id,
+                DailyWordTracking.word_id == word_obj.id,
+                DailyWordTracking.date >= tracking_start,
+                DailyWordTracking.date <= tracking_end,
+            )
+        )
+    )
+    existing_tracking = tracking_result.scalar_one_or_none()
+
+    tracking_mastery_confidence = confidence if confidence is not None else 0.35
+
+    if existing_tracking:
+        existing_tracking.exposure_count = (existing_tracking.exposure_count or 0) + 1
+        existing_tracking.mastery_confidence = max(
+            existing_tracking.mastery_confidence or 0.0,
+            tracking_mastery_confidence,
+        )
+
+        if isinstance(existing_tracking.learned_context, dict):
+            merged_context = dict(existing_tracking.learned_context)
+            merged_context.update(tracking_context)
+            existing_tracking.learned_context = merged_context
+        else:
+            existing_tracking.learned_context = tracking_context
+    else:
+        db.add(
+            DailyWordTracking(
+                child_id=child_id,
+                word_id=word_obj.id,
+                date=timestamp_dt,
+                exposure_count=1,
+                used_actively=False,
+                mastery_confidence=tracking_mastery_confidence,
+                learned_context=tracking_context,
+                include_in_story=True,
+                story_priority=5,
+            )
+        )
     
     await db.commit()
     await db.refresh(progress)

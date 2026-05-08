@@ -23,6 +23,7 @@ from app.models.parent_analytics import ParentalControl
 from app.models.user import User, Child
 from app.models.vocabulary import Category, Word, WordProgress
 from app.core.security import get_current_active_user
+from app.services.child_metrics import sync_child_metrics
 
 router = APIRouter()
 
@@ -187,6 +188,9 @@ async def get_progress_stats(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Child not found"
         )
+
+    if await sync_child_metrics(db, child, as_of=date.today()):
+        await db.commit()
     
     # Get word progress stats
     result = await db.execute(

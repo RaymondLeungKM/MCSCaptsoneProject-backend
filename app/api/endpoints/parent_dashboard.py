@@ -34,6 +34,7 @@ from app.schemas.parent_analytics import (
     LearningTimeSeriesData
 )
 from app.core.security import get_current_user
+from app.services.child_metrics import sync_child_metrics
 
 router = APIRouter(prefix="/parent-dashboard", tags=["parent-dashboard"])
 
@@ -637,27 +638,14 @@ async def get_dashboard_summary(
     if not child:
         raise HTTPException(status_code=404, detail="Child not found")
 
-    await _ensure_learning_insights_exist(child, db)
-    
-    # Calculate actual words learned from WordProgress table
-    words_learned_result = await db.execute(
-        select(func.count(WordProgress.id))
-        .where(
-            and_(
-                WordProgress.child_id == child_id,
-                WordProgress.exposure_count >= 1  # At least one exposure
-            )
-        )
-    )
-    actual_words_learned = words_learned_result.scalar() or 0
-    
-    # Update child's words_learned if different
-    if child.words_learned != actual_words_learned:
-        child.words_learned = actual_words_learned
+    today = date.today()
+    if await sync_child_metrics(db, child, as_of=today):
         await db.commit()
         await db.refresh(child)
 
-    seven_days_ago = date.today() - timedelta(days=6)
+    await _ensure_learning_insights_exist(child, db)
+
+    seven_days_ago = today - timedelta(days=6)
     _, _, recent_category_activity = await _get_recent_tracking_activity(
         child_id,
         db,

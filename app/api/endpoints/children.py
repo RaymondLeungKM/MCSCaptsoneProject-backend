@@ -14,6 +14,7 @@ from app.schemas.user import ChildCreate, ChildUpdate, ChildResponse, ChildProfi
 from app.models.user import User, Child
 from app.core.security import get_current_active_user
 from app.core.child_age import calculate_child_age, infer_birth_year_from_age
+from app.services.child_metrics import sync_child_metrics
 
 router = APIRouter()
 
@@ -75,31 +76,16 @@ async def get_children(
         .where(Child.parent_id == current_user.id)
     )
     children = result.scalars().all()
-    
-    # Calculate today's progress for each child
-    from app.models.daily_words import DailyWordTracking
-    from datetime import datetime
-    from sqlalchemy import func
-    
-    today = datetime.now().date()
-    start_of_day = datetime.combine(today, datetime.min.time())
-    end_of_day = datetime.combine(today, datetime.max.time())
-    
+
+    today = date.today()
+    has_changes = False
+
     for child in children:
-        today_count_result = await db.execute(
-            select(func.count(func.distinct(DailyWordTracking.word_id)))
-            .where(
-                DailyWordTracking.child_id == child.id,
-                DailyWordTracking.date >= start_of_day,
-                DailyWordTracking.date <= end_of_day
-            )
-        )
-        today_count = today_count_result.scalar() or 0
-        
-        if child.today_progress != today_count:
-            child.today_progress = today_count
-    
-    await db.commit()
+        child_changed = await sync_child_metrics(db, child, as_of=today)
+        has_changes = has_changes or child_changed
+
+    if has_changes:
+        await db.commit()
 
     for child in children:
         _apply_effective_age(child, as_of=today)
@@ -127,30 +113,10 @@ async def get_child(
             detail="Child not found"
         )
     
-    # Calculate today's actual progress from DailyWordTracking
-    from app.models.daily_words import DailyWordTracking
-    from datetime import datetime
-    from sqlalchemy import func
-    
-    today = datetime.now().date()
-    start_of_day = datetime.combine(today, datetime.min.time())
-    end_of_day = datetime.combine(today, datetime.max.time())
-    
-    today_count_result = await db.execute(
-        select(func.count(func.distinct(DailyWordTracking.word_id)))
-        .where(
-            DailyWordTracking.child_id == child_id,
-            DailyWordTracking.date >= start_of_day,
-            DailyWordTracking.date <= end_of_day
-        )
-    )
-    today_count = today_count_result.scalar() or 0
-    
-    # Update child's today_progress if different
-    if child.today_progress != today_count:
-        child.today_progress = today_count
+    today = date.today()
+
+    if await sync_child_metrics(db, child, as_of=today):
         await db.commit()
-        await db.refresh(child)
 
     _apply_effective_age(child, as_of=today)
     
