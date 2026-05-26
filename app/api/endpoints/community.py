@@ -41,6 +41,16 @@ def _safe_ext(filename: str) -> str:
     return Path(filename).suffix.lower()
 
 
+def _is_real_image_url(value: Optional[str]) -> bool:
+    return bool(
+        value and (
+            value.startswith("http://")
+            or value.startswith("https://")
+            or value.startswith("/")
+        )
+    )
+
+
 async def _save_upload(file: UploadFile) -> str:
     """Save an upload and return the relative URL path."""
     if not file.filename:
@@ -188,8 +198,8 @@ async def submit_post_from_collection(
     # Fetch word for image URL and display text
     word_result = await db.execute(select(Word).where(Word.id == body.word_id))
     word = word_result.scalar_one_or_none()
-    if not word or not word.image_url:
-        raise HTTPException(status_code=400, detail="Word has no image")
+    if not word or not _is_real_image_url(word.image_url):
+        raise HTTPException(status_code=400, detail="Word has no usable image")
 
     post = CommunityPost(
         id=str(uuid.uuid4()),
@@ -207,6 +217,23 @@ async def submit_post_from_collection(
     await db.commit()
     await db.refresh(post)
     return post
+
+
+@router.get("/posts/{child_id}/mine", response_model=List[CommunityPostOut])
+async def get_my_child_posts(
+    child_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return all community posts belonging to the current user's child."""
+    await _get_owned_child(child_id, current_user, db)
+
+    result = await db.execute(
+        select(CommunityPost)
+        .where(CommunityPost.child_id == child_id)
+        .order_by(CommunityPost.created_at.desc())
+    )
+    return result.scalars().all()
 
 
 @router.get("/posts/pending", response_model=List[CommunityPostOut])

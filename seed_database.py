@@ -26,6 +26,8 @@ from app.models.analytics import LearningSession, DailyStats, Achievement
 from app.models.parent_analytics import DailyLearningStats, LearningInsight, WeeklyReport, ParentalControl
 from app.models.generated_sentences import GeneratedSentence
 from app.models.daily_words import DailyWordTracking
+from app.services.curated_word_images import get_curated_word_image_url
+from app.services.image_generation_service import _cache_key, _cached_image_path
 
 
 async def generate_cantonese_for_word(enhancement_service, word_english: str, category: str) -> dict:
@@ -59,6 +61,31 @@ def _is_valid_jyutping(jyutping: str) -> bool:
     has_tone_digit = bool(re.search(r'[1-6]', jyutping))
     has_pinyin_diacritic = bool(re.search(r'[āáǎàōóǒūúǔùīíǐìēéěèǖǘǚǜ]', jyutping, re.IGNORECASE))
     return has_tone_digit and not has_pinyin_diacritic
+
+
+def _is_real_image_url(value: str | None) -> bool:
+    return bool(
+        value and (
+            value.startswith("http://")
+            or value.startswith("https://")
+            or value.startswith("/")
+        )
+    )
+
+
+def _resolve_cached_image_url(word: str, word_cantonese: str, image_url: str | None) -> str | None:
+    curated_image_url = get_curated_word_image_url(word)
+    if curated_image_url:
+        return curated_image_url
+
+    if _is_real_image_url(image_url):
+        return image_url
+
+    cached_path = _cached_image_path(_cache_key(word, word_cantonese or ""))
+    if not cached_path:
+        return image_url
+
+    return f"/uploads/images/words/{cached_path.name}"
 
 
 async def repair_mandarin_words():
@@ -345,7 +372,7 @@ async def seed_comprehensive_data():
             {"word": "Socks", "category": "Clothing", "pronunciation": "soks", "difficulty": "EASY", "definition": "What you wear on your feet inside shoes", "image_url": "🧦", "physical_action": "Point to your socks", "contexts": ["clothing", "feet", "warm"], "related_words": []},
             {"word": "Dress", "category": "Clothing", "pronunciation": "dres", "difficulty": "MEDIUM", "definition": "A one-piece clothing", "image_url": "👗", "physical_action": "Twirl around", "contexts": ["clothing", "pretty", "special"], "related_words": []},
             {"word": "Jacket", "category": "Clothing", "pronunciation": "jak-it", "difficulty": "MEDIUM", "definition": "A warm coat you wear outside", "image_url": "🧥", "physical_action": "Pretend to zip up a jacket", "contexts": ["clothing", "warm", "cold"], "related_words": []},
-            {"word": "Slippers", "category": "Clothing", "pronunciation": "slip-erz", "difficulty": "EASY", "definition": "Soft shoes you wear at home", "image_url": "🩴", "physical_action": "Pretend to slide on slippers", "contexts": ["clothing", "home", "feet"], "related_words": []},
+            {"word": "House Slippers", "category": "Clothing", "pronunciation": "slip-erz", "difficulty": "EASY", "definition": "Soft shoes you wear at home", "image_url": "🩴", "physical_action": "Pretend to slide on slippers", "contexts": ["clothing", "home", "feet"], "related_words": []},
         ]
 
         # Remove words that no longer belong in the vocabulary
@@ -485,6 +512,21 @@ async def seed_comprehensive_data():
                 print(f"\n⚠️  LLM generation failed: {e}")
                 print("   Words will have English data only. You can re-run with --force later.\n")
                 await db.commit()
+
+        print("🖼️  Syncing cached word images into PostgreSQL image_url fields...\n")
+        image_updates = 0
+        for word_obj in word_objects.values():
+            resolved_image_url = _resolve_cached_image_url(
+                word_obj.word,
+                word_obj.word_cantonese,
+                word_obj.image_url,
+            )
+            if resolved_image_url != word_obj.image_url:
+                word_obj.image_url = resolved_image_url
+                image_updates += 1
+
+        await db.commit()
+        print(f"✅ Synced {image_updates} cached word images into PostgreSQL\n")
 
         # Update category word counts
         print("📊 Updating category word counts...")

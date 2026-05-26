@@ -166,21 +166,157 @@ async def translate_to_english(word: str, word_cantonese: str) -> str:
 
     # Last resort: use the raw string (Pollinations accepts some Unicode)
     return source
+# ── Noun-phrase helper ───────────────────────────────────────────────────────
+
+async def _get_noun_phrase(english_word: str) -> str:
+    """
+    Return the correct English noun phrase with article/quantifier for image prompts.
+
+    Strategy:
+    1. Check a small lookup for words that grammatically require a quantifier
+       (e.g. "toilet paper" → "a roll of toilet paper").  These are the only
+       words where "a <word>" would be wrong — roughly 20 common cases.
+    2. Ask Ollama as a dynamic fallback (useful if you add new categories later).
+    3. Fall back to "a/an <word>" which is correct for the vast majority of nouns.
+    """
+    word_lower = english_word.strip().lower()
+
+    # Words that need a specific quantifier — only cases where "a X" is wrong.
+    # Animals and most objects are fine with "a/an" so they don't appear here.
+    _QUANTIFIERS = {
+        "toilet paper":  "a roll of toilet paper",
+        "paper towel":   "a roll of paper towel",
+        "tape":          "a roll of tape",
+        "ribbon":        "a roll of ribbon",
+        "scissors":      "a pair of scissors",
+        "glasses":       "a pair of glasses",
+        "sunglasses":    "a pair of sunglasses",
+        "shoes":         "a pair of shoes",
+        "socks":         "a pair of socks",
+        "pants":         "a pair of pants",
+        "trousers":      "a pair of trousers",
+        "chopsticks":    "a pair of chopsticks",
+        "gloves":        "a pair of gloves",
+        "grapes":        "a bunch of grapes",
+        "bananas":       "a bunch of bananas",
+        "flowers":       "a bunch of flowers",
+        "bread":         "a loaf of bread",
+        "water":         "a glass of water",
+        "juice":         "a glass of juice",
+        "milk":          "a glass of milk",
+        "soap":          "a bar of soap",
+        "toothpaste":    "a tube of toothpaste",
+        "rice":          "a bowl of rice",
+        "noodles":       "a bowl of noodles",
+        "cereal":        "a bowl of cereal",
+    }
+
+    if word_lower in _QUANTIFIERS:
+        return _QUANTIFIERS[word_lower]
+
+    # Ollama: useful for edge cases not in the table above.
+    url = f"{settings.OLLAMA_BASE_URL}/api/chat"
+    payload = {
+        "model": settings.OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": (
+            "Return ONLY the correct English noun phrase with article for this word.\n"
+            "Use quantifiers only when grammatically required (e.g. 'a pair of scissors').\n"
+            "For most words just add 'a' or 'an'.\n"
+            f"Word: {english_word}"
+        )}],
+        "stream": False,
+        "options": {"temperature": 0.0, "num_predict": 20},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                result = (
+                    data.get("message", {}).get("content", "")
+                    or data.get("response", "")
+                ).strip().strip('"').strip("'").lower()
+                if result and len(result) < 60 and _is_english(result) and word_lower in result:
+                    return result
+    except Exception:
+        pass
+
+    # Final fallback: correct a/an + word
+    article = "an" if word_lower and word_lower[0] in "aeiou" else "a"
+    return f"{article} {word_lower}"
 
 # ── Prompt builders ───────────────────────────────────────────────────────────
 
-def build_cartoon_prompt(english_word: str) -> str:
-    w = (english_word or "object").strip()
+# Categories whose subjects naturally have faces (animals, living creatures).
+# Everything else (food, objects, places, etc.) should NOT have a face.
+# We rely on the DB category rather than a manual per-word list because:
+#  - Kolors/SDXL are diffusion models, not instruction-following LLMs.
+#  - They can't evaluate "if X then Y" in a prompt reliably.
+#  - Face suppression works via the negative prompt, which must be a static
+#    list — so we decide here in Python which version to use.
+_FACE_CATEGORIES = {
+    "animals", "animal", "pets", "pet",
+    "people", "person", "family", "characters",
+}
+
+
+def _naturally_has_face(english_word: str, category: str = "") -> bool:
+    """Return True if the subject naturally has a face (animal, person).
+
+    Decision is driven by the DB category so we don't maintain a manual
+    word list.  The english_word argument is kept for potential future use
+    (e.g. words with no category).
+    """
+    return category.strip().lower() in _FACE_CATEGORIES
+
+
+def build_cartoon_prompt(noun_phrase: str, has_face: bool = False) -> str:
+    # noun_phrase already has article/quantifier: "a roll of toilet paper"
+    # Strip the leading article to get the bare noun for mid-sentence references.
+    phrase = (noun_phrase or "an object").strip()
+    bare = phrase
+    for prefix in ("a bunch of ", "a pair of ", "a roll of ", "a loaf of ",
+                   "a glass of ", "a piece of ", "a slice of ", "a set of ",
+                   "a bar of ", "a tube of ", "a bag of ", "a box of ",
+                   "an ", "a "):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+    if has_face:
+        return (
+            f"A high-quality cute cartoon watercolor illustration of {phrase} "
+            f"for a children's vocabulary flashcard. "
+            f"Soft watercolor tones in warm pastels with gentle ink outlines. "
+            f"The {bare} is centered, filling about 70% of the frame, "
+            f"on a plain cream paper background with a soft shadow beneath. "
+            f"No text, no labels, no watermarks."
+        )
     return (
-        f"A high-quality, cute cartoon watercolor illustration of a single, pristine {w}, suitable for a children's picture book. Soft, blended watercolor tones in warm pastels appropriate for the object are used with gentle, defining ink outlines. This is a clean, lifeless object study; it has absolutely no face, eyes, smile, or limbs (arms, legs, or shoes). The single {w} is centered and clearly oriented, filling approximately 70% of the frame. The setting is a plain textured cream paper background with a soft, diffuse shadow wash beneath the object, similar to image_0.png. Soft, diffused lighting highlights the object's form. There is absolutely no text, letters, labels, or watermarks present."
+        f"A high-quality cartoon watercolor illustration of {phrase} "
+        f"for a children's vocabulary flashcard. "
+        f"The {bare} is a plain inanimate object with no face, no eyes, no mouth, "
+        f"no expression, and no anthropomorphic features whatsoever. "
+        f"Soft watercolor tones in warm pastels with gentle ink outlines. "
+        f"The {bare} is centered, filling about 70% of the frame, "
+        f"on a plain cream paper background with a soft shadow beneath. "
+        f"No text, no labels, no watermarks. Just the object."
     )
 
-def build_negative_prompt() -> str:
-    return (
+
+def build_negative_prompt(has_face: bool = False) -> str:
+    base = (
         "photo, photograph, realistic, 3D render, scary, violent, gore, "
         "text, letters, labels, watermark, blurry, signature, "
         "dark background, busy background, "
         "multiple objects, adult, mature, deformed, ugly, low quality"
+    )
+    if has_face:
+        return base
+    # For inanimate objects, strongly suppress any facial features
+    return (
+        "face, eyes, mouth, smile, expression, kawaii face, cute face, anthropomorphic, cartoon face, "
+        "googly eyes, eye, eyeball, emoji face, emoticon, character face, "
+        + base
     )
 
 # ── Silicon Flow API ──────────────────────────────────────────────────────────
@@ -192,16 +328,19 @@ SILICONFLOW_URL = "https://api.siliconflow.cn/v1/images/generations"
 MAX_RETRIES_429 = 3
 RETRY_WAIT_SECS = 35  # >30s to ensure the per-minute window resets
 
-async def _generate_kolors(english_word: str, retries_on_429: int = MAX_RETRIES_429) -> Optional[bytes]:
+async def _generate_kolors(english_word: str, category: str = "", retries_on_429: int = MAX_RETRIES_429) -> Optional[bytes]:
     """Kwai-Kolors/Kolors via Silicon Flow, with automatic 429 retry."""
     api_key = settings.SILICONFLOW_API_KEY
     if not api_key:
         print("[ImageGen] SILICONFLOW_API_KEY not set")
         return None
+    has_face = _naturally_has_face(english_word, category)
+    noun_phrase = await _get_noun_phrase(english_word)
+    print(f"[ImageGen] Noun phrase: '{noun_phrase}' (has_face={has_face})")
     payload = {
         "model": "Kwai-Kolors/Kolors",
-        "prompt": build_cartoon_prompt(english_word),
-        "negative_prompt": build_negative_prompt(),
+        "prompt": build_cartoon_prompt(noun_phrase, has_face=has_face),
+        "negative_prompt": build_negative_prompt(has_face=has_face),
         "image_size": "1024x1024",
         "batch_size": 1,
         "num_inference_steps": 20,
@@ -275,7 +414,7 @@ async def generate_word_image(
     print(f"[ImageGen] Generating for '{word_cantonese}' → '{english_word}'")
 
     # 4. Kolors
-    image_bytes = await _generate_kolors(english_word)
+    image_bytes = await _generate_kolors(english_word, category=category)
 
     if image_bytes:
         content_type = "image/jpeg"

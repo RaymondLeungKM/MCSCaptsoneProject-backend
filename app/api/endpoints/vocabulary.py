@@ -40,6 +40,64 @@ router = APIRouter()
 
 ACTIVE_VOCAB_REQUEST_MIN_EXPOSURES = 6
 
+UNSAFE_CHILD_VOCAB_TOKENS = {
+    "knife",
+    "scissors",
+    "fork",
+    "wok",
+    "oven",
+    "cuttingboard",
+    "candle",
+    "weapon",
+    "gun",
+    "sword",
+    "bomb",
+    "grenade",
+    "axe",
+    "刀",
+    "剪刀",
+    "叉",
+    "鑊",
+    "焗爐",
+    "砧板",
+    "蠟燭",
+    "武器",
+    "槍",
+    "劍",
+    "炸彈",
+    "手榴彈",
+    "斧頭",
+}
+
+
+def _normalize_vocab_token(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return "".join(
+        ch for ch in value.strip().lower() if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"
+    )
+
+
+def _is_child_safe_word_fields(
+    word: Optional[str],
+    word_cantonese: Optional[str],
+) -> bool:
+    return (
+        _normalize_vocab_token(word) not in UNSAFE_CHILD_VOCAB_TOKENS
+        and _normalize_vocab_token(word_cantonese) not in UNSAFE_CHILD_VOCAB_TOKENS
+    )
+
+
+def _is_child_safe_word_record(word: Word) -> bool:
+    return _is_child_safe_word_fields(word.word, word.word_cantonese)
+
+
+def _is_child_safe_word_payload(payload: dict) -> bool:
+    return _is_child_safe_word_fields(
+        payload.get("word"),
+        payload.get("word_cantonese"),
+    )
+
 
 async def _get_category_or_404(category_id: str, db: AsyncSession) -> Category:
     result = await db.execute(select(Category).where(Category.id == category_id))
@@ -233,7 +291,7 @@ async def get_community_words(
         .limit(limit)
     )
     result = await db.execute(query)
-    words = result.scalars().all()
+    words = [word for word in result.scalars().all() if _is_child_safe_word_record(word)]
 
     response = []
     for word in words:
@@ -326,7 +384,7 @@ async def get_words(
     query = query.limit(limit).offset(offset)
     
     result = await db.execute(query)
-    words = result.scalars().all()
+    words = [word for word in result.scalars().all() if _is_child_safe_word_record(word)]
     
     # Add category name to each word
     response_words = []
@@ -343,6 +401,8 @@ async def get_words(
             for w in response_words
         }
         for mw in mongo_words:
+            if not _is_child_safe_word_payload(mw):
+                continue
             key = f"{(mw.get('word') or '').strip().lower()}|{mw.get('image_url') or ''}"
             if key not in seen:
                 response_words.append(mw)
@@ -476,7 +536,7 @@ async def get_words_with_progress(
         query = query.where(Word.category == category)
     
     result = await db.execute(query)
-    words = result.scalars().all()
+    words = [word for word in result.scalars().all() if _is_child_safe_word_record(word)]
     
     # Get progress for each word
     words_with_progress = []
