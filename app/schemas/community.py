@@ -157,11 +157,25 @@ class CommunityChallengeCreate(BaseModel):
     title_zh: Optional[str] = None
     description: Optional[str] = None
     description_zh: Optional[str] = None
-    target_count: int = 5
+    target_count: int = Field(5, ge=1, le=1000)
     category: Optional[str] = None
     emoji: str = "🏆"
+    status: ChallengeStatus = ChallengeStatus.ACTIVE
     starts_at: datetime
     ends_at: datetime
+
+
+class CommunityChallengeUpdate(BaseModel):
+    title: Optional[str] = None
+    title_zh: Optional[str] = None
+    description: Optional[str] = None
+    description_zh: Optional[str] = None
+    target_count: Optional[int] = Field(None, ge=1, le=1000)
+    category: Optional[str] = None
+    emoji: Optional[str] = None
+    status: Optional[ChallengeStatus] = None
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
 
 
 class CommunityChallengeResponse(BaseModel):

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import uuid
 
 from app.db.session import get_db
-from app.core.security import get_current_active_user
+from app.core.security import get_current_active_user, get_current_admin_user
 from app.models.user import User, Child
 from app.core.child_age import calculate_child_age
 from app.models.vocabulary import WordProgress, Word
@@ -35,6 +35,7 @@ from app.schemas.community import (
     FriendProgressResponse,
     FriendChildStats,
     CommunityChallengeCreate,
+    CommunityChallengeUpdate,
     CommunityChallengeResponse,
     ChallengeParticipationResponse,
     ChallengeProgressUpdate,
@@ -417,6 +418,40 @@ async def get_friends_progress(
 # 10.2.3  Community Challenges
 # ===========================================================================
 
+def _challenge_window_filters(now: datetime):
+    return (
+        CommunityChallenge.starts_at <= now,
+        CommunityChallenge.ends_at >= now,
+    )
+
+
+def _validate_challenge_window(starts_at: datetime, ends_at: datetime):
+    if ends_at <= starts_at:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Challenge end time must be after start time",
+        )
+
+
+@router.get("/admin/challenges", response_model=List[CommunityChallengeResponse])
+async def list_admin_challenges(
+    status_filter: Optional[ChallengeStatus] = Query(
+        None, alias="status", description="Filter by challenge status"
+    ),
+    current_user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List public community challenges for admin management."""
+    query = select(CommunityChallenge)
+    if status_filter:
+        query = query.where(CommunityChallenge.status == status_filter)
+
+    result = await db.execute(
+        query.order_by(CommunityChallenge.starts_at.desc(), CommunityChallenge.created_at.desc())
+    )
+    return result.scalars().all()
+
+
 @router.get("/challenges", response_model=List[CommunityChallengeResponse])
 async def list_challenges(
     status_filter: Optional[ChallengeStatus] = Query(
@@ -426,28 +461,31 @@ async def list_challenges(
     db: AsyncSession = Depends(get_db),
 ):
     """Return community challenges (defaults to ACTIVE)."""
+    now = datetime.now(timezone.utc)
     query = select(CommunityChallenge)
     if status_filter:
         query = query.where(CommunityChallenge.status == status_filter)
+        if status_filter == ChallengeStatus.ACTIVE:
+            query = query.where(*_challenge_window_filters(now))
     else:
-        query = query.where(CommunityChallenge.status == ChallengeStatus.ACTIVE)
+        query = query.where(
+            CommunityChallenge.status == ChallengeStatus.ACTIVE,
+            *_challenge_window_filters(now),
+        )
 
     result = await db.execute(query.order_by(CommunityChallenge.ends_at.asc()))
     return result.scalars().all()
 
 
-@router.post("/challenges", response_model=CommunityChallengeResponse, status_code=201)
-async def create_challenge(
+@router.post("/admin/challenges", response_model=CommunityChallengeResponse, status_code=201)
+async def create_admin_challenge(
     payload: CommunityChallengeCreate,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Create a new community challenge.
+    """Create a new public community challenge."""
+    _validate_challenge_window(payload.starts_at, payload.ends_at)
 
-    In production this would be admin-only; for the demo any authenticated
-    parent can create a challenge for their friend group.
-    """
     challenge = CommunityChallenge(
         id=str(uuid.uuid4()),
         title=payload.title,
@@ -457,11 +495,39 @@ async def create_challenge(
         target_count=payload.target_count,
         category=payload.category,
         emoji=payload.emoji,
-        status=ChallengeStatus.ACTIVE,
+        status=payload.status,
         starts_at=payload.starts_at,
         ends_at=payload.ends_at,
     )
     db.add(challenge)
+    await db.commit()
+    await db.refresh(challenge)
+    return challenge
+
+
+@router.patch("/admin/challenges/{challenge_id}", response_model=CommunityChallengeResponse)
+async def update_admin_challenge(
+    challenge_id: str,
+    payload: CommunityChallengeUpdate,
+    current_user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update an existing public community challenge."""
+    result = await db.execute(
+        select(CommunityChallenge).where(CommunityChallenge.id == challenge_id)
+    )
+    challenge = result.scalar_one_or_none()
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+
+    update_data = payload.dict(exclude_unset=True)
+    next_starts_at = update_data.get("starts_at", challenge.starts_at)
+    next_ends_at = update_data.get("ends_at", challenge.ends_at)
+    _validate_challenge_window(next_starts_at, next_ends_at)
+
+    for field, value in update_data.items():
+        setattr(challenge, field, value)
+
     await db.commit()
     await db.refresh(challenge)
     return challenge
@@ -535,11 +601,14 @@ async def join_or_update_challenge(
     if not child_result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Child not found")
 
+    now = datetime.now(timezone.utc)
+
     # Verify challenge is active
     ch_result = await db.execute(
         select(CommunityChallenge).where(
             CommunityChallenge.id == challenge_id,
             CommunityChallenge.status == ChallengeStatus.ACTIVE,
+            *_challenge_window_filters(now),
         )
     )
     challenge = ch_result.scalar_one_or_none()
