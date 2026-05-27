@@ -72,6 +72,29 @@ class LLMService:
             # To change: Update OLLAMA_MODEL in .env file
             return os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
         return "gpt-4o"
+
+    def _normalize_messages(self, messages: List[Any]) -> List[LLMMessage]:
+        normalized_messages: List[LLMMessage] = []
+
+        for msg in messages:
+            if isinstance(msg, LLMMessage):
+                normalized_messages.append(msg)
+            elif isinstance(msg, dict):
+                normalized_messages.append(
+                    LLMMessage(
+                        role=str(msg.get("role", "user")),
+                        content=str(msg.get("content", "")),
+                    )
+                )
+            else:
+                normalized_messages.append(
+                    LLMMessage(
+                        role=str(getattr(msg, "role", "user")),
+                        content=str(getattr(msg, "content", "")),
+                    )
+                )
+
+        return normalized_messages
     
     async def generate(
         self, 
@@ -91,14 +114,16 @@ class LLMService:
         Returns:
             Generated text content
         """
+        normalized_messages = self._normalize_messages(messages)
+
         if self.provider == LLMProvider.OPENAI:
-            return await self._generate_openai(messages, temperature, max_tokens, **kwargs)
+            return await self._generate_openai(normalized_messages, temperature, max_tokens, **kwargs)
         elif self.provider == LLMProvider.OPENROUTER:
-            return await self._generate_openrouter(messages, temperature, max_tokens, **kwargs)
+            return await self._generate_openrouter(normalized_messages, temperature, max_tokens, **kwargs)
         elif self.provider == LLMProvider.ANTHROPIC:
-            return await self._generate_anthropic(messages, temperature, max_tokens, **kwargs)
+            return await self._generate_anthropic(normalized_messages, temperature, max_tokens, **kwargs)
         elif self.provider == LLMProvider.OLLAMA:
-            return await self._generate_ollama(messages, temperature, max_tokens, **kwargs)
+            return await self._generate_ollama(normalized_messages, temperature, max_tokens, **kwargs)
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
     

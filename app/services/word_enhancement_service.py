@@ -7,6 +7,7 @@ import json
 import re
 from pydantic import BaseModel
 
+from app.services.curated_cantonese_vocabulary import get_curated_cantonese_content
 from app.services.llm_service import get_llm_service, LLMMessage, LLMProvider
 
 
@@ -261,11 +262,16 @@ class WordEnhancementService:
         print(f"[WordEnhancement] ❌ All {max_retries} attempts failed for word: {word}")
         print(f"[WordEnhancement] Last error: {last_error}")
         print(f"[WordEnhancement] Using fallback content")
-        return self._create_fallback_content(word)
+        return self._create_fallback_content(word, source)
     
-    def _create_fallback_content(self, word: str) -> EnhancedWordContent:
+    def _create_fallback_content(self, word: str, source: Optional[str] = None) -> EnhancedWordContent:
         """Create basic fallback content if AI generation fails"""
         print(f"[WordEnhancement] Using fallback content for: {word}")
+
+        curated_content = get_curated_cantonese_content(word, source)
+        if curated_content:
+            return EnhancedWordContent(**curated_content)
+
         return EnhancedWordContent(
             word_english=word,
             word_cantonese=word,  # Use English as fallback
