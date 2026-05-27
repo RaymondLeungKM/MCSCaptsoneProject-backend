@@ -9,9 +9,9 @@ Handles:
 """
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, and_
+from sqlalchemy import select, or_, and_, func
 from typing import List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import uuid
 
 from app.db.session import get_db
@@ -19,12 +19,17 @@ from app.core.security import get_current_active_user, get_current_admin_user
 from app.models.user import User, Child
 from app.core.child_age import calculate_child_age
 from app.models.vocabulary import WordProgress, Word
+from app.models.daily_words import DailyWordTracking
 from app.models.community import (
     ParentFriendship,
     FriendshipStatus,
     CommunityChallenge,
     ChallengeParticipation,
     ChallengeStatus,
+    FriendChallenge,
+    FriendChallengeParticipant,
+    FriendChallengeMetric,
+    FriendChallengeInviteStatus,
 )
 from app.schemas.community import (
     FriendRequestCreate,
@@ -39,9 +44,230 @@ from app.schemas.community import (
     CommunityChallengeResponse,
     ChallengeParticipationResponse,
     ChallengeProgressUpdate,
+    FriendChallengeCreate,
+    FriendChallengeRespond,
+    FriendChallengeResponse,
+    FriendChallengeParticipantResponse,
+    FriendChallengeViewStatus,
 )
 
 router = APIRouter()
+
+
+def _friend_challenge_template(
+    metric_type: FriendChallengeMetric,
+    target_count: int,
+) -> tuple[str, str, str]:
+    if metric_type == FriendChallengeMetric.PRACTICE_DAYS:
+        return (
+            f"Practice for {target_count} days",
+            f"連續練習 {target_count} 天",
+            "📅",
+        )
+    if metric_type == FriendChallengeMetric.NEW_WORDS:
+        return (
+            f"Learn {target_count} new words",
+            f"學習 {target_count} 個新詞語",
+            "📚",
+        )
+    return (
+        f"Use {target_count} words actively",
+        f"活用 {target_count} 個詞語",
+        "🗣️",
+    )
+
+
+async def _get_accepted_friend_ids(
+    current_user_id: str,
+    db: AsyncSession,
+) -> set[str]:
+    result = await db.execute(
+        select(ParentFriendship).where(
+            or_(
+                ParentFriendship.requester_id == current_user_id,
+                ParentFriendship.addressee_id == current_user_id,
+            ),
+            ParentFriendship.status == FriendshipStatus.ACCEPTED,
+        )
+    )
+    friendships = result.scalars().all()
+    return {
+        f.addressee_id if f.requester_id == current_user_id else f.requester_id
+        for f in friendships
+    }
+
+
+async def _compute_friend_challenge_progress(
+    child_id: str,
+    metric_type: FriendChallengeMetric,
+    starts_at: datetime,
+    ends_at: datetime,
+    db: AsyncSession,
+) -> int:
+    base_filters = and_(
+        DailyWordTracking.child_id == child_id,
+        DailyWordTracking.date >= starts_at,
+        DailyWordTracking.date <= ends_at,
+    )
+
+    if metric_type == FriendChallengeMetric.PRACTICE_DAYS:
+        result = await db.execute(
+            select(func.count(func.distinct(func.date(DailyWordTracking.date)))).where(
+                base_filters
+            )
+        )
+        return int(result.scalar() or 0)
+
+    if metric_type == FriendChallengeMetric.ACTIVE_WORDS:
+        result = await db.execute(
+            select(func.count(func.distinct(DailyWordTracking.word_id))).where(
+                and_(base_filters, DailyWordTracking.used_actively == True)
+            )
+        )
+        return int(result.scalar() or 0)
+
+    first_seen_subquery = (
+        select(
+            DailyWordTracking.word_id.label("word_id"),
+            func.min(DailyWordTracking.date).label("first_seen"),
+        )
+        .where(DailyWordTracking.child_id == child_id)
+        .group_by(DailyWordTracking.word_id)
+        .subquery()
+    )
+    result = await db.execute(
+        select(func.count())
+        .select_from(first_seen_subquery)
+        .where(
+            and_(
+                first_seen_subquery.c.first_seen >= starts_at,
+                first_seen_subquery.c.first_seen <= ends_at,
+            )
+        )
+    )
+    return int(result.scalar() or 0)
+
+
+def _derive_friend_challenge_view_status(
+    invite_status: FriendChallengeInviteStatus,
+    progress: int,
+    target_count: int,
+    ends_at: datetime,
+) -> FriendChallengeViewStatus:
+    if invite_status == FriendChallengeInviteStatus.PENDING:
+        return FriendChallengeViewStatus.PENDING
+    if invite_status == FriendChallengeInviteStatus.DECLINED:
+        return FriendChallengeViewStatus.DECLINED
+    if progress >= target_count:
+        return FriendChallengeViewStatus.COMPLETED
+    if ends_at < datetime.now(timezone.utc):
+        return FriendChallengeViewStatus.EXPIRED
+    return FriendChallengeViewStatus.ACTIVE
+
+
+async def _build_friend_challenge_response(
+    challenge: FriendChallenge,
+    current_user_id: str,
+    db: AsyncSession,
+) -> FriendChallengeResponse:
+    participant_result = await db.execute(
+        select(FriendChallengeParticipant).where(
+            FriendChallengeParticipant.challenge_id == challenge.id
+        )
+    )
+    participant_rows = participant_result.scalars().all()
+
+    parent_ids = {challenge.creator_id, *(p.parent_id for p in participant_rows)}
+    child_ids = {p.child_id for p in participant_rows if p.child_id}
+
+    user_map: dict[str, User] = {}
+    if parent_ids:
+        user_result = await db.execute(select(User).where(User.id.in_(parent_ids)))
+        user_map = {user.id: user for user in user_result.scalars().all()}
+
+    child_map: dict[str, Child] = {}
+    if child_ids:
+        child_result = await db.execute(select(Child).where(Child.id.in_(child_ids)))
+        child_map = {child.id: child for child in child_result.scalars().all()}
+
+    accepted_count = 0
+    pending_count = 0
+    my_invite_status = FriendChallengeInviteStatus.PENDING
+    my_child_id: Optional[str] = None
+    my_progress = 0
+    my_completed = False
+    participants: List[FriendChallengeParticipantResponse] = []
+
+    for participant in participant_rows:
+        progress = 0
+        is_completed = False
+        child = child_map.get(participant.child_id) if participant.child_id else None
+
+        if participant.invite_status == FriendChallengeInviteStatus.ACCEPTED:
+            accepted_count += 1
+            if participant.child_id:
+                progress = await _compute_friend_challenge_progress(
+                    participant.child_id,
+                    challenge.metric_type,
+                    challenge.starts_at,
+                    challenge.ends_at,
+                    db,
+                )
+                is_completed = progress >= challenge.target_count
+        elif participant.invite_status == FriendChallengeInviteStatus.PENDING:
+            pending_count += 1
+
+        if participant.parent_id == current_user_id:
+            my_invite_status = participant.invite_status
+            my_child_id = participant.child_id
+            my_progress = progress
+            my_completed = is_completed
+
+        participants.append(
+            FriendChallengeParticipantResponse(
+                id=participant.id,
+                parent_id=participant.parent_id,
+                parent_name=user_map.get(participant.parent_id).full_name
+                if user_map.get(participant.parent_id)
+                else None,
+                child_id=participant.child_id,
+                child_name=child.name if child else None,
+                child_avatar=child.avatar if child else None,
+                invite_status=participant.invite_status,
+                progress=progress,
+                is_completed=is_completed,
+            )
+        )
+
+    return FriendChallengeResponse(
+        id=challenge.id,
+        creator_id=challenge.creator_id,
+        creator_name=user_map.get(challenge.creator_id).full_name
+        if user_map.get(challenge.creator_id)
+        else None,
+        title=challenge.title,
+        title_zh=challenge.title_zh,
+        metric_type=challenge.metric_type,
+        target_count=challenge.target_count,
+        duration_days=challenge.duration_days,
+        emoji=challenge.emoji,
+        starts_at=challenge.starts_at,
+        ends_at=challenge.ends_at,
+        created_at=challenge.created_at,
+        accepted_participant_count=accepted_count,
+        pending_participant_count=pending_count,
+        my_invite_status=my_invite_status,
+        my_child_id=my_child_id,
+        my_progress=my_progress,
+        my_completed=my_completed,
+        view_status=_derive_friend_challenge_view_status(
+            my_invite_status,
+            my_progress,
+            challenge.target_count,
+            challenge.ends_at,
+        ),
+        participants=participants,
+    )
 
 
 # ===========================================================================
@@ -415,7 +641,206 @@ async def get_friends_progress(
 
 
 # ===========================================================================
-# 10.2.3  Community Challenges
+# 10.2.3  Private Friend Challenges
+# ===========================================================================
+
+@router.get("/friend-challenges", response_model=List[FriendChallengeResponse])
+async def list_friend_challenges(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    created_result = await db.execute(
+        select(FriendChallenge).where(FriendChallenge.creator_id == current_user.id)
+    )
+    created_challenges = created_result.scalars().all()
+
+    invited_result = await db.execute(
+        select(FriendChallengeParticipant.challenge_id).where(
+            FriendChallengeParticipant.parent_id == current_user.id,
+            FriendChallengeParticipant.invite_status
+            != FriendChallengeInviteStatus.DECLINED,
+        )
+    )
+    visible_ids = {challenge.id for challenge in created_challenges}
+    visible_ids.update(invited_result.scalars().all())
+
+    if not visible_ids:
+        return []
+
+    challenge_result = await db.execute(
+        select(FriendChallenge)
+        .where(FriendChallenge.id.in_(visible_ids))
+        .order_by(FriendChallenge.created_at.desc())
+    )
+    challenges = challenge_result.scalars().all()
+
+    responses = [
+        await _build_friend_challenge_response(challenge, current_user.id, db)
+        for challenge in challenges
+    ]
+
+    status_priority = {
+        FriendChallengeViewStatus.PENDING: 0,
+        FriendChallengeViewStatus.ACTIVE: 1,
+        FriendChallengeViewStatus.COMPLETED: 2,
+        FriendChallengeViewStatus.EXPIRED: 3,
+        FriendChallengeViewStatus.DECLINED: 4,
+    }
+    responses.sort(
+        key=lambda challenge: (
+            status_priority.get(challenge.view_status, 99),
+            challenge.ends_at,
+        )
+    )
+    return responses
+
+
+@router.post(
+    "/friend-challenges",
+    response_model=FriendChallengeResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_friend_challenge(
+    payload: FriendChallengeCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    invited_parent_ids = list(dict.fromkeys(payload.invited_parent_ids))
+    if not invited_parent_ids:
+        raise HTTPException(status_code=400, detail="Select at least one friend")
+    if len(invited_parent_ids) > 5:
+        raise HTTPException(status_code=400, detail="You can invite up to 5 friends")
+    if current_user.id in invited_parent_ids:
+        raise HTTPException(status_code=400, detail="You cannot invite yourself")
+
+    child_result = await db.execute(
+        select(Child).where(Child.id == payload.child_id, Child.parent_id == current_user.id)
+    )
+    child = child_result.scalar_one_or_none()
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    accepted_friend_ids = await _get_accepted_friend_ids(current_user.id, db)
+    invalid_friend_ids = [
+        parent_id for parent_id in invited_parent_ids if parent_id not in accepted_friend_ids
+    ]
+    if invalid_friend_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="All invited parents must already be accepted friends",
+        )
+
+    starts_at = datetime.now(timezone.utc)
+    ends_at = starts_at + timedelta(days=payload.duration_days)
+    title, title_zh, emoji = _friend_challenge_template(
+        payload.metric_type,
+        payload.target_count,
+    )
+
+    challenge = FriendChallenge(
+        id=str(uuid.uuid4()),
+        creator_id=current_user.id,
+        title=title,
+        title_zh=title_zh,
+        metric_type=payload.metric_type,
+        target_count=payload.target_count,
+        duration_days=payload.duration_days,
+        emoji=emoji,
+        starts_at=starts_at,
+        ends_at=ends_at,
+    )
+    db.add(challenge)
+    db.add(
+        FriendChallengeParticipant(
+            id=str(uuid.uuid4()),
+            challenge_id=challenge.id,
+            parent_id=current_user.id,
+            child_id=child.id,
+            invite_status=FriendChallengeInviteStatus.ACCEPTED,
+            responded_at=starts_at,
+        )
+    )
+
+    for parent_id in invited_parent_ids:
+        db.add(
+            FriendChallengeParticipant(
+                id=str(uuid.uuid4()),
+                challenge_id=challenge.id,
+                parent_id=parent_id,
+                invite_status=FriendChallengeInviteStatus.PENDING,
+            )
+        )
+
+    await db.commit()
+    await db.refresh(challenge)
+    return await _build_friend_challenge_response(challenge, current_user.id, db)
+
+
+@router.post(
+    "/friend-challenges/{challenge_id}/respond",
+    response_model=FriendChallengeResponse,
+)
+async def respond_to_friend_challenge(
+    challenge_id: str,
+    payload: FriendChallengeRespond,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    challenge_result = await db.execute(
+        select(FriendChallenge).where(FriendChallenge.id == challenge_id)
+    )
+    challenge = challenge_result.scalar_one_or_none()
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+
+    participant_result = await db.execute(
+        select(FriendChallengeParticipant).where(
+            FriendChallengeParticipant.challenge_id == challenge_id,
+            FriendChallengeParticipant.parent_id == current_user.id,
+        )
+    )
+    participant = participant_result.scalar_one_or_none()
+    if not participant:
+        raise HTTPException(status_code=404, detail="Invite not found")
+
+    if participant.invite_status != FriendChallengeInviteStatus.PENDING:
+        raise HTTPException(status_code=400, detail="Invite has already been answered")
+
+    if payload.invite_status not in (
+        FriendChallengeInviteStatus.ACCEPTED,
+        FriendChallengeInviteStatus.DECLINED,
+    ):
+        raise HTTPException(status_code=400, detail="Invite response must be accepted or declined")
+
+    if challenge.ends_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="This challenge has already ended")
+
+    if payload.invite_status == FriendChallengeInviteStatus.ACCEPTED:
+        if not payload.child_id:
+            raise HTTPException(status_code=400, detail="Choose a child to join this challenge")
+        child_result = await db.execute(
+            select(Child).where(
+                Child.id == payload.child_id,
+                Child.parent_id == current_user.id,
+            )
+        )
+        child = child_result.scalar_one_or_none()
+        if not child:
+            raise HTTPException(status_code=404, detail="Child not found")
+        participant.child_id = child.id
+    else:
+        participant.child_id = None
+
+    participant.invite_status = payload.invite_status
+    participant.responded_at = datetime.now(timezone.utc)
+    db.add(participant)
+    await db.commit()
+
+    return await _build_friend_challenge_response(challenge, current_user.id, db)
+
+
+# ===========================================================================
+# 10.2.4  Community Challenges
 # ===========================================================================
 
 def _challenge_window_filters(now: datetime):
