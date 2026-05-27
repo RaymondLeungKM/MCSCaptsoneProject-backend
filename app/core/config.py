@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     
     # AI/LLM Configuration
-    # LLM_PROVIDER: "openai", "anthropic", or "ollama"
+    # LLM_PROVIDER: "openai", "openrouter", "anthropic", or "ollama"
     LLM_PROVIDER: str = "ollama"  # Default to Ollama for local testing
     
     # OpenAI
@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     OPENROUTER_MODEL: str = "openai/gpt-4o-mini"
+
+    # External bedtime story program adapter
+    EXTERNAL_STORY_PROGRAM_DIR: str = "../story-generation-program"
+    EXTERNAL_STORY_PYTHON_BIN: str = "python3"
+    EXTERNAL_STORY_TIMEOUT_SECONDS: int = 300
     
     # Anthropic Claude
     ANTHROPIC_API_KEY: str = ""

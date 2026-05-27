@@ -1,7 +1,11 @@
 """
 Endpoints for AI-generated bedtime stories
 """
+import time
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from typing import List
@@ -19,11 +23,67 @@ from app.schemas.stories import (
     GeneratedStoryCreate,
     GeneratedStoryResponse,
     StoryGenerationRequest,
-    StoryGenerationResponse
+    StoryGenerationResponse,
+    ExternalStoryInvokeRequest,
+    ExternalStoryInvokeResponse,
 )
 from app.services.story_generator import story_generator
+from app.services.external_story_program_service import (
+    ExternalStoryProgramError,
+    external_story_program_service,
+)
 
 router = APIRouter()
+
+THEME_VOCAB_HINTS = {
+    "adventure": "冒險",
+    "family": "家庭",
+    "animals": "動物",
+    "nature": "大自然",
+    "friendship": "友誼",
+    "bedtime": "睡前",
+}
+
+THEME_TITLE_LABELS = {
+    "adventure": ("冒險", "Adventure"),
+    "family": ("家庭", "Family"),
+    "animals": ("動物", "Animals"),
+    "nature": ("大自然", "Nature"),
+    "friendship": ("友誼", "Friendship"),
+    "bedtime": ("睡前", "Bedtime"),
+}
+
+
+def _word_label(word: DailyWordSummary) -> str:
+    return (word.word_cantonese or word.word or word.word_id).strip()
+
+
+def _build_external_vocab_words(
+    theme: str | None,
+    words: List[DailyWordSummary],
+) -> List[str]:
+    theme_hint = THEME_VOCAB_HINTS.get(theme or "")
+    ordered_words = [theme_hint] + [_word_label(word) for word in words]
+    return list(dict.fromkeys([word for word in ordered_words if word]))[:30]
+
+
+def _build_external_title(
+    child_name: str,
+    theme: str | None,
+) -> tuple[str, str]:
+    zh_theme, en_theme = THEME_TITLE_LABELS.get(theme or "bedtime", ("睡前", "Bedtime"))
+    return f"{child_name}的{zh_theme}故事", f"{child_name}'s {en_theme} Story"
+
+
+def _build_external_word_usage(words: List[DailyWordSummary]) -> dict[str, str]:
+    return {
+        _word_label(word): (
+            word.definition_cantonese
+            or word.example_cantonese
+            or "在故事中自然地出現。"
+        )
+        for word in words
+    }
 
 
 @router.get("/daily-words/{child_id}", response_model=List[DailyWordSummary])
@@ -169,6 +229,105 @@ async def generate_bedtime_story(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate story: {str(e)}"
         )
+
+
+@router.post("/external/invoke", response_model=StoryGenerationResponse)
+async def invoke_external_story_program(
+    request: ExternalStoryInvokeRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Invoke the external story-generation-program and persist into generated_stories."""
+    child_query = select(Child).where(
+        and_(Child.id == request.child_id, Child.parent_id == current_user.id)
+    )
+    result = await db.execute(child_query)
+    child = result.scalar_one_or_none()
+
+    if not child:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Child not found",
+        )
+
+    words_used = await story_generator.get_daily_words(db, request.child_id, request.date)
+    if not words_used:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No words learned today to include in story. Please complete some learning activities first.",
+        )
+
+    vocab_words = _build_external_vocab_words(request.theme, words_used)
+    generation_started = time.perf_counter()
+
+    try:
+        result = await run_in_threadpool(
+            external_story_program_service.invoke,
+            vocab_words,
+        )
+
+        persisted_at = datetime.utcnow()
+        title, title_english = _build_external_title(child.name, request.theme)
+        story = GeneratedStory(
+            id=str(uuid.uuid4()),
+            child_id=request.child_id,
+            title=title,
+            title_english=title_english,
+            theme=request.theme,
+            generation_date=persisted_at,
+            generated_at=persisted_at,
+            generated_by="external_story_program",
+            content_cantonese=result.story_text,
+            content_english=None,
+            jyutping=None,
+            vocab_used=result.vocab_used[:500],
+            story_text=result.story_text,
+            story_text_ssml=story_generator._build_story_ssml(result.story_text),
+            story_generate_provdier="OpenRouter",
+            story_generate_model=result.llm_model,
+            featured_words=[_word_label(word) for word in words_used],
+            word_usage=_build_external_word_usage(words_used),
+            audio_url=result.audio_url,
+            audio_duration_seconds=None,
+            audio_filename=result.audio_filename,
+            audio_generate_provider=result.tts_provider,
+            audio_generate_voice_name=None,
+            reading_time_minutes=request.reading_time_minutes,
+            word_count=len(result.story_text),
+            difficulty_level="easy",
+            cultural_references=None,
+            read_count=0,
+            is_favorite=False,
+            parent_approved=True,
+            ai_model=result.llm_model,
+            generation_prompt=(
+                f"External story program invoked for child={request.child_id}, "
+                f"theme={request.theme or 'bedtime'}, vocab={result.vocab_used}"
+            ),
+            generation_time_seconds=time.perf_counter() - generation_started,
+        )
+
+        db.add(story)
+        await db.commit()
+        await db.refresh(story)
+
+        return StoryGenerationResponse(
+            story=GeneratedStoryResponse.model_validate(story),
+            words_used=words_used,
+            generation_time_seconds=story.generation_time_seconds or 0.0,
+            success=True,
+            message="Story generated successfully",
+        )
+    except ExternalStoryProgramError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(error),
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to invoke external story program: {error}",
+        ) from error
 
 
 @router.get("/list/{child_id}", response_model=List[GeneratedStoryResponse])

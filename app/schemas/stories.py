@@ -139,3 +139,27 @@ class StoryGenerationResponse(BaseModel):
     generation_time_seconds: float
     success: bool
     message: Optional[str] = None
+
+
+class ExternalStoryInvokeRequest(BaseModel):
+    """Request payload for invoking the external story generator and persisting the result"""
+    child_id: str
+    theme: Optional[str] = None
+    date: Optional[datetime] = None
+    word_count_target: int = Field(default=400, ge=200, le=800)
+    reading_time_minutes: int = Field(default=5, ge=3, le=10)
+    include_english: bool = False
+    include_jyutping: bool = True
+
+
+class ExternalStoryInvokeResponse(BaseModel):
+    """Response payload from the external story generation adapter"""
+    story_text: str
+    vocab_used: str
+    audio_url: str
+    audio_filename: str
+    external_audio_path: str
+    external_story_id: Optional[str] = None
+    llm_model: Optional[str] = None
+    tts_provider: Optional[str] = None
+    generated_at: datetime
