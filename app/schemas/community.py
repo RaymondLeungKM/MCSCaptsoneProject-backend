@@ -220,6 +220,10 @@ class ChallengeParticipationResponse(BaseModel):
     id: str
     challenge_id: str
     child_id: str
+    child_name: Optional[str] = None
+    child_avatar: Optional[str] = None
+    parent_name: Optional[str] = None
+    participant_code: Optional[str] = None
     progress: int
     is_completed: bool
     completed_at: Optional[datetime]

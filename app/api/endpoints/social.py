@@ -983,11 +983,32 @@ async def list_challenge_participations(
     )
     participations = result.scalars().all()
 
+    child_ids = {participation.child_id for participation in participations}
+    children_result = await db.execute(select(Child).where(Child.id.in_(child_ids)))
+    children = children_result.scalars().all()
+    child_map = {child.id: child for child in children}
+
+    parent_ids = {child.parent_id for child in children}
+    parent_map: dict[str, User] = {}
+    if parent_ids:
+        parents_result = await db.execute(select(User).where(User.id.in_(parent_ids)))
+        parent_map = {parent.id: parent for parent in parents_result.scalars().all()}
+
     return [
         ChallengeParticipationResponse(
             id=p.id,
             challenge_id=p.challenge_id,
             child_id=p.child_id,
+            child_name=child_map.get(p.child_id).name if child_map.get(p.child_id) else None,
+            child_avatar=(
+                child_map.get(p.child_id).avatar if child_map.get(p.child_id) else None
+            ),
+            parent_name=(
+                parent_map.get(child_map[p.child_id].parent_id).full_name
+                if p.child_id in child_map and child_map[p.child_id].parent_id in parent_map
+                else None
+            ),
+            participant_code=p.child_id.replace("-", "")[-4:].upper(),
             progress=p.progress,
             is_completed=p.is_completed,
             completed_at=p.completed_at,
