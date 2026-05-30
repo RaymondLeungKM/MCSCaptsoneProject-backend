@@ -289,3 +289,36 @@ class MissionAssignmentResponse(MissionAssignmentBase):
 
 class AssignedMissionResponse(MissionResponse):
     assignment: MissionAssignmentResponse
+
+
+class MissionCompletionHistoryItem(BaseModel):
+    mission_id: str
+    title: str
+    context: MissionContext
+    is_offline: bool
+    surface: MissionSurface
+    assignment_date: date
+    completed_at: datetime
+    completion_notes: Optional[str] = None
+    target_words: List[str] = Field(default_factory=list)
+    points_earned: int
+
+
+class MissionSummaryResponse(BaseModel):
+    child_id: str
+    local_today: date
+    completed_today: int
+    completed_this_week: int
+    weekly_goal: int
+    streak_days: int
+    total_completed: int
+    family_points: int
+    level: int
+    level_title: str
+    next_level_points: int
+    points_to_next_level: int
+    next_reward_label: str
+    encouragement: str
+    recent_completions: List[MissionCompletionHistoryItem] = Field(
+        default_factory=list
+    )

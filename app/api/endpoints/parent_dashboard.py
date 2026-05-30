@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, desc, or_, case
 from typing import List, Optional
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone
 import uuid
 
 from app.db.session import get_db
@@ -31,12 +31,33 @@ from app.schemas.parent_analytics import (
     DashboardSummaryResponse,
     CategoryProgress,
     AnalyticsChartsResponse,
-    LearningTimeSeriesData
+    LearningTimeSeriesData,
+    WeeklyDeltaMetric,
+    WeeklyDeltaResponse,
 )
 from app.core.security import get_current_user
 from app.services.child_metrics import sync_child_metrics
 
 router = APIRouter(prefix="/parent-dashboard", tags=["parent-dashboard"])
+
+MAX_SESSION_MINUTES = 90
+HKT = timezone(timedelta(hours=8), name="HKT")
+
+
+def _local_today() -> date:
+    return datetime.now(HKT).date()
+
+
+def _local_day_bounds(local_day: date) -> tuple[datetime, datetime]:
+    local_start = datetime.combine(local_day, time.min, tzinfo=HKT)
+    local_end = local_start + timedelta(days=1)
+    return local_start.astimezone(timezone.utc), local_end.astimezone(timezone.utc)
+
+
+def _local_date_window(start_day: date, end_day: date) -> tuple[datetime, datetime]:
+    start_at, _ = _local_day_bounds(start_day)
+    end_at, _ = _local_day_bounds(end_day + timedelta(days=1))
+    return start_at, end_at
 
 
 def _get_preferred_time_label(child: Child) -> str:
@@ -83,6 +104,76 @@ def _get_category_practice_tip(category_name: str) -> str:
     return "可用圖片、實物或動作配對，把這個主題放進日常情境中反覆練習。"
 
 
+def _build_category_mastery_progress(
+    *,
+    category_id: str,
+    category_name: str,
+    category_name_cantonese: Optional[str],
+    total_words: int,
+    mastered_words: int,
+    recent_activity: int = 0,
+) -> CategoryProgress:
+    mastered_count = max(mastered_words or 0, 0)
+    total_count = max(total_words or 0, 0)
+
+    return CategoryProgress(
+        category_id=category_id,
+        category_name=category_name,
+        category_name_cantonese=category_name_cantonese or category_name,
+        words_learned=mastered_count,
+        total_words=total_count,
+        progress_percentage=(mastered_count / total_count * 100) if total_count > 0 else 0,
+        recent_activity=recent_activity,
+    )
+
+
+def _is_my_collection_category_name(
+    category_name: str | None,
+    category_name_cantonese: str | None,
+) -> bool:
+    normalized_name = (category_name or "").strip().lower()
+    normalized_cantonese = (category_name_cantonese or "").strip()
+    return normalized_name == "my collection" or normalized_cantonese in {
+        "我的",
+        "我的收藏",
+    }
+
+
+async def _get_child_owned_collection_progress_counts(
+    child_id: str,
+    db: AsyncSession,
+) -> tuple[int, int]:
+    total_words_result = await db.execute(
+        select(func.count(Word.id)).where(
+            Word.is_active == True,
+            Word.created_by_child_id == child_id,
+        )
+    )
+    total_words = total_words_result.scalar_one() or 0
+
+    if total_words == 0:
+        return 0, 0
+
+    mastered_words_result = await db.execute(
+        select(func.count(WordProgress.id))
+        .select_from(Word)
+        .join(
+            WordProgress,
+            and_(
+                WordProgress.word_id == Word.id,
+                WordProgress.child_id == child_id,
+                WordProgress.mastered.is_(True),
+            ),
+        )
+        .where(
+            Word.is_active == True,
+            Word.created_by_child_id == child_id,
+        )
+    )
+    mastered_words = mastered_words_result.scalar_one() or 0
+    return total_words, mastered_words
+
+
 def _build_learning_insight(
     *,
     child_id: str,
@@ -110,12 +201,145 @@ def _build_learning_insight(
     )
 
 
+def _is_auto_generated_learning_insight(insight: LearningInsight) -> bool:
+    return isinstance(insight.data, dict) and insight.data.get("source") == "auto-bootstrap"
+
+
+def _get_auto_generated_learning_insight_key(
+    insight: LearningInsight,
+) -> Optional[str]:
+    data = insight.data if isinstance(insight.data, dict) else {}
+
+    explicit_key = data.get("insight_key")
+    if isinstance(explicit_key, str) and explicit_key.strip():
+        return explicit_key
+
+    kind = data.get("kind")
+    if kind == "onboarding":
+        return "onboarding-rhythm"
+    if kind == "context":
+        return "onboarding-context"
+    if kind == "learning-style":
+        return "onboarding-learning-style"
+
+    if any(metric in data for metric in ("learned_words", "mastered_words", "active_days")):
+        return "weekly-momentum"
+
+    if "progress_percentage" in data or "remaining_words" in data:
+        category_key = insight.category or data.get("category_name") or "general"
+        return f"category-focus:{category_key}"
+
+    if "dominant_mode" in data or "total_exposures" in data:
+        return "multi-sensory-balance"
+
+    return None
+
+
+def _replace_learning_insight_content(
+    existing: LearningInsight,
+    candidate: LearningInsight,
+) -> bool:
+    payload_changed = any(
+        (
+            existing.insight_type != candidate.insight_type,
+            existing.priority != candidate.priority,
+            existing.category != candidate.category,
+            existing.title != candidate.title,
+            existing.description != candidate.description,
+            existing.action_items != candidate.action_items,
+            existing.data != candidate.data,
+            existing.valid_until != candidate.valid_until,
+        )
+    )
+
+    if not payload_changed:
+        return False
+
+    existing.insight_type = candidate.insight_type
+    existing.priority = candidate.priority
+    existing.category = candidate.category
+    existing.title = candidate.title
+    existing.description = candidate.description
+    existing.action_items = candidate.action_items
+    existing.data = candidate.data
+    existing.valid_until = candidate.valid_until
+    existing.generated_at = candidate.generated_at
+
+    if not existing.is_dismissed:
+        existing.is_read = False
+
+    return True
+
+
 def _normalize_tracking_day(value):
     if isinstance(value, datetime):
-        return value.date()
+        return _ensure_utc(value).astimezone(HKT).date()
     if isinstance(value, str):
-        return date.fromisoformat(value)
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return _normalize_tracking_day(
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+            )
     return value
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _rounded_duration_minutes(start_time: datetime, end_time: datetime) -> int:
+    total_seconds = max((end_time - start_time).total_seconds(), 0)
+    if total_seconds <= 0:
+        return 0
+    return max(1, int((total_seconds + 59) // 60))
+
+
+def _merge_intervals(
+    intervals: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    if not intervals:
+        return []
+
+    sorted_intervals = sorted(intervals, key=lambda interval: interval[0])
+    merged: list[tuple[datetime, datetime]] = [sorted_intervals[0]]
+
+    for current_start, current_end in sorted_intervals[1:]:
+        previous_start, previous_end = merged[-1]
+        if current_start <= previous_end:
+            merged[-1] = (previous_start, max(previous_end, current_end))
+            continue
+
+        merged.append((current_start, current_end))
+
+    return merged
+
+
+def _total_interval_seconds(intervals: list[tuple[datetime, datetime]]) -> float:
+    return sum(
+        max((end_time - start_time).total_seconds(), 0.0)
+        for start_time, end_time in _merge_intervals(intervals)
+    )
+
+
+def _rounded_minutes_from_total_seconds(
+    total_seconds: float,
+    *,
+    has_words: bool = False,
+) -> int:
+    if total_seconds <= 0:
+        return 0
+
+    rounded_minutes = int((total_seconds + 30) // 60)
+    if rounded_minutes > 0:
+        return rounded_minutes
+
+    if has_words:
+        return 1
+
+    return 0
 
 
 async def _get_recent_tracking_activity(
@@ -123,11 +347,13 @@ async def _get_recent_tracking_activity(
     db: AsyncSession,
     start_date: date,
     end_date: Optional[date] = None,
-) -> tuple[int, int, dict]:
-    resolved_end_date = end_date or date.today()
+) -> tuple[int, set[date], dict]:
+    resolved_end_date = end_date or _local_today()
+    start_at, end_at = _local_date_window(start_date, resolved_end_date)
+
     tracking_result = await db.execute(
         select(
-            func.date(DailyWordTracking.date).label("tracked_day"),
+            DailyWordTracking.date,
             DailyWordTracking.word_id,
             Word.category.label("category_id"),
         )
@@ -135,11 +361,8 @@ async def _get_recent_tracking_activity(
         .where(
             and_(
                 DailyWordTracking.child_id == child_id,
-                DailyWordTracking.date >= datetime.combine(start_date, time.min),
-                DailyWordTracking.date < datetime.combine(
-                    resolved_end_date + timedelta(days=1),
-                    time.min,
-                ),
+                DailyWordTracking.date >= start_at,
+                DailyWordTracking.date < end_at,
             )
         )
     )
@@ -166,7 +389,7 @@ async def _get_recent_tracking_activity(
 
     return (
         len(unique_words),
-        len(active_days),
+        active_days,
         {
             category_id: len(word_ids)
             for category_id, word_ids in category_words.items()
@@ -174,17 +397,118 @@ async def _get_recent_tracking_activity(
     )
 
 
-def _get_session_duration_minutes(session: LearningSession) -> int:
-    if session.duration_minutes is not None:
-        return max(session.duration_minutes, 0)
+def _resolved_session_window(
+    session: LearningSession,
+    *,
+    now_utc: datetime,
+) -> tuple[datetime, datetime] | None:
+    if not session.start_time:
+        return None
 
-    if session.start_time and session.end_time:
-        return max(
-            int((session.end_time - session.start_time).total_seconds() // 60),
-            0,
+    if session.duration_minutes is not None and session.duration_minutes > MAX_SESSION_MINUTES:
+        return None
+
+    session_start = _ensure_utc(session.start_time)
+    raw_session_end = session.end_time or now_utc
+    session_end = min(
+        _ensure_utc(raw_session_end),
+        session_start + timedelta(minutes=MAX_SESSION_MINUTES),
+    )
+
+    if session_end <= session_start:
+        return None
+
+    return session_start, session_end
+
+
+def _split_session_intervals_by_day(
+    session: LearningSession,
+    *,
+    now_utc: datetime,
+) -> dict[date, list[tuple[datetime, datetime]]]:
+    resolved_window = _resolved_session_window(session, now_utc=now_utc)
+    if resolved_window is None:
+        return {}
+
+    session_start, session_end = resolved_window
+    intervals_by_day: dict[date, list[tuple[datetime, datetime]]] = {}
+    cursor = session_start
+
+    while cursor < session_end:
+        local_cursor = cursor.astimezone(HKT)
+        next_local_day_start = datetime.combine(
+            local_cursor.date() + timedelta(days=1),
+            time.min,
+            tzinfo=HKT,
+        ).astimezone(timezone.utc)
+        segment_end = min(session_end, next_local_day_start)
+        intervals_by_day.setdefault(local_cursor.date(), []).append(
+            (cursor, segment_end)
         )
+        cursor = segment_end
 
-    return 0
+    return intervals_by_day
+
+
+def _summarize_sessions_by_day(
+    sessions: list[LearningSession],
+    *,
+    start_day: date,
+    end_day: date,
+    now_utc: Optional[datetime] = None,
+) -> dict[date, dict[str, float | int]]:
+    resolved_now = now_utc or datetime.now(timezone.utc)
+    day_buckets = {
+        start_day + timedelta(days=offset): {
+            "intervals": [],
+            "session_count": 0,
+        }
+        for offset in range((end_day - start_day).days + 1)
+    }
+    session_windows: list[tuple[datetime, datetime]] = []
+
+    for session in sessions:
+        resolved_window = _resolved_session_window(session, now_utc=resolved_now)
+        if resolved_window is None:
+            continue
+
+        session_windows.append(resolved_window)
+
+        for tracked_day, intervals in _split_session_intervals_by_day(
+            session,
+            now_utc=resolved_now,
+        ).items():
+            if tracked_day not in day_buckets:
+                continue
+
+            day_buckets[tracked_day]["intervals"].extend(intervals)
+
+    for session_start, _ in _merge_intervals(session_windows):
+        session_day = _normalize_tracking_day(session_start)
+        if session_day not in day_buckets:
+            continue
+
+        day_buckets[session_day]["session_count"] += 1
+
+    return {
+        tracked_day: {
+            "total_seconds": _total_interval_seconds(bucket["intervals"]),
+            "session_count": bucket["session_count"],
+        }
+        for tracked_day, bucket in day_buckets.items()
+    }
+
+
+def _get_session_duration_minutes(session: LearningSession) -> int:
+    resolved_window = _resolved_session_window(
+        session,
+        now_utc=datetime.now(timezone.utc),
+    )
+    if resolved_window is None:
+        return 0
+
+    session_start, session_end = resolved_window
+    return _rounded_duration_minutes(session_start, session_end)
 
 
 async def _build_live_weekly_report(
@@ -192,11 +516,11 @@ async def _build_live_weekly_report(
     db: AsyncSession,
     week_start_date: Optional[date] = None,
 ) -> WeeklyReportResponse:
-    today = date.today()
+    today = _local_today()
     week_start = week_start_date or (today - timedelta(days=today.weekday()))
     week_end = week_start + timedelta(days=6)
 
-    total_words_learned, days_active, category_activity = (
+    total_words_learned, tracking_days, category_activity = (
         await _get_recent_tracking_activity(
             child.id,
             db,
@@ -213,31 +537,46 @@ async def _build_live_weekly_report(
         previous_week_start,
         previous_week_end,
     )
+    start_at, end_at = _local_date_window(week_start, week_end)
 
     sessions_result = await db.execute(
         select(LearningSession).where(
             and_(
                 LearningSession.child_id == child.id,
-                LearningSession.start_time >= datetime.combine(week_start, time.min),
-                LearningSession.start_time < datetime.combine(
-                    week_end + timedelta(days=1),
-                    time.min,
+                LearningSession.start_time < end_at,
+                or_(
+                    LearningSession.end_time.is_(None),
+                    LearningSession.end_time > start_at,
                 ),
             )
         )
     )
     sessions = sessions_result.scalars().all()
-    total_sessions = len(sessions)
-    total_learning_time = sum(
-        _get_session_duration_minutes(session)
-        for session in sessions
+    session_daily_stats = _summarize_sessions_by_day(
+        sessions,
+        start_day=week_start,
+        end_day=week_end,
     )
+    total_learning_time = 0
+    total_sessions = 0
+    session_active_days = set()
 
-    if total_sessions == 0 and total_words_learned > 0:
-        total_sessions = days_active
+    for tracked_day, day_stats in session_daily_stats.items():
+        total_seconds = float(day_stats["total_seconds"])
+        rounded_minutes = _rounded_minutes_from_total_seconds(
+            total_seconds,
+            has_words=tracked_day in tracking_days,
+        )
 
-    if total_learning_time == 0 and total_words_learned > 0:
-        total_learning_time = total_words_learned * 2
+        if rounded_minutes > 0:
+            session_active_days.add(tracked_day)
+
+        if rounded_minutes > 0 or tracked_day in tracking_days:
+            total_sessions += int(day_stats["session_count"])
+
+        total_learning_time += rounded_minutes
+
+    days_active = len(tracking_days | session_active_days)
 
     category_names: dict[str, str] = {}
     if category_activity:
@@ -330,11 +669,54 @@ async def _build_live_weekly_report(
     )
 
 
+def _build_weekly_delta_metric(
+    current_value: int,
+    previous_value: int,
+) -> WeeklyDeltaMetric:
+    return WeeklyDeltaMetric(
+        current=current_value,
+        previous=previous_value,
+        delta=current_value - previous_value,
+    )
+
+
+def _build_weekly_delta_summary(
+    current_report: WeeklyReportResponse,
+    previous_report: WeeklyReportResponse,
+) -> WeeklyDeltaResponse:
+    current_xp = current_report.total_words_learned * 10
+    previous_xp = previous_report.total_words_learned * 10
+
+    return WeeklyDeltaResponse(
+        current_week_start_date=current_report.week_start_date,
+        current_week_end_date=current_report.week_end_date,
+        previous_week_start_date=previous_report.week_start_date,
+        previous_week_end_date=previous_report.week_end_date,
+        words_learned=_build_weekly_delta_metric(
+            current_report.total_words_learned,
+            previous_report.total_words_learned,
+        ),
+        learning_time=_build_weekly_delta_metric(
+            current_report.total_learning_time,
+            previous_report.total_learning_time,
+        ),
+        sessions=_build_weekly_delta_metric(
+            current_report.total_sessions,
+            previous_report.total_sessions,
+        ),
+        xp_earned=_build_weekly_delta_metric(current_xp, previous_xp),
+        active_days=_build_weekly_delta_metric(
+            current_report.days_active,
+            previous_report.days_active,
+        ),
+    )
+
+
 async def _generate_default_learning_insights(
     child: Child,
     db: AsyncSession,
 ) -> List[LearningInsight]:
-    weekly_window_start = date.today() - timedelta(days=6)
+    weekly_window_start = _local_today() - timedelta(days=6)
 
     learned_words_result = await db.execute(
         select(func.count(WordProgress.id))
@@ -363,6 +745,7 @@ async def _generate_default_learning_insights(
         db,
         weekly_window_start,
     )
+    active_days_count = len(active_days)
 
     exposure_mode_result = await db.execute(
         select(
@@ -381,7 +764,9 @@ async def _generate_default_learning_insights(
             Category.name,
             Category.name_cantonese,
             func.count(Word.id).label("total_words"),
-            func.count(WordProgress.id).label("learned_words"),
+            func.count(WordProgress.id).filter(
+                WordProgress.mastered.is_(True)
+            ).label("mastered_words"),
         )
         .select_from(Category)
         .join(
@@ -396,7 +781,6 @@ async def _generate_default_learning_insights(
             and_(
                 WordProgress.word_id == Word.id,
                 WordProgress.child_id == child.id,
-                WordProgress.exposure_count >= 1,
             ),
         )
         .where(Category.is_active == True)
@@ -404,24 +788,26 @@ async def _generate_default_learning_insights(
     )
 
     category_progress = []
-    for category_id, category_name, category_name_cantonese, total_words, learned_count in category_progress_result.all():
-        progress_percentage = (
-            learned_count / total_words * 100 if total_words else 0
-        )
+    for (
+        category_id,
+        category_name,
+        category_name_cantonese,
+        total_words,
+        mastered_count,
+    ) in category_progress_result.all():
         category_progress.append(
-            {
-                "category_id": category_id,
-                "category_name": category_name,
-                "category_name_cantonese": category_name_cantonese or category_name,
-                "total_words": total_words,
-                "learned_words": learned_count,
-                "progress_percentage": progress_percentage,
-            }
+            _build_category_mastery_progress(
+                category_id=category_id,
+                category_name=category_name,
+                category_name_cantonese=category_name_cantonese,
+                total_words=total_words,
+                mastered_words=mastered_count,
+            )
         )
 
-    category_progress.sort(key=lambda item: item["progress_percentage"])
+    category_progress.sort(key=lambda item: item.progress_percentage)
     weakest_category = next(
-        (item for item in category_progress if item["learned_words"] < item["total_words"]),
+        (item for item in category_progress if item.words_learned < item.total_words),
         category_progress[0] if category_progress else None,
     )
 
@@ -441,7 +827,11 @@ async def _generate_default_learning_insights(
                 action_items=[
                     f"優先安排在{_get_preferred_time_label(child)}做 5 至 10 分鐘短練習，先完成每日目標。",
                 ],
-                data={"source": "auto-bootstrap", "kind": "onboarding"},
+                data={
+                    "source": "auto-bootstrap",
+                    "kind": "onboarding",
+                    "insight_key": "onboarding-rhythm",
+                },
             )
         )
         insights.append(
@@ -454,7 +844,11 @@ async def _generate_default_learning_insights(
                 action_items=[
                     "可以指著身邊的實物說名稱，再請孩子跟讀或做對應動作。",
                 ],
-                data={"source": "auto-bootstrap", "kind": "context"},
+                data={
+                    "source": "auto-bootstrap",
+                    "kind": "context",
+                    "insight_key": "onboarding-context",
+                },
             )
         )
         insights.append(
@@ -470,7 +864,11 @@ async def _generate_default_learning_insights(
                 action_items=[
                     "可把圖片、口頭提示和身體動作放在同一次練習中一起使用。",
                 ],
-                data={"source": "auto-bootstrap", "kind": "learning-style"},
+                data={
+                    "source": "auto-bootstrap",
+                    "kind": "learning-style",
+                    "insight_key": "onboarding-learning-style",
+                },
             )
         )
         return insights
@@ -498,17 +896,18 @@ async def _generate_default_learning_insights(
             action_items=[action_item],
             data={
                 "source": "auto-bootstrap",
+                "insight_key": "weekly-momentum",
                 "learned_words": learned_words,
                 "mastered_words": mastered_words,
-                "active_days": active_days,
+                "active_days": active_days_count,
             },
         )
     )
 
     if weakest_category:
-        weakest_name = weakest_category["category_name_cantonese"]
+        weakest_name = weakest_category.category_name_cantonese
         remaining_words = max(
-            weakest_category["total_words"] - weakest_category["learned_words"],
+            weakest_category.total_words - weakest_category.words_learned,
             0,
         )
         insights.append(
@@ -516,18 +915,20 @@ async def _generate_default_learning_insights(
                 child_id=child.id,
                 insight_type="weakness",
                 priority="high"
-                if weakest_category["progress_percentage"] < 50
+                if weakest_category.progress_percentage < 50
                 else "medium",
                 title=f"可優先加強「{weakest_name}」主題",
                 description=(
-                    f"目前此主題已接觸 {weakest_category['learned_words']} / {weakest_category['total_words']} 個詞彙，"
+                    f"目前此主題已掌握 {weakest_category.words_learned} / {weakest_category.total_words} 個詞彙，"
                     f"尚有 {remaining_words} 個詞彙可再加強。"
                 ),
                 action_items=[_get_category_practice_tip(weakest_name)],
-                category=weakest_category["category_name"],
+                category=weakest_category.category_name,
                 data={
                     "source": "auto-bootstrap",
-                    "progress_percentage": weakest_category["progress_percentage"],
+                    "insight_key": f"category-focus:{weakest_category.category_name}",
+                    "category_name": weakest_category.category_name,
+                    "progress_percentage": weakest_category.progress_percentage,
                     "remaining_words": remaining_words,
                 },
             )
@@ -561,6 +962,7 @@ async def _generate_default_learning_insights(
                 ],
                 data={
                     "source": "auto-bootstrap",
+                    "insight_key": "multi-sensory-balance",
                     "dominant_mode": dominant_mode,
                     "dominant_ratio": dominant_ratio,
                 },
@@ -579,31 +981,63 @@ async def _generate_default_learning_insights(
                 action_items=[
                     "可把已熟悉的詞彙加入口語輸出或小故事，幫助從辨認走向主動使用。",
                 ],
-                data={"source": "auto-bootstrap", "total_exposures": total_exposures},
+                data={
+                    "source": "auto-bootstrap",
+                    "insight_key": "multi-sensory-balance",
+                    "total_exposures": total_exposures,
+                },
             )
         )
 
     return insights[:3]
 
 
-async def _ensure_learning_insights_exist(
+async def _sync_learning_insights(
     child: Child,
     db: AsyncSession,
 ) -> None:
     existing_result = await db.execute(
-        select(LearningInsight.id)
-        .where(LearningInsight.child_id == child.id)
-        .limit(1)
+        select(LearningInsight).where(LearningInsight.child_id == child.id)
     )
-    if existing_result.scalar_one_or_none():
-        return
+    existing_insights = existing_result.scalars().all()
+
+    auto_generated_by_key: dict[str, LearningInsight] = {}
+    stale_auto_generated: list[LearningInsight] = []
+
+    for insight in existing_insights:
+        if not _is_auto_generated_learning_insight(insight):
+            continue
+
+        insight_key = _get_auto_generated_learning_insight_key(insight)
+        if insight_key is None:
+            stale_auto_generated.append(insight)
+            continue
+
+        auto_generated_by_key[insight_key] = insight
 
     generated_insights = await _generate_default_learning_insights(child, db)
-    if not generated_insights:
-        return
+    changed = False
 
-    db.add_all(generated_insights)
-    await db.commit()
+    for candidate in generated_insights:
+        insight_key = _get_auto_generated_learning_insight_key(candidate)
+        if insight_key is None:
+            continue
+
+        existing = auto_generated_by_key.pop(insight_key, None)
+        if existing is None:
+            db.add(candidate)
+            changed = True
+            continue
+
+        if _replace_learning_insight_content(existing, candidate):
+            changed = True
+
+    for stale_insight in [*stale_auto_generated, *auto_generated_by_key.values()]:
+        await db.delete(stale_insight)
+        changed = True
+
+    if changed:
+        await db.commit()
 
 
 def _learning_insight_priority_order():
@@ -638,12 +1072,12 @@ async def get_dashboard_summary(
     if not child:
         raise HTTPException(status_code=404, detail="Child not found")
 
-    today = date.today()
+    today = _local_today()
     if await sync_child_metrics(db, child, as_of=today):
         await db.commit()
         await db.refresh(child)
 
-    await _ensure_learning_insights_exist(child, db)
+    await _sync_learning_insights(child, db)
 
     seven_days_ago = today - timedelta(days=6)
     _, _, recent_category_activity = await _get_recent_tracking_activity(
@@ -657,13 +1091,15 @@ async def get_dashboard_summary(
     category_progress_result = await db.execute(
         select(
             Word.category,
-            func.count(WordProgress.id).label('words_learned')
+            func.count(WordProgress.id).filter(
+                WordProgress.mastered.is_(True)
+            ).label('mastered_words')
         )
         .join(Word, WordProgress.word_id == Word.id)
         .where(
             and_(
                 WordProgress.child_id == child_id,
-                WordProgress.exposure_count >= 1
+                Word.is_active == True,
             )
         )
         .group_by(Word.category)
@@ -672,27 +1108,42 @@ async def get_dashboard_summary(
     
     # Get total words per category
     category_progress = []
-    for cat_id, learned_count in category_counts:
+    for cat_id, mastered_count in category_counts:
         category_result = await db.execute(
             select(Category, func.count(Word.id))
             .join(Word, Category.id == Word.category)
-            .where(Category.id == cat_id)
+            .where(Category.id == cat_id, Word.is_active == True)
             .group_by(Category.id)
         )
         cat_data = category_result.first()
         if cat_data:
             category, total_words = cat_data
             recent_activity = recent_category_activity.get(cat_id, 0)
-            
-            category_progress.append(CategoryProgress(
-                category_id=category.id,
-                category_name=category.name,
-                category_name_cantonese=category.name_cantonese or category.name,
-                words_learned=learned_count,
-                total_words=total_words,
-                progress_percentage=(learned_count / total_words * 100) if total_words > 0 else 0,
-                recent_activity=recent_activity
-            ))
+            mastered_for_category = mastered_count
+
+            if _is_my_collection_category_name(
+                category.name,
+                category.name_cantonese,
+            ):
+                total_words, mastered_for_category = (
+                    await _get_child_owned_collection_progress_counts(
+                        child_id,
+                        db,
+                    )
+                )
+                if total_words == 0:
+                    continue
+
+            category_progress.append(
+                _build_category_mastery_progress(
+                    category_id=category.id,
+                    category_name=category.name,
+                    category_name_cantonese=category.name_cantonese,
+                    total_words=total_words,
+                    mastered_words=mastered_for_category,
+                    recent_activity=recent_activity,
+                )
+            )
     
     # Get recent insights (last 5, unread first)
     insights_result = await db.execute(
@@ -713,6 +1164,12 @@ async def get_dashboard_summary(
     insights = insights_result.scalars().all()
     
     latest_report = await _build_live_weekly_report(child, db)
+    previous_report = await _build_live_weekly_report(
+        child,
+        db,
+        latest_report.week_start_date - timedelta(days=7),
+    )
+    weekly_delta = _build_weekly_delta_summary(latest_report, previous_report)
     
     # Get parental control settings
     control_result = await db.execute(
@@ -736,6 +1193,7 @@ async def get_dashboard_summary(
         weekly_sessions=latest_report.total_sessions,
         weekly_words_learned=latest_report.total_words_learned,
         weekly_xp_earned=weekly_xp,
+        weekly_delta=weekly_delta,
         category_progress=category_progress,
         recent_insights=[LearningInsightResponse.from_orm(i) for i in insights],
         latest_report=latest_report,
@@ -764,7 +1222,7 @@ async def get_analytics_charts(
         raise HTTPException(status_code=404, detail="Child not found")
     
     # Calculate date range
-    today = date.today()
+    today = _local_today()
     if period == "week":
         start_date = today - timedelta(days=6)  # 6 days ago + today = 7 days
         num_days = 7
@@ -774,9 +1232,7 @@ async def get_analytics_charts(
     else:  # all
         start_date = date(2020, 1, 1)  # Far in the past
         num_days = (today - start_date).days
-    
-    # Convert start_date to datetime for proper comparison with DateTime field
-    start_date_dt = datetime.combine(start_date, datetime.min.time())
+    start_at, end_at = _local_date_window(start_date, today)
     
     # Use DailyWordTracking table to get accurate word learning dates
     # This table tracks when words were first learned each day
@@ -786,7 +1242,8 @@ async def get_analytics_charts(
         .where(
             and_(
                 DailyWordTracking.child_id == child_id,
-                DailyWordTracking.date >= start_date_dt
+                DailyWordTracking.date >= start_at,
+                DailyWordTracking.date < end_at,
             )
         )
     )
@@ -798,7 +1255,7 @@ async def get_analytics_charts(
     
     for tracking, word in tracking_records:
         if tracking.date:
-            learned_date = tracking.date.date()
+            learned_date = _normalize_tracking_day(tracking.date)
             if learned_date >= start_date and learned_date <= today:
                 # Initialize date entry if needed
                 if learned_date not in date_stats:
@@ -818,12 +1275,31 @@ async def get_analytics_charts(
     _, _, recent_category_activity = await _get_recent_tracking_activity(
         child_id,
         db,
-        date.today() - timedelta(days=6),
+        _local_today() - timedelta(days=6),
+    )
+
+    sessions_result = await db.execute(
+        select(LearningSession).where(
+            and_(
+                LearningSession.child_id == child_id,
+                LearningSession.start_time < end_at,
+                or_(
+                    LearningSession.end_time.is_(None),
+                    LearningSession.end_time > start_at,
+                ),
+            )
+        )
+    )
+    session_daily_stats = _summarize_sessions_by_day(
+        sessions_result.scalars().all(),
+        start_day=start_date,
+        end_day=today,
     )
     
     # Create time series arrays - generate a date for each day in range
     dates = []
     words_learned = []
+    learning_time = []
     xp_earned = []
     
     current_date = start_date
@@ -834,12 +1310,21 @@ async def get_analytics_charts(
         words_count = len(day_stats['words_learned'])
         
         words_learned.append(words_count)
+        learning_time.append(
+            _rounded_minutes_from_total_seconds(
+                float(
+                    session_daily_stats.get(current_date, {}).get(
+                        "total_seconds",
+                        0.0,
+                    )
+                ),
+                has_words=words_count > 0,
+            )
+        )
         xp_earned.append(words_count * 10)  # 10 XP per word
         
         current_date += timedelta(days=1)
-    
-    # Placeholder arrays (we don't track these precisely yet)
-    learning_time = [words * 2 for words in words_learned]  # Approximate 2 min per word
+
     accuracy = [95.0 if words > 0 else 0.0 for words in words_learned]  # Approximate
     
     # Get category info and format progress data
@@ -890,8 +1375,15 @@ async def get_analytics_charts(
     
     # Calculate average session length
     total_time = sum(learning_time)
-    days_with_activity = len([w for w in words_learned if w > 0])
-    average_session_length = int(total_time / days_with_activity) if days_with_activity > 0 else 0
+    total_sessions = 0
+    for tracked_day, day_stats in session_daily_stats.items():
+        rounded_minutes = _rounded_minutes_from_total_seconds(
+            float(day_stats["total_seconds"]),
+            has_words=bool(date_stats.get(tracked_day, {}).get("words_learned")),
+        )
+        if rounded_minutes > 0 or bool(date_stats.get(tracked_day, {}).get("words_learned")):
+            total_sessions += int(day_stats["session_count"])
+    average_session_length = int(total_time / total_sessions) if total_sessions > 0 else 0
     
     return AnalyticsChartsResponse(
         child_id=child_id,
@@ -936,36 +1428,45 @@ async def get_words_by_date(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
     
-    # Get words from DailyWordTracking for this date
-    start_of_day = datetime.combine(target_date, datetime.min.time())
-    end_of_day = datetime.combine(target_date, datetime.max.time())
-    
+    # Query a narrow window around the requested day, then reuse the same
+    # datetime -> day normalization the charts endpoint relies on.
+    window_start, window_end = _local_day_bounds(target_date)
+
     tracking_result = await db.execute(
         select(DailyWordTracking, Word, Category)
         .join(Word, DailyWordTracking.word_id == Word.id)
-        .join(Category, Word.category == Category.id)
+        .outerjoin(Category, Word.category == Category.id)
         .where(
             and_(
                 DailyWordTracking.child_id == child_id,
-                DailyWordTracking.date >= start_of_day,
-                DailyWordTracking.date <= end_of_day
+                DailyWordTracking.date >= window_start,
+                DailyWordTracking.date < window_end
             )
         )
         .order_by(DailyWordTracking.created_at.desc())
     )
-    records = tracking_result.all()
+    records = [
+        (tracking, word, category)
+        for tracking, word, category in tracking_result.all()
+        if _normalize_tracking_day(tracking.date) == target_date
+    ]
     
     # Format response
     words_data = []
+    seen_word_ids = set()
     for tracking, word, category in records:
+        if tracking.word_id in seen_word_ids:
+            continue
+        seen_word_ids.add(tracking.word_id)
+
         words_data.append({
             "id": word.id,
             "word": word.word,
             "word_cantonese": word.word_cantonese,
             "jyutping": word.jyutping,
             "image_url": word.image_url,
-            "category": category.name,
-            "category_cantonese": category.name_cantonese,
+            "category": category.name if category else (word.category or ""),
+            "category_cantonese": category.name_cantonese if category else None,
             "definition": word.definition,
             "definition_cantonese": word.definition_cantonese,
             "exposure_count": tracking.exposure_count,
@@ -1008,7 +1509,12 @@ async def get_learning_insights(
     if not child:
         raise HTTPException(status_code=404, detail="Child not found")
 
-    await _ensure_learning_insights_exist(child, db)
+    today = _local_today()
+    if await sync_child_metrics(db, child, as_of=today):
+        await db.commit()
+        await db.refresh(child)
+
+    await _sync_learning_insights(child, db)
     
     # Build query
     conditions = [LearningInsight.child_id == child_id]
@@ -1022,6 +1528,7 @@ async def get_learning_insights(
         .where(and_(*conditions))
         .order_by(
             _learning_insight_priority_order(),
+            LearningInsight.is_read.asc(),
             desc(LearningInsight.generated_at)
         )
         .limit(limit)

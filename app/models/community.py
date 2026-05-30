@@ -37,6 +37,18 @@ class ChallengeStatus(str, enum.Enum):
     EXPIRED = "expired"
 
 
+class FriendChallengeMetric(str, enum.Enum):
+    PRACTICE_DAYS = "practice_days"
+    NEW_WORDS = "new_words"
+    ACTIVE_WORDS = "active_words"
+
+
+class FriendChallengeInviteStatus(str, enum.Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+
+
 # ---------------------------------------------------------------------------
 # Epic 10.1 – Community Feed Models
 # ---------------------------------------------------------------------------
@@ -228,4 +240,90 @@ class ChallengeParticipation(Base):
 
     # Relationships
     challenge = relationship("CommunityChallenge", back_populates="participations")
+    child = relationship("Child", foreign_keys=[child_id])
+
+
+class FriendChallenge(Base):
+    """
+    A private parent-to-parent challenge between accepted friends.
+    Progress is derived from existing child learning activity within the
+    challenge date window instead of being entered manually.
+    """
+    __tablename__ = "friend_challenges"
+
+    id = Column(String, primary_key=True, index=True)
+    creator_id = Column(
+        String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    title = Column(String, nullable=False)
+    title_zh = Column(String, nullable=False)
+    metric_type = Column(
+        SQLEnum(
+            FriendChallengeMetric,
+            name="friendchallengemetric",
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
+        nullable=False,
+        index=True,
+    )
+    target_count = Column(Integer, default=5, nullable=False)
+    duration_days = Column(Integer, default=7, nullable=False)
+    emoji = Column(String, default="🤝", nullable=False)
+
+    starts_at = Column(DateTime(timezone=True), nullable=False)
+    ends_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    creator = relationship("User", foreign_keys=[creator_id])
+    participants = relationship(
+        "FriendChallengeParticipant",
+        back_populates="challenge",
+        cascade="all, delete-orphan",
+    )
+
+
+class FriendChallengeParticipant(Base):
+    """
+    One invited parent entry for a private friend challenge.
+    Pending rows act as invites; accepted rows also carry the selected child.
+    """
+    __tablename__ = "friend_challenge_participants"
+
+    id = Column(String, primary_key=True, index=True)
+    challenge_id = Column(
+        String,
+        ForeignKey("friend_challenges.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    parent_id = Column(
+        String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    child_id = Column(
+        String, ForeignKey("children.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    invite_status = Column(
+        SQLEnum(
+            FriendChallengeInviteStatus,
+            name="friendchallengeinvitestatus",
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
+        default=FriendChallengeInviteStatus.PENDING,
+        nullable=False,
+        index=True,
+    )
+    responded_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "challenge_id",
+            "parent_id",
+            name="uq_friend_challenge_participant",
+        ),
+    )
+
+    challenge = relationship("FriendChallenge", back_populates="participants")
+    parent = relationship("User", foreign_keys=[parent_id])
     child = relationship("Child", foreign_keys=[child_id])

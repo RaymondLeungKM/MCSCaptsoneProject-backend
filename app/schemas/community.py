@@ -29,6 +29,26 @@ class ChallengeStatus(str, Enum):
     EXPIRED = "expired"
 
 
+class FriendChallengeMetric(str, Enum):
+    PRACTICE_DAYS = "practice_days"
+    NEW_WORDS = "new_words"
+    ACTIVE_WORDS = "active_words"
+
+
+class FriendChallengeInviteStatus(str, Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+
+
+class FriendChallengeViewStatus(str, Enum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    EXPIRED = "expired"
+    DECLINED = "declined"
+
+
 # ---------------------------------------------------------------------------
 # Community Post schemas (Epic 10.1)
 # ---------------------------------------------------------------------------
@@ -157,11 +177,25 @@ class CommunityChallengeCreate(BaseModel):
     title_zh: Optional[str] = None
     description: Optional[str] = None
     description_zh: Optional[str] = None
-    target_count: int = 5
+    target_count: int = Field(5, ge=1, le=1000)
     category: Optional[str] = None
     emoji: str = "🏆"
+    status: ChallengeStatus = ChallengeStatus.ACTIVE
     starts_at: datetime
     ends_at: datetime
+
+
+class CommunityChallengeUpdate(BaseModel):
+    title: Optional[str] = None
+    title_zh: Optional[str] = None
+    description: Optional[str] = None
+    description_zh: Optional[str] = None
+    target_count: Optional[int] = Field(None, ge=1, le=1000)
+    category: Optional[str] = None
+    emoji: Optional[str] = None
+    status: Optional[ChallengeStatus] = None
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
 
 
 class CommunityChallengeResponse(BaseModel):
@@ -186,6 +220,10 @@ class ChallengeParticipationResponse(BaseModel):
     id: str
     challenge_id: str
     child_id: str
+    child_name: Optional[str] = None
+    child_avatar: Optional[str] = None
+    parent_name: Optional[str] = None
+    participant_code: Optional[str] = None
     progress: int
     is_completed: bool
     completed_at: Optional[datetime]
@@ -211,3 +249,53 @@ class ChallengeParticipationResponse(BaseModel):
 class ChallengeProgressUpdate(BaseModel):
     """Increment a child's participation progress"""
     increment: int = Field(1, ge=1, le=100)
+
+
+class FriendChallengeCreate(BaseModel):
+    child_id: str
+    invited_parent_ids: List[str] = Field(default_factory=list)
+    metric_type: FriendChallengeMetric
+    target_count: int = Field(..., ge=1, le=50)
+    duration_days: int = Field(7, ge=3, le=30)
+
+
+class FriendChallengeRespond(BaseModel):
+    invite_status: FriendChallengeInviteStatus
+    child_id: Optional[str] = None
+
+
+class FriendChallengeParticipantResponse(BaseModel):
+    id: str
+    parent_id: str
+    parent_name: Optional[str] = None
+    child_id: Optional[str] = None
+    child_name: Optional[str] = None
+    child_avatar: Optional[str] = None
+    invite_status: FriendChallengeInviteStatus
+    progress: int = 0
+    is_completed: bool = False
+
+
+class FriendChallengeResponse(BaseModel):
+    id: str
+    creator_id: str
+    creator_name: Optional[str] = None
+    title: str
+    title_zh: str
+    metric_type: FriendChallengeMetric
+    target_count: int
+    duration_days: int
+    emoji: str
+    starts_at: datetime
+    ends_at: datetime
+    created_at: datetime
+    accepted_participant_count: int = 0
+    pending_participant_count: int = 0
+    my_invite_status: FriendChallengeInviteStatus
+    my_child_id: Optional[str] = None
+    my_progress: int = 0
+    my_completed: bool = False
+    view_status: FriendChallengeViewStatus
+    participants: List[FriendChallengeParticipantResponse] = Field(
+        default_factory=list
+    )
