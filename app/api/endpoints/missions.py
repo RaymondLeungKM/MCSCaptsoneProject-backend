@@ -6,16 +6,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import sqlalchemy as sa
 from sqlalchemy import select
 from typing import List
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 import uuid
 
 from app.db.session import get_db
 from app.schemas.content import (
     AssignedMissionResponse,
     MissionCreate,
+    MissionCompletionHistoryItem,
     MissionProgressResponse,
     MissionProgressUpdate,
     MissionResponse,
+    MissionSummaryResponse,
     MissionUpdate,
 )
 from app.models.content import (
@@ -35,6 +37,34 @@ router = APIRouter()
 
 MAX_DAILY_ASSIGNMENTS = 3
 MAX_OFFLINE_ASSIGNMENTS = 6
+MISSION_COMPLETION_COOLDOWN_DAYS = 7
+MISSION_DAILY_POINTS = 10
+MISSION_OFFLINE_POINTS = 15
+MISSION_WEEKLY_GOAL = 5
+HKT = timezone(timedelta(hours=8), name="HKT")
+
+MISSION_LEVELS = [
+    {"level": 1, "title": "陪跑新手", "min_points": 0},
+    {"level": 2, "title": "互動拍檔", "min_points": 50},
+    {"level": 3, "title": "共學隊長", "min_points": 120},
+    {"level": 4, "title": "語言探險家", "min_points": 220},
+    {"level": 5, "title": "家庭共學達人", "min_points": 360},
+]
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _current_hkt_date(now_utc: datetime | None = None) -> date:
+    resolved_now = _ensure_utc(now_utc) if now_utc else datetime.now(timezone.utc)
+    return resolved_now.astimezone(HKT).date()
+
+
+def _enum_value(value):
+    return value.value if hasattr(value, "value") else value
 
 
 async def _get_mission_by_id(mission_id: str, db: AsyncSession) -> Mission:
@@ -71,7 +101,7 @@ def _apply_mission_lifecycle_defaults(
     *,
     previous_status: MissionStatus | None = None,
 ) -> None:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     if mission.status == MissionStatus.PUBLISHED:
         if mission.published_at is None:
@@ -198,19 +228,19 @@ def _serialize_assigned_mission(
     assignment: MissionAssignment | None = None,
     progress: MissionProgress | None = None,
 ) -> dict:
-    assignment_status = (
-        assignment.status if assignment else MissionAssignmentStatus.ASSIGNED
-    )
-    if progress and progress.completed:
-        assignment_status = MissionAssignmentStatus.COMPLETED
+    if assignment:
+        assignment_status = assignment.status
+        completed_at = assignment.completed_at
+        completion_notes = assignment.completion_notes
+    else:
+        assignment_status = MissionAssignmentStatus.ASSIGNED
+        completed_at = None
+        completion_notes = None
 
-    completed_at = assignment.completed_at if assignment else None
-    if progress and progress.completed_date:
-        completed_at = progress.completed_date
-
-    completion_notes = assignment.completion_notes if assignment else None
-    if progress and progress.parent_notes:
-        completion_notes = progress.parent_notes
+        if progress and progress.completed:
+            assignment_status = MissionAssignmentStatus.COMPLETED
+            completed_at = progress.completed_date
+            completion_notes = progress.parent_notes
 
     assignment_payload = {
         "id": assignment.id if assignment else f"{mission.id}:{assignment_date.isoformat()}",
@@ -289,6 +319,212 @@ def _select_missions_for_assignment(
     return selected
 
 
+def _mission_created_at_sort_value(mission: Mission) -> datetime:
+    if mission.created_at is None:
+        return datetime.min
+    if mission.created_at.tzinfo is not None:
+        return mission.created_at.replace(tzinfo=None)
+    return mission.created_at
+
+
+def _mission_points(is_offline: bool) -> int:
+    return MISSION_OFFLINE_POINTS if is_offline else MISSION_DAILY_POINTS
+
+
+def _resolve_mission_level(points: int) -> tuple[dict, dict | None]:
+    current_level = MISSION_LEVELS[0]
+
+    for level in MISSION_LEVELS:
+        if points >= level["min_points"]:
+            current_level = level
+        else:
+            return current_level, level
+
+    return current_level, None
+
+
+def _weekly_goal_label(completed_this_week: int) -> str:
+    if completed_this_week >= MISSION_WEEKLY_GOAL:
+        return "本週共學目標已達成，繼續累積家庭星星吧。"
+
+    remaining = MISSION_WEEKLY_GOAL - completed_this_week
+    return f"再完成 {remaining} 個任務，即可達成本週共學目標。"
+
+
+def _encouragement_message(
+    *,
+    streak_days: int,
+    total_completed: int,
+    points_to_next_level: int,
+    next_level: dict | None,
+) -> str:
+    if total_completed == 0:
+        return "完成第一個任務即可開始累積家庭星星，建立親子共學節奏。"
+
+    if streak_days >= 7:
+        return f"已連續陪孩子完成 {streak_days} 天任務，這種穩定陪伴最有助把詞語帶進日常生活。"
+
+    if next_level and points_to_next_level > 0:
+        return f"距離「{next_level['title']}」還差 {points_to_next_level} 顆家庭星星。"
+
+    return "今天繼續完成一個任務，讓孩子把新詞語說進真實情境。"
+
+
+def _build_mission_summary_payload(
+    *,
+    child_id: str,
+    local_today: date,
+    completed_rows: list[tuple[MissionAssignment, Mission]],
+) -> dict:
+    completed_dates = {
+        assignment.assignment_date
+        for assignment, _ in completed_rows
+        if assignment.assignment_date is not None
+    }
+
+    streak_days = 0
+    streak_cursor = local_today
+    while streak_cursor in completed_dates:
+        streak_days += 1
+        streak_cursor -= timedelta(days=1)
+
+    week_start = local_today - timedelta(days=local_today.weekday())
+    completed_today = sum(
+        1
+        for assignment, _ in completed_rows
+        if assignment.assignment_date == local_today
+    )
+    completed_this_week = sum(
+        1
+        for assignment, _ in completed_rows
+        if week_start <= assignment.assignment_date <= local_today
+    )
+    family_points = sum(
+        _mission_points(mission.is_offline)
+        for _, mission in completed_rows
+    )
+    total_completed = len(completed_rows)
+
+    current_level, next_level = _resolve_mission_level(family_points)
+    next_level_points = (
+        next_level["min_points"] if next_level else current_level["min_points"]
+    )
+    points_to_next_level = max(next_level_points - family_points, 0)
+
+    recent_completions = [
+        MissionCompletionHistoryItem(
+            mission_id=mission.id,
+            title=mission.title,
+            context=_enum_value(mission.context),
+            is_offline=mission.is_offline,
+            surface=_enum_value(assignment.surface),
+            assignment_date=assignment.assignment_date,
+            completed_at=assignment.completed_at,
+            completion_notes=assignment.completion_notes,
+            target_words=mission.target_words or [],
+            points_earned=_mission_points(mission.is_offline),
+        )
+        for assignment, mission in completed_rows[:6]
+    ]
+
+    return MissionSummaryResponse(
+        child_id=child_id,
+        local_today=local_today,
+        completed_today=completed_today,
+        completed_this_week=completed_this_week,
+        weekly_goal=MISSION_WEEKLY_GOAL,
+        streak_days=streak_days,
+        total_completed=total_completed,
+        family_points=family_points,
+        level=current_level["level"],
+        level_title=current_level["title"],
+        next_level_points=next_level_points,
+        points_to_next_level=points_to_next_level,
+        next_reward_label=_weekly_goal_label(completed_this_week),
+        encouragement=_encouragement_message(
+            streak_days=streak_days,
+            total_completed=total_completed,
+            points_to_next_level=points_to_next_level,
+            next_level=next_level,
+        ),
+        recent_completions=recent_completions,
+    ).model_dump()
+
+
+def _was_completed_recently(
+    completed_at: datetime | None,
+    *,
+    assignment_date: date,
+) -> bool:
+    if completed_at is None:
+        return False
+
+    completed_local_date = _ensure_utc(completed_at).astimezone(HKT).date()
+    return (
+        assignment_date - completed_local_date
+    ).days < MISSION_COMPLETION_COOLDOWN_DAYS
+
+
+async def _get_assignment_history(
+    *,
+    child_id: str,
+    mission_ids: list[str],
+    assignment_date: date,
+    db: AsyncSession,
+) -> dict[str, tuple[date | None, datetime | None]]:
+    if not mission_ids:
+        return {}
+
+    history_result = await db.execute(
+        select(
+            MissionAssignment.mission_id,
+            sa.func.max(MissionAssignment.assignment_date).label(
+                "last_assignment_date"
+            ),
+            sa.func.max(MissionAssignment.completed_at).label("last_completed_at"),
+        )
+        .where(
+            MissionAssignment.child_id == child_id,
+            MissionAssignment.mission_id.in_(mission_ids),
+            MissionAssignment.assignment_date < assignment_date,
+        )
+        .group_by(MissionAssignment.mission_id)
+    )
+
+    return {
+        row.mission_id: (row.last_assignment_date, row.last_completed_at)
+        for row in history_result
+    }
+
+
+def _rank_candidate_missions(
+    missions: list[Mission],
+    *,
+    assignment_history: dict[str, tuple[date | None, datetime | None]],
+    assignment_date: date,
+) -> list[Mission]:
+    def mission_sort_key(mission: Mission) -> tuple:
+        last_assignment_date, last_completed_at = assignment_history.get(
+            mission.id,
+            (None, None),
+        )
+        recently_completed = _was_completed_recently(
+            last_completed_at,
+            assignment_date=assignment_date,
+        )
+
+        return (
+            recently_completed,
+            last_assignment_date is not None,
+            last_assignment_date or date.min,
+            mission.sort_order if mission.sort_order is not None else 0,
+            _mission_created_at_sort_value(mission),
+            mission.id,
+        )
+
+    return sorted(missions, key=mission_sort_key)
+
+
 async def _generate_assignments_for_date(
     *,
     child: Child,
@@ -317,8 +553,19 @@ async def _generate_assignments_for_date(
         .order_by(Mission.sort_order.asc(), Mission.created_at.asc())
     )
     candidate_missions = catalog_result.scalars().all()
-    selected_missions = _select_missions_for_assignment(
+    assignment_history = await _get_assignment_history(
+        child_id=child.id,
+        mission_ids=[mission.id for mission in candidate_missions],
+        assignment_date=assignment_date,
+        db=db,
+    )
+    ranked_missions = _rank_candidate_missions(
         candidate_missions,
+        assignment_history=assignment_history,
+        assignment_date=assignment_date,
+    )
+    selected_missions = _select_missions_for_assignment(
+        ranked_missions,
         limit=MAX_OFFLINE_ASSIGNMENTS if is_offline else MAX_DAILY_ASSIGNMENTS,
     )
 
@@ -326,6 +573,10 @@ async def _generate_assignments_for_date(
         return
 
     for index, mission in enumerate(selected_missions, start=1):
+        last_assignment_date, last_completed_at = assignment_history.get(
+            mission.id,
+            (None, None),
+        )
         db.add(
             MissionAssignment(
                 id=str(uuid.uuid4()),
@@ -337,14 +588,29 @@ async def _generate_assignments_for_date(
                 surface=mission.surface,
                 priority=index,
                 selection_reason=(
-                    "Generated from published offline mission catalog"
+                    "Rotated from published offline mission catalog"
                     if is_offline
-                    else "Generated from published daily mission catalog"
+                    else "Rotated from published daily mission catalog"
                 ),
                 selection_metadata={
                     "catalog_sort_order": mission.sort_order,
                     "context": mission.context.value,
                     "is_offline": is_offline,
+                    "last_assignment_date": (
+                        last_assignment_date.isoformat()
+                        if last_assignment_date
+                        else None
+                    ),
+                    "last_completed_at": (
+                        last_completed_at.isoformat()
+                        if last_completed_at
+                        else None
+                    ),
+                    "completion_cooldown_days": MISSION_COMPLETION_COOLDOWN_DAYS,
+                    "deferred_recent_completion": _was_completed_recently(
+                        last_completed_at,
+                        assignment_date=assignment_date,
+                    ),
                 },
             )
         )
@@ -425,7 +691,7 @@ async def get_daily_missions(
 
     return await _get_assigned_or_catalog_missions(
         child=child,
-        assignment_date=datetime.utcnow().date(),
+        assignment_date=_current_hkt_date(),
         is_offline=False,
         surfaces=[MissionSurface.CHILD, MissionSurface.BOTH],
         db=db,
@@ -443,14 +709,47 @@ async def get_offline_missions(
 
     return await _get_assigned_or_catalog_missions(
         child=child,
-        assignment_date=datetime.utcnow().date(),
+        assignment_date=_current_hkt_date(),
         is_offline=True,
         surfaces=[MissionSurface.PARENT, MissionSurface.BOTH],
         db=db,
     )
 
 
-@router.post("/{mission_id}/complete/{child_id}")
+@router.get("/{child_id}/summary", response_model=MissionSummaryResponse)
+async def get_mission_summary(
+    child_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get mission completion history and derived incentive summary for a child."""
+    child = await _ensure_child_belongs_to_user(child_id, current_user, db)
+    local_today = _current_hkt_date()
+
+    completed_result = await db.execute(
+        select(MissionAssignment, Mission)
+        .join(Mission, MissionAssignment.mission_id == Mission.id)
+        .where(
+            MissionAssignment.child_id == child.id,
+            MissionAssignment.status == MissionAssignmentStatus.COMPLETED,
+            MissionAssignment.completed_at.is_not(None),
+        )
+        .order_by(
+            MissionAssignment.assignment_date.desc(),
+            MissionAssignment.completed_at.desc(),
+            Mission.title.asc(),
+        )
+    )
+    completed_rows = completed_result.all()
+
+    return _build_mission_summary_payload(
+        child_id=child.id,
+        local_today=local_today,
+        completed_rows=completed_rows,
+    )
+
+
+@router.post("/{mission_id}/complete/{child_id}", response_model=MissionProgressResponse)
 async def complete_mission(
     mission_id: str,
     child_id: str,
@@ -485,12 +784,12 @@ async def complete_mission(
         )
         db.add(progress)
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     progress.completed = progress_data.completed
     progress.parent_notes = progress_data.parent_notes
     progress.completed_date = now if progress_data.completed else None
 
-    assignment_date = now.date()
+    assignment_date = _current_hkt_date(now)
     assignment_result = await db.execute(
         select(MissionAssignment).where(
             MissionAssignment.child_id == child_id,
@@ -525,22 +824,5 @@ async def complete_mission(
     
     await db.commit()
     await db.refresh(progress)
-    
+
     return progress
-
-
-@router.get("/{child_id}/progress", response_model=List[MissionProgressResponse])
-async def get_mission_progress(
-    child_id: str,
-    current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get child's mission completion history"""
-    await _ensure_child_belongs_to_user(child_id, current_user, db)
-
-    result = await db.execute(
-        select(MissionProgress).where(MissionProgress.child_id == child_id)
-    )
-    progress_list = result.scalars().all()
-    
-    return progress_list

@@ -27,6 +27,55 @@ from app.services.child_metrics import sync_child_metrics
 
 router = APIRouter()
 
+MAX_SESSION_MINUTES = 90
+
+
+def _is_my_collection_category_name(
+    category_name: str | None,
+    category_name_cantonese: str | None,
+) -> bool:
+    normalized_name = (category_name or "").strip().lower()
+    normalized_cantonese = (category_name_cantonese or "").strip()
+    return normalized_name == "my collection" or normalized_cantonese in {
+        "我的",
+        "我的收藏",
+    }
+
+
+async def _get_child_owned_collection_progress_counts(
+    child_id: str,
+    db: AsyncSession,
+) -> tuple[int, int]:
+    total_words_result = await db.execute(
+        select(func.count(Word.id)).where(
+            Word.is_active == True,
+            Word.created_by_child_id == child_id,
+        )
+    )
+    total_words = total_words_result.scalar_one() or 0
+
+    if total_words == 0:
+        return 0, 0
+
+    mastered_words_result = await db.execute(
+        select(func.count(WordProgress.id))
+        .select_from(Word)
+        .join(
+            WordProgress,
+            and_(
+                WordProgress.word_id == Word.id,
+                WordProgress.child_id == child_id,
+                WordProgress.mastered.is_(True),
+            ),
+        )
+        .where(
+            Word.is_active == True,
+            Word.created_by_child_id == child_id,
+        )
+    )
+    mastered_words = mastered_words_result.scalar_one() or 0
+    return total_words, mastered_words
+
 
 def _ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
@@ -36,7 +85,20 @@ def _ensure_utc(dt: datetime) -> datetime:
 
 def _duration_minutes(start_time: datetime, end_time: datetime) -> int:
     total_seconds = max((end_time - start_time).total_seconds(), 0)
-    return int(total_seconds // 60)
+    if total_seconds <= 0:
+        return 0
+    return max(1, int((total_seconds + 59) // 60))
+
+
+def _bounded_duration_minutes(start_time: datetime, end_time: datetime) -> int:
+    return min(_duration_minutes(start_time, end_time), MAX_SESSION_MINUTES)
+
+
+def _auto_closed_duration_minutes(start_time: datetime, end_time: datetime) -> int:
+    raw_duration_minutes = _duration_minutes(start_time, end_time)
+    if raw_duration_minutes > MAX_SESSION_MINUTES:
+        return 0
+    return raw_duration_minutes
 
 
 def _merge_intervals(
@@ -112,7 +174,10 @@ async def start_learning_session(
         open_start = _ensure_utc(open_session.start_time)
         closed_at = max(open_start, new_session_start)
         open_session.end_time = closed_at
-        open_session.duration_minutes = _duration_minutes(open_start, closed_at)
+        open_session.duration_minutes = _auto_closed_duration_minutes(
+            open_start,
+            closed_at,
+        )
     
     session = LearningSession(
         id=str(uuid.uuid4()),
@@ -158,8 +223,10 @@ async def end_learning_session(
     
     # Calculate duration
     if session.end_time and session.start_time:
-        duration = (session.end_time - session.start_time).total_seconds() / 60
-        session.duration_minutes = int(duration)
+        session.duration_minutes = _bounded_duration_minutes(
+            _ensure_utc(session.start_time),
+            _ensure_utc(session.end_time),
+        )
     
     # Calculate XP earned
     session.xp_earned = len(session.words_encountered) * 10 + session.interactions_count * 5
@@ -348,14 +415,29 @@ async def get_progress_stats(
 
         for row in learned_category_rows:
             total_for_category = total_words_by_category.get(row.category_id, 0)
+            mastered_for_category = row.mastered_words or 0
+
+            if _is_my_collection_category_name(
+                row.category_name,
+                row.category_name_cantonese,
+            ):
+                total_for_category, mastered_for_category = (
+                    await _get_child_owned_collection_progress_counts(
+                        child_id,
+                        db,
+                    )
+                )
+                if total_for_category == 0:
+                    continue
+
             progress_percentage = round(
-                ((row.mastered_words or 0) / total_for_category) * 100,
+                (mastered_for_category / total_for_category) * 100,
             ) if total_for_category > 0 else 0
             category_progress.append(
                 {
                     "category": row.category_name_cantonese or row.category_name,
                     "progress": int(progress_percentage),
-                    "mastered": row.mastered_words or 0,
+                    "mastered": mastered_for_category,
                     "total": total_for_category,
                 }
             )

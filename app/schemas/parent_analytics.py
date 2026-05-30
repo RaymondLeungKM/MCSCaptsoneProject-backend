@@ -172,6 +172,26 @@ class CategoryProgress(BaseModel):
     recent_activity: int  # Words learned in last 7 days
 
 
+class WeeklyDeltaMetric(BaseModel):
+    """Week-over-week change for one metric"""
+    current: int
+    previous: int
+    delta: int
+
+
+class WeeklyDeltaResponse(BaseModel):
+    """Comparison between the current week and the previous week"""
+    current_week_start_date: date
+    current_week_end_date: date
+    previous_week_start_date: date
+    previous_week_end_date: date
+    words_learned: WeeklyDeltaMetric
+    learning_time: WeeklyDeltaMetric
+    sessions: WeeklyDeltaMetric
+    xp_earned: WeeklyDeltaMetric
+    active_days: WeeklyDeltaMetric
+
+
 class DashboardSummaryResponse(BaseModel):
     """Comprehensive dashboard summary"""
     child_id: str
@@ -188,6 +208,7 @@ class DashboardSummaryResponse(BaseModel):
     weekly_sessions: int
     weekly_words_learned: int
     weekly_xp_earned: int
+    weekly_delta: Optional[WeeklyDeltaResponse] = None
     
     # Category breakdown
     category_progress: List[CategoryProgress]
