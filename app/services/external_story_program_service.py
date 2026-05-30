@@ -65,6 +65,15 @@ class ExternalStoryProgramService:
 
         return program_dir
 
+    def availability_error(self) -> Optional[str]:
+        """Return a human-readable availability error, if any."""
+        try:
+            self._resolve_program_dir()
+        except ExternalStoryProgramError as error:
+            return str(error)
+
+        return None
+
     @staticmethod
     def _resolve_python_bin(program_dir: Path) -> str:
         configured_bin = (settings.EXTERNAL_STORY_PYTHON_BIN or "").strip() or "python3"

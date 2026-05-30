@@ -41,6 +41,7 @@ import argparse
 import asyncio
 import base64
 import json
+import mimetypes
 import os
 import sys
 import time
@@ -365,6 +366,22 @@ class ImageTester:
         self.results: list[TestResult] = []
         self.semaphore = asyncio.Semaphore(concurrency)
 
+    def _build_image_src(self, image_path: Optional[str]) -> Optional[str]:
+        """Embed images into the report so the HTML stays portable."""
+        if not image_path:
+            return None
+
+        image_file = self.output_dir / image_path
+        if not image_file.exists():
+            return None
+
+        mime_type, _ = mimetypes.guess_type(str(image_file))
+        if not mime_type:
+            mime_type = "image/jpeg"
+
+        encoded = base64.b64encode(image_file.read_bytes()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+
     async def run_single_test(
         self,
         client: httpx.AsyncClient,
@@ -454,265 +471,219 @@ class ImageTester:
             await asyncio.gather(*tasks)
 
     def generate_report(self) -> str:
-        """Generate an HTML comparison report."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        total = len(self.results)
-        success = sum(1 for r in self.results if r.success)
-        failed = total - success
-        avg_time = sum(r.elapsed for r in self.results) / max(total, 1)
-        total_time = sum(r.elapsed for r in self.results)
+                """Generate an HTML comparison report."""
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                total = len(self.results)
+                success = sum(1 for r in self.results if r.success)
+                failed = total - success
+                avg_time = sum(r.elapsed for r in self.results) / max(total, 1)
+                total_time = sum(r.elapsed for r in self.results)
 
-        # Group results for smart grid layout
-        # Group by word → then sorted by model/prompt
-        by_word: dict[str, list[TestResult]] = {}
-        for r in self.results:
-            by_word.setdefault(r.word, []).append(r)
+                by_word: dict[str, list[TestResult]] = {}
+                for result in self.results:
+                        by_word.setdefault(result.word, []).append(result)
 
-        # Detect comparison dimensions
-        all_models = sorted(set(r.model_key for r in self.results))
-        all_prompts = sorted(set(r.prompt_key for r in self.results))
-        all_guidances = sorted(set(r.guidance for r in self.results))
-        all_steps = sorted(set(r.steps for r in self.results))
+                all_models = sorted(set(r.model_key for r in self.results))
+                all_prompts = sorted(set(r.prompt_key for r in self.results))
 
-        # Determine comparison type for layout
-        is_model_compare = len(all_models) > 1
-        is_prompt_compare = len(all_prompts) > 1
-        is_param_compare = len(all_guidances) > 1 or len(all_steps) > 1
-
-        html = f"""<!DOCTYPE html>
+                html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>Image Generation Comparison Report</title>
 <style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #f5f5f7; color: #1d1d1f; padding: 24px; }}
-  .header {{ text-align: center; margin-bottom: 32px; }}
-  .header h1 {{ font-size: 28px; font-weight: 700; margin-bottom: 8px; }}
-  .header .subtitle {{ color: #86868b; font-size: 14px; }}
-
-  .stats-bar {{
-    display: flex; justify-content: center; gap: 32px; padding: 16px; margin-bottom: 24px;
-    background: white; border-radius: 16px; box-shadow: 0 2px 10px rgba(0,0,0,0.04);
-  }}
-  .stat {{ text-align: center; }}
-  .stat .value {{ font-size: 28px; font-weight: 700; }}
-  .stat .label {{ font-size: 12px; color: #86868b; margin-top: 2px; }}
-  .stat.success .value {{ color: #34c759; }}
-  .stat.failed .value {{ color: #ff3b30; }}
-  .stat.time .value {{ color: #007aff; }}
-
-  .section {{ margin-bottom: 32px; }}
-  .section-title {{
-    font-size: 20px; font-weight: 600; margin-bottom: 16px; padding-bottom: 8px;
-    border-bottom: 2px solid #e5e5ea; display: flex; align-items: center; gap: 8px;
-  }}
-  .section-title .word-cn {{ font-size: 16px; color: #86868b; }}
-
-  /* ── Comparison Grid ── */
-  .compare-grid {{
-    display: grid; gap: 16px;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  }}
-  .compare-grid.cols-2 {{ grid-template-columns: repeat(2, 1fr); }}
-  .compare-grid.cols-3 {{ grid-template-columns: repeat(3, 1fr); }}
-  .compare-grid.cols-4 {{ grid-template-columns: repeat(4, 1fr); }}
-
-  .card {{
-    background: white; border-radius: 16px; overflow: hidden;
-    box-shadow: 0 2px 10px rgba(0,0,0,0.06); transition: transform 0.2s, box-shadow 0.2s;
-  }}
-  .card:hover {{ transform: translateY(-3px); box-shadow: 0 8px 24px rgba(0,0,0,0.1); }}
-  .card.error {{ opacity: 0.5; }}
-
-  .card img {{
-    width: 100%; aspect-ratio: 1; object-fit: cover; display: block; background: #f5f5f7;
-  }}
-  .card .card-body {{ padding: 12px 14px; }}
-  .card .card-title {{ font-size: 14px; font-weight: 600; margin-bottom: 6px; }}
-  .card .card-meta {{ font-size: 11px; color: #86868b; line-height: 1.7; }}
-
-  .badge {{
-    display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 10px; font-weight: 600;
-  }}
-  .badge-model {{ background: #f0e6ff; color: #7c3aed; }}
-  .badge-prompt {{ background: #e6f7ff; color: #0077cc; }}
-  .badge-success {{ background: #d4edda; color: #155724; }}
-  .badge-error {{ background: #f8d7da; color: #721c24; }}
-  .badge-time {{ background: #fff3cd; color: #856404; }}
-  .badge-size {{ background: #e8f5e9; color: #2e7d32; }}
-  .badge-guidance {{ background: #fff0f6; color: #c41d7f; }}
-  .badge-steps {{ background: #f6ffed; color: #389e0d; }}
-
-  .prompt-text {{
-    font-size: 10px; color: #aaa; margin-top: 6px; padding: 6px 8px;
-    background: #fafafa; border-radius: 6px; word-break: break-all;
-    max-height: 48px; overflow: hidden; line-height: 1.5;
-  }}
-
-  .error-card {{
-    padding: 24px; text-align: center; background: #fff5f5; border: 2px dashed #ffccc7;
-    border-radius: 16px; color: #cf1322;
-  }}
-  .error-card .error-icon {{ font-size: 48px; margin-bottom: 8px; }}
-  .error-card .error-msg {{ font-size: 12px; color: #999; margin-top: 4px; }}
-
-  /* ── Summary Table ── */
-  .summary-table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.04); }}
-  .summary-table th {{ background: #f5f5f7; padding: 10px 14px; font-size: 12px; text-align: left; color: #86868b; font-weight: 600; }}
-  .summary-table td {{ padding: 10px 14px; font-size: 13px; border-top: 1px solid #f0f0f0; }}
-  .summary-table tr:hover td {{ background: #fafafa; }}
-
-  .legend {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }}
-  .legend-item {{ display: flex; align-items: center; gap: 4px; font-size: 12px; color: #666; }}
-
-  @media (max-width: 768px) {{
-    .compare-grid {{ grid-template-columns: repeat(2, 1fr) !important; gap: 10px; }}
-    .stats-bar {{ flex-wrap: wrap; gap: 16px; }}
-  }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #f5f5f7; color: #1d1d1f; padding: 24px; }}
+    .header {{ text-align: center; margin-bottom: 32px; }}
+    .header h1 {{ font-size: 28px; font-weight: 700; margin-bottom: 8px; }}
+    .header .subtitle {{ color: #86868b; font-size: 14px; }}
+    .stats-bar {{ display: flex; justify-content: center; gap: 32px; padding: 16px; margin-bottom: 24px; background: white; border-radius: 16px; box-shadow: 0 2px 10px rgba(0,0,0,0.04); }}
+    .stat {{ text-align: center; }}
+    .stat .value {{ font-size: 28px; font-weight: 700; }}
+    .stat .label {{ font-size: 12px; color: #86868b; margin-top: 2px; }}
+    .stat.success .value {{ color: #34c759; }}
+    .stat.failed .value {{ color: #ff3b30; }}
+    .stat.time .value {{ color: #007aff; }}
+    .section {{ margin-bottom: 32px; }}
+    .section-title {{ font-size: 20px; font-weight: 600; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 2px solid #e5e5ea; display: flex; align-items: center; gap: 8px; }}
+    .section-title .word-cn {{ font-size: 16px; color: #86868b; }}
+    .compare-grid {{ display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }}
+    .compare-grid.cols-2 {{ grid-template-columns: repeat(2, 1fr); }}
+    .compare-grid.cols-3 {{ grid-template-columns: repeat(3, 1fr); }}
+    .compare-grid.cols-4 {{ grid-template-columns: repeat(4, 1fr); }}
+    .card {{ background: white; border-radius: 16px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.06); transition: transform 0.2s, box-shadow 0.2s; }}
+    .card:hover {{ transform: translateY(-3px); box-shadow: 0 8px 24px rgba(0,0,0,0.1); }}
+    .card img {{ width: 100%; aspect-ratio: 1; object-fit: cover; display: block; background: #f5f5f7; }}
+    .card .card-body {{ padding: 12px 14px; }}
+    .card .card-title {{ font-size: 14px; font-weight: 600; margin-bottom: 6px; }}
+    .card .card-meta {{ font-size: 11px; color: #86868b; line-height: 1.7; }}
+    .badge {{ display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 10px; font-weight: 600; }}
+    .badge-model {{ background: #f0e6ff; color: #7c3aed; }}
+    .badge-prompt {{ background: #e6f7ff; color: #0077cc; }}
+    .badge-success {{ background: #d4edda; color: #155724; }}
+    .badge-error {{ background: #f8d7da; color: #721c24; }}
+    .badge-time {{ background: #fff3cd; color: #856404; }}
+    .badge-size {{ background: #e8f5e9; color: #2e7d32; }}
+    .badge-guidance {{ background: #fff0f6; color: #c41d7f; }}
+    .badge-steps {{ background: #f6ffed; color: #389e0d; }}
+    .prompt-text {{ font-size: 10px; color: #aaa; margin-top: 6px; padding: 6px 8px; background: #fafafa; border-radius: 6px; word-break: break-all; max-height: 48px; overflow: hidden; line-height: 1.5; }}
+    .error-card {{ padding: 24px; text-align: center; background: #fff5f5; border: 2px dashed #ffccc7; border-radius: 16px; color: #cf1322; }}
+    .error-card .error-icon {{ font-size: 48px; margin-bottom: 8px; }}
+    .error-card .error-msg {{ font-size: 12px; color: #999; margin-top: 4px; }}
+    .summary-table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.04); }}
+    .summary-table th {{ background: #f5f5f7; padding: 10px 14px; font-size: 12px; text-align: left; color: #86868b; font-weight: 600; }}
+    .summary-table td {{ padding: 10px 14px; font-size: 13px; border-top: 1px solid #f0f0f0; }}
+    .summary-table tr:hover td {{ background: #fafafa; }}
+    .legend {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }}
+    .legend-item {{ display: flex; align-items: center; gap: 4px; font-size: 12px; color: #666; }}
+    @media (max-width: 768px) {{
+        .compare-grid {{ grid-template-columns: repeat(2, 1fr) !important; gap: 10px; }}
+        .stats-bar {{ flex-wrap: wrap; gap: 16px; }}
+    }}
 </style>
 </head>
 <body>
 <div class="header">
-  <h1>Image Generation Comparison Report</h1>
-  <p class="subtitle">Generated {timestamp} · {total} images across {len(all_models)} model(s) × {len(all_prompts)} prompt(s)</p>
+    <h1>Image Generation Comparison Report</h1>
+    <p class="subtitle">Generated {timestamp} · {total} images across {len(all_models)} model(s) × {len(all_prompts)} prompt(s)</p>
 </div>
-
 <div class="stats-bar">
-  <div class="stat"><div class="value">{total}</div><div class="label">Total Tests</div></div>
-  <div class="stat success"><div class="value">{success}</div><div class="label">Successful</div></div>
-  <div class="stat failed"><div class="value">{failed}</div><div class="label">Failed</div></div>
-  <div class="stat time"><div class="value">{avg_time:.1f}s</div><div class="label">Avg Time</div></div>
-  <div class="stat"><div class="value">{total_time:.0f}s</div><div class="label">Total Time</div></div>
+    <div class="stat"><div class="value">{total}</div><div class="label">Total Tests</div></div>
+    <div class="stat success"><div class="value">{success}</div><div class="label">Successful</div></div>
+    <div class="stat failed"><div class="value">{failed}</div><div class="label">Failed</div></div>
+    <div class="stat time"><div class="value">{avg_time:.1f}s</div><div class="label">Avg Time</div></div>
+    <div class="stat"><div class="value">{total_time:.0f}s</div><div class="label">Total Time</div></div>
 </div>
 """
 
-        # Legend
-        html += '<div class="legend">\n'
-        for mk in all_models:
-            html += f'  <div class="legend-item"><span class="badge badge-model">{MODELS[mk]["name"]}</span></div>\n'
-        html += '</div>\n'
+                html += '<div class="legend">\n'
+                for model_key in all_models:
+                        html += f'  <div class="legend-item"><span class="badge badge-model">{MODELS[model_key]["name"]}</span></div>\n'
+                html += '</div>\n'
 
-        # Determine grid columns
-        num_variants = max(len(all_models), len(all_prompts), 1)
-        cols_cls = f"cols-{min(num_variants, 4)}" if num_variants <= 4 else ""
+                num_variants = max(len(all_models), len(all_prompts), 1)
+                cols_cls = f"cols-{min(num_variants, 4)}" if num_variants <= 4 else ""
 
-        # ── Per-word sections ──
-        for word, results in by_word.items():
-            word_cn = results[0].word_cn if results else ""
-            html += f'<div class="section">\n'
-            html += f'  <div class="section-title">{word} <span class="word-cn">{word_cn}</span></div>\n'
-            html += f'  <div class="compare-grid {cols_cls}">\n'
+                for word, word_results in by_word.items():
+                        word_cn = word_results[0].word_cn if word_results else ""
+                        html += f'<div class="section">\n'
+                        html += f'  <div class="section-title">{word} <span class="word-cn">{word_cn}</span></div>\n'
+                        html += f'  <div class="compare-grid {cols_cls}">\n'
 
-            # Sort: by model, then by prompt, then by guidance, then by steps
-            results.sort(key=lambda r: (r.model_key, r.prompt_key, r.guidance, r.steps))
+                        word_results.sort(key=lambda r: (r.model_key, r.prompt_key, r.guidance, r.steps))
 
-            for r in results:
-                if r.success and r.image_path:
-                    html += f"""    <div class="card">
-      <img src="{r.image_path}" alt="{r.word}" loading="lazy" />
-      <div class="card-body">
-        <div class="card-title">{r.word} ({r.word_cn})</div>
-        <div class="card-meta">
-          <span class="badge badge-model">{r.model_name}</span>
-          <span class="badge badge-prompt">{r.prompt_name}</span><br/>
-          <span class="badge badge-guidance">g={r.guidance}</span>
-          <span class="badge badge-steps">steps={r.steps}</span>
-          <span class="badge badge-time">{r.elapsed:.1f}s</span>
-          <span class="badge badge-size">{r.file_size//1024}KB</span>
-        </div>
-        <div class="prompt-text">{r.prompt_text[:200]}</div>
-      </div>
-    </div>\n"""
-                else:
-                    html += f"""    <div class="error-card">
-      <div class="error-icon">❌</div>
-      <div><strong>{r.word}</strong></div>
-      <div><span class="badge badge-model">{r.model_name}</span> <span class="badge badge-prompt">{r.prompt_name}</span></div>
-      <div class="error-msg">{r.error[:120] if r.error else 'Unknown error'}</div>
-    </div>\n"""
+                        for result in word_results:
+                                image_src = self._build_image_src(result.image_path)
+                                if result.success and image_src:
+                                        html += f"""    <div class="card">
+            <img src="{image_src}" alt="{result.word}" loading="lazy" />
+            <div class="card-body">
+                <div class="card-title">{result.word} ({result.word_cn})</div>
+                <div class="card-meta">
+                    <span class="badge badge-model">{result.model_name}</span>
+                    <span class="badge badge-prompt">{result.prompt_name}</span><br/>
+                    <span class="badge badge-guidance">g={result.guidance}</span>
+                    <span class="badge badge-steps">steps={result.steps}</span>
+                    <span class="badge badge-time">{result.elapsed:.1f}s</span>
+                    <span class="badge badge-size">{result.file_size//1024}KB</span>
+                </div>
+                <div class="prompt-text">{result.prompt_text[:200]}</div>
+            </div>
+        </div>\n"""
+                                elif result.success and result.image_path:
+                                        html += f"""    <div class="error-card">
+            <div class="error-icon">⚠️</div>
+            <div><strong>{result.word}</strong></div>
+            <div><span class="badge badge-model">{result.model_name}</span> <span class="badge badge-prompt">{result.prompt_name}</span></div>
+            <div class="error-msg">Expected image file is missing: {result.image_path}</div>
+        </div>\n"""
+                                else:
+                                        message = result.error[:120] if result.error else "Unknown error"
+                                        html += f"""    <div class="error-card">
+            <div class="error-icon">❌</div>
+            <div><strong>{result.word}</strong></div>
+            <div><span class="badge badge-model">{result.model_name}</span> <span class="badge badge-prompt">{result.prompt_name}</span></div>
+            <div class="error-msg">{message}</div>
+        </div>\n"""
 
-            html += '  </div>\n</div>\n'
+                        html += '  </div>\n</div>\n'
 
-        # ── Summary Table ──
-        html += """
+                html += """
 <div class="section">
-  <div class="section-title">Detailed Results</div>
-  <table class="summary-table">
-    <thead><tr>
-      <th>#</th><th>Word</th><th>Model</th><th>Prompt</th>
-      <th>Guidance</th><th>Steps</th><th>Time</th><th>Size</th><th>Status</th>
-    </tr></thead>
-    <tbody>
+    <div class="section-title">Detailed Results</div>
+    <table class="summary-table">
+        <thead><tr>
+            <th>#</th><th>Word</th><th>Model</th><th>Prompt</th>
+            <th>Guidance</th><th>Steps</th><th>Time</th><th>Size</th><th>Status</th>
+        </tr></thead>
+        <tbody>
 """
-        for i, r in enumerate(self.results, 1):
-            status = '<span class="badge badge-success">✓ OK</span>' if r.success else f'<span class="badge badge-error">✗ {r.error[:40]}</span>'
-            size = f"{r.file_size // 1024}KB" if r.file_size else "—"
-            html += f"""      <tr>
-        <td>{i}</td><td>{r.word} {r.word_cn}</td><td>{r.model_name}</td><td>{r.prompt_name}</td>
-        <td>{r.guidance}</td><td>{r.steps}</td><td>{r.elapsed:.1f}s</td><td>{size}</td><td>{status}</td>
-      </tr>\n"""
+                for index, result in enumerate(self.results, 1):
+                        status = '<span class="badge badge-success">✓ OK</span>' if result.success else f'<span class="badge badge-error">✗ {result.error[:40]}</span>'
+                        size = f"{result.file_size // 1024}KB" if result.file_size else "—"
+                        html += f"""      <tr>
+                <td>{index}</td><td>{result.word} {result.word_cn}</td><td>{result.model_name}</td><td>{result.prompt_name}</td>
+                <td>{result.guidance}</td><td>{result.steps}</td><td>{result.elapsed:.1f}s</td><td>{size}</td><td>{status}</td>
+            </tr>\n"""
 
-        html += """    </tbody>
-  </table>
+                html += """    </tbody>
+    </table>
 </div>
 
-<!-- ── Model Performance Summary ── -->
 <div class="section">
-  <div class="section-title">Performance by Model</div>
-  <table class="summary-table">
-    <thead><tr><th>Model</th><th>Tests</th><th>Success</th><th>Failed</th><th>Avg Time</th><th>Avg Size</th></tr></thead>
-    <tbody>
+    <div class="section-title">Performance by Model</div>
+    <table class="summary-table">
+        <thead><tr><th>Model</th><th>Tests</th><th>Success</th><th>Failed</th><th>Avg Time</th><th>Avg Size</th></tr></thead>
+        <tbody>
 """
-        for mk in all_models:
-            model_results = [r for r in self.results if r.model_key == mk]
-            m_total = len(model_results)
-            m_success = sum(1 for r in model_results if r.success)
-            m_failed = m_total - m_success
-            m_avg_time = sum(r.elapsed for r in model_results) / max(m_total, 1)
-            m_avg_size = sum(r.file_size for r in model_results if r.success) / max(m_success, 1)
-            html += f"""      <tr>
-        <td><span class="badge badge-model">{MODELS[mk]['name']}</span></td>
-        <td>{m_total}</td><td>{m_success}</td><td>{m_failed}</td>
-        <td>{m_avg_time:.1f}s</td><td>{m_avg_size/1024:.0f}KB</td>
-      </tr>\n"""
+                for model_key in all_models:
+                        model_results = [r for r in self.results if r.model_key == model_key]
+                        total_results = len(model_results)
+                        successful_results = sum(1 for r in model_results if r.success)
+                        failed_results = total_results - successful_results
+                        avg_model_time = sum(r.elapsed for r in model_results) / max(total_results, 1)
+                        avg_model_size = sum(r.file_size for r in model_results if r.success) / max(successful_results, 1)
+                        html += f"""      <tr>
+                <td><span class="badge badge-model">{MODELS[model_key]['name']}</span></td>
+                <td>{total_results}</td><td>{successful_results}</td><td>{failed_results}</td>
+                <td>{avg_model_time:.1f}s</td><td>{avg_model_size/1024:.0f}KB</td>
+            </tr>\n"""
 
-        html += """    </tbody>
-  </table>
+                html += """    </tbody>
+    </table>
 </div>
 
-<!-- ── Prompt Style Summary ── -->
 <div class="section">
-  <div class="section-title">Performance by Prompt Style</div>
-  <table class="summary-table">
-    <thead><tr><th>Prompt</th><th>Tests</th><th>Success</th><th>Failed</th><th>Avg Time</th><th>Avg Size</th></tr></thead>
-    <tbody>
+    <div class="section-title">Performance by Prompt Style</div>
+    <table class="summary-table">
+        <thead><tr><th>Prompt</th><th>Tests</th><th>Success</th><th>Failed</th><th>Avg Time</th><th>Avg Size</th></tr></thead>
+        <tbody>
 """
-        for pk in all_prompts:
-            prompt_results = [r for r in self.results if r.prompt_key == pk]
-            p_total = len(prompt_results)
-            p_success = sum(1 for r in prompt_results if r.success)
-            p_failed = p_total - p_success
-            p_avg_time = sum(r.elapsed for r in prompt_results) / max(p_total, 1)
-            p_avg_size = sum(r.file_size for r in prompt_results if r.success) / max(p_success, 1)
-            pname = PROMPT_PRESETS.get(pk, {}).get("name", pk)
-            html += f"""      <tr>
-        <td><span class="badge badge-prompt">{pname}</span></td>
-        <td>{p_total}</td><td>{p_success}</td><td>{p_failed}</td>
-        <td>{p_avg_time:.1f}s</td><td>{p_avg_size/1024:.0f}KB</td>
-      </tr>\n"""
+                for prompt_key in all_prompts:
+                        prompt_results = [r for r in self.results if r.prompt_key == prompt_key]
+                        total_results = len(prompt_results)
+                        successful_results = sum(1 for r in prompt_results if r.success)
+                        failed_results = total_results - successful_results
+                        avg_prompt_time = sum(r.elapsed for r in prompt_results) / max(total_results, 1)
+                        avg_prompt_size = sum(r.file_size for r in prompt_results if r.success) / max(successful_results, 1)
+                        prompt_name = PROMPT_PRESETS.get(prompt_key, {}).get("name", prompt_key)
+                        html += f"""      <tr>
+                <td><span class="badge badge-prompt">{prompt_name}</span></td>
+                <td>{total_results}</td><td>{successful_results}</td><td>{failed_results}</td>
+                <td>{avg_prompt_time:.1f}s</td><td>{avg_prompt_size/1024:.0f}KB</td>
+            </tr>\n"""
 
-        html += """    </tbody>
-  </table>
+                html += """    </tbody>
+    </table>
 </div>
 
 </body>
 </html>"""
 
-        report_path = self.output_dir / "report.html"
-        report_path.write_text(html, encoding="utf-8")
-        return str(report_path)
+                report_path = self.output_dir / "report.html"
+                report_path.write_text(html, encoding="utf-8")
+                return str(report_path)
 
     def print_summary(self):
         """Print a console summary of all results."""

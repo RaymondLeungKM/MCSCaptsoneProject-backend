@@ -198,6 +198,12 @@ class ChallengeParticipationResponse(BaseModel):
     challenge_target: Optional[int] = None
     challenge_emoji: Optional[str] = None
 
+    # Optional leaderboard display info
+    parent_name: Optional[str] = None
+    child_name: Optional[str] = None
+    child_avatar: Optional[str] = None
+    participant_code: Optional[str] = None
+
     class Config:
         from_attributes = True
 

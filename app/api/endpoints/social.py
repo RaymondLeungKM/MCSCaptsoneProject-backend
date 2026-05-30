@@ -43,6 +43,33 @@ from app.schemas.community import (
 router = APIRouter()
 
 
+def _build_challenge_participation_response(
+    participation: ChallengeParticipation,
+    challenge: CommunityChallenge,
+    *,
+    child: Optional[Child] = None,
+    parent_name: Optional[str] = None,
+) -> ChallengeParticipationResponse:
+    return ChallengeParticipationResponse(
+        id=participation.id,
+        challenge_id=participation.challenge_id,
+        child_id=participation.child_id,
+        progress=participation.progress,
+        is_completed=participation.is_completed,
+        completed_at=participation.completed_at,
+        created_at=participation.created_at,
+        updated_at=participation.updated_at,
+        challenge_title=challenge.title,
+        challenge_title_zh=challenge.title_zh,
+        challenge_target=challenge.target_count,
+        challenge_emoji=challenge.emoji,
+        parent_name=parent_name,
+        child_name=child.name if child else None,
+        child_avatar=child.avatar if child else None,
+        participant_code=None,
+    )
+
+
 # ===========================================================================
 # 10.2.1  Friend Connections & "Following"
 # ===========================================================================
@@ -486,28 +513,26 @@ async def list_challenge_participations(
         raise HTTPException(status_code=404, detail="Challenge not found")
 
     result = await db.execute(
-        select(ChallengeParticipation)
+        select(
+            ChallengeParticipation,
+            Child,
+            User.full_name.label("parent_name"),
+        )
+        .join(Child, ChallengeParticipation.child_id == Child.id)
+        .join(User, Child.parent_id == User.id, isouter=True)
         .where(ChallengeParticipation.challenge_id == challenge_id)
         .order_by(ChallengeParticipation.progress.desc())
     )
-    participations = result.scalars().all()
+    participations = result.all()
 
     return [
-        ChallengeParticipationResponse(
-            id=p.id,
-            challenge_id=p.challenge_id,
-            child_id=p.child_id,
-            progress=p.progress,
-            is_completed=p.is_completed,
-            completed_at=p.completed_at,
-            created_at=p.created_at,
-            updated_at=p.updated_at,
-            challenge_title=challenge.title,
-            challenge_title_zh=challenge.title_zh,
-            challenge_target=challenge.target_count,
-            challenge_emoji=challenge.emoji,
+        _build_challenge_participation_response(
+            participation,
+            challenge,
+            child=child,
+            parent_name=parent_name,
         )
-        for p in participations
+        for participation, child, parent_name in participations
     ]
 
 
@@ -532,7 +557,8 @@ async def join_or_update_challenge(
     child_result = await db.execute(
         select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
     )
-    if not child_result.scalar_one_or_none():
+    child = child_result.scalar_one_or_none()
+    if not child:
         raise HTTPException(status_code=404, detail="Child not found")
 
     # Verify challenge is active
@@ -579,19 +605,11 @@ async def join_or_update_challenge(
     await db.commit()
     await db.refresh(participation)
 
-    return ChallengeParticipationResponse(
-        id=participation.id,
-        challenge_id=participation.challenge_id,
-        child_id=participation.child_id,
-        progress=participation.progress,
-        is_completed=participation.is_completed,
-        completed_at=participation.completed_at,
-        created_at=participation.created_at,
-        updated_at=participation.updated_at,
-        challenge_title=challenge.title,
-        challenge_title_zh=challenge.title_zh,
-        challenge_target=challenge.target_count,
-        challenge_emoji=challenge.emoji,
+    return _build_challenge_participation_response(
+        participation,
+        challenge,
+        child=child,
+        parent_name=current_user.full_name,
     )
 
 
@@ -610,7 +628,8 @@ async def get_my_challenge_progress(
     child_result = await db.execute(
         select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
     )
-    if not child_result.scalar_one_or_none():
+    child = child_result.scalar_one_or_none()
+    if not child:
         raise HTTPException(status_code=404, detail="Child not found")
 
     ch_result = await db.execute(
@@ -630,17 +649,9 @@ async def get_my_challenge_progress(
     if not participation:
         raise HTTPException(status_code=404, detail="Not participating in this challenge")
 
-    return ChallengeParticipationResponse(
-        id=participation.id,
-        challenge_id=participation.challenge_id,
-        child_id=participation.child_id,
-        progress=participation.progress,
-        is_completed=participation.is_completed,
-        completed_at=participation.completed_at,
-        created_at=participation.created_at,
-        updated_at=participation.updated_at,
-        challenge_title=challenge.title,
-        challenge_title_zh=challenge.title_zh,
-        challenge_target=challenge.target_count,
-        challenge_emoji=challenge.emoji,
+    return _build_challenge_participation_response(
+        participation,
+        challenge,
+        child=child,
+        parent_name=current_user.full_name,
     )

@@ -86,6 +86,44 @@ def _build_external_word_usage(words: List[DailyWordSummary]) -> dict[str, str]:
     }
 
 
+async def _generate_story_with_internal_generator(
+    request: ExternalStoryInvokeRequest,
+    db: AsyncSession,
+    words_used: List[DailyWordSummary],
+    message: str = "Story generated successfully",
+) -> StoryGenerationResponse:
+    try:
+        story_request = StoryGenerationRequest(**request.model_dump())
+        story, _, generation_time = await story_generator.generate_story(db, story_request)
+    except ValueError as error:
+        error_msg = str(error)
+
+        if "No words learned today" in error_msg:
+            detail = "No words learned today to include in story. Please complete some learning activities first."
+        elif "Failed to parse AI response" in error_msg:
+            detail = f"The AI generated an invalid story format. Error: {error_msg}"
+        else:
+            detail = error_msg
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=detail,
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate story: {error}",
+        ) from error
+
+    return StoryGenerationResponse(
+        story=GeneratedStoryResponse.model_validate(story),
+        words_used=words_used,
+        generation_time_seconds=generation_time,
+        success=True,
+        message=message,
+    )
+
+
 @router.get("/daily-words/{child_id}", response_model=List[DailyWordSummary])
 async def get_daily_words(
     child_id: str,
@@ -260,6 +298,18 @@ async def invoke_external_story_program(
     vocab_words = _build_external_vocab_words(request.theme, words_used)
     generation_started = time.perf_counter()
 
+    external_program_error = external_story_program_service.availability_error()
+    if external_program_error:
+        return await _generate_story_with_internal_generator(
+            request,
+            db,
+            words_used,
+            message=(
+                "Story generated successfully using the built-in generator because "
+                "the external story program is unavailable."
+            ),
+        )
+
     try:
         result = await run_in_threadpool(
             external_story_program_service.invoke,
@@ -319,10 +369,15 @@ async def invoke_external_story_program(
             message="Story generated successfully",
         )
     except ExternalStoryProgramError as error:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(error),
-        ) from error
+        return await _generate_story_with_internal_generator(
+            request,
+            db,
+            words_used,
+            message=(
+                "Story generated successfully using the built-in generator because "
+                f"the external story program failed: {error}"
+            ),
+        )
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

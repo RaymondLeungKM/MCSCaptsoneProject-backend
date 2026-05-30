@@ -107,6 +107,148 @@ class StoryGeneratorService:
             return f"<speak>{text}</speak>"
         ssml_paragraphs = "".join([f"<p>{p}</p>" for p in paragraphs])
         return f"<speak>{ssml_paragraphs}</speak>"
+
+    @staticmethod
+    def _word_label(word: DailyWordSummary) -> str:
+        return (word.word_cantonese or word.word or word.word_id).strip()
+
+    @staticmethod
+    def _should_use_offline_fallback(error: Exception) -> bool:
+        message = str(error).lower()
+        fallback_markers = (
+            "cannot connect to ollama",
+            "ollama request timed out",
+            "http://localhost:11434",
+            "llm service not initialized",
+            "api key required",
+            "connection refused",
+        )
+        return any(marker in message for marker in fallback_markers)
+
+    def _build_offline_story_content(
+        self,
+        child_name: str,
+        theme: Optional[str],
+        words: List[DailyWordSummary],
+    ) -> tuple[str, str, Dict[str, str]]:
+        theme_settings = {
+            "adventure": ("冒險", "彩虹小路", "勇敢出發"),
+            "family": ("家庭", "溫暖小屋", "互相照顧"),
+            "animals": ("動物", "森林草地", "認識新朋友"),
+            "nature": ("大自然", "月光花園", "細心觀察"),
+            "friendship": ("友誼", "星光公園", "分享快樂"),
+            "bedtime": ("睡前", "月亮小鎮", "安心入睡"),
+        }
+        theme_label, setting_place, closing_mood = theme_settings.get(
+            theme or "bedtime",
+            (theme or "睡前", "發光小路", "安心休息"),
+        )
+
+        vocab_terms = [self._word_label(word) for word in words]
+        word_usage = {
+            self._word_label(word): (
+                word.definition_cantonese
+                or word.example_cantonese
+                or "在故事裡成為一位溫柔的小主角。"
+            )
+            for word in words
+        }
+
+        story_lines = [
+            (
+                f"今晚，{child_name}抱住軟綿綿的小被子，準備聽一個{theme_label}故事。"
+                f"窗外有柔柔的風，月亮把銀光灑進房間，帶領{child_name}慢慢走進{setting_place}。"
+            ),
+            (
+                f"在{setting_place}入口，{child_name}先看見{vocab_terms[0]}。"
+                f"{vocab_terms[0]}輕輕搖一搖，好像在說：「歡迎你呀，我們一起找找今晚的驚喜吧！」"
+            ),
+        ]
+
+        action_templates = [
+            "走前幾步，{child}又遇見{label}，大家停下來聽風聲，心裡覺得安安靜靜又好舒服。",
+            "再往前看，{label}就在柔和的光影裡等著，提醒{child}每學會一個新詞語，世界就會亮一點點。",
+            "不久之後，{child}把{label}也放進小口袋裡，決定把今天的好奇心同笑容一起帶回家。",
+            "最後，{label}陪著{child}抬頭看星星，讓今晚的天空變得更加閃閃發亮。",
+        ]
+
+        for index, label in enumerate(vocab_terms[1:5]):
+            template = action_templates[index % len(action_templates)]
+            story_lines.append(template.format(child=child_name, label=label))
+
+        all_words = "、".join(vocab_terms)
+        story_lines.append(
+            (
+                f"回家的時候，{child_name}輕輕數著今天認識的{all_words}，"
+                f"知道它們都會變成心裡的小星星。"
+                f"{child_name}笑著鑽進被窩，帶著{closing_mood}的心情，慢慢進入甜甜的夢鄉。"
+            )
+        )
+
+        title_word = vocab_terms[0] if vocab_terms else "星光"
+        title = f"{child_name}和{title_word}的{theme_label}故事"
+        story_text = "\n\n".join(story_lines)
+        return title, story_text, word_usage
+
+    async def _generate_story_offline(
+        self,
+        db: AsyncSession,
+        request: StoryGenerationRequest,
+        child: Child,
+        words: List[DailyWordSummary],
+        start_time: float,
+        prompt: str,
+        reason: str,
+    ) -> tuple[GeneratedStory, List[DailyWordSummary], float]:
+        story_id = str(uuid.uuid4())
+        title, story_text, word_usage = self._build_offline_story_content(
+            child.name,
+            request.theme,
+            words,
+        )
+        vocab_terms = [self._word_label(word) for word in words]
+        vocab_used = ", ".join(vocab_terms)
+        if len(vocab_used) > 500:
+            vocab_used = vocab_used[:497] + "..."
+
+        story = GeneratedStory(
+            id=story_id,
+            child_id=request.child_id,
+            title=title,
+            title_english=f"{child.name}'s Cozy Story",
+            theme=request.theme,
+            generated_at=datetime.utcnow(),
+            generated_by="story_generator_offline_fallback",
+            content_cantonese=story_text,
+            content_english=None,
+            jyutping=None,
+            vocab_used=vocab_used,
+            story_text=story_text,
+            story_text_ssml=self._build_story_ssml(story_text),
+            story_generate_provdier="offline_fallback",
+            story_generate_model="local-template",
+            featured_words=vocab_terms,
+            word_usage=word_usage,
+            audio_url=None,
+            audio_duration_seconds=None,
+            audio_filename=f"story_{story_id}.mp3",
+            audio_generate_provider=None,
+            audio_generate_voice_name=None,
+            reading_time_minutes=request.reading_time_minutes,
+            word_count=len(story_text),
+            difficulty_level="easy",
+            cultural_references=None,
+            ai_model="local-template",
+            generation_prompt=f"{prompt}\n\n[fallback_reason] {reason}",
+            generation_time_seconds=time.time() - start_time,
+        )
+
+        db.add(story)
+        await db.commit()
+        await db.refresh(story)
+
+        generation_time = time.time() - start_time
+        return story, words, generation_time
     
     def _parse_story_json(self, ai_response: str) -> dict:
         """Parse JSON response from AI with error handling and auto-fixes"""
@@ -356,9 +498,6 @@ class StoryGeneratorService:
     ) -> tuple[Optional[GeneratedStory], List[DailyWordSummary], float]:
         """Generate a bedtime story using AI"""
 
-        if not self.llm_service:
-            raise ValueError("LLM service not initialized. Please configure an API key or run Ollama locally.")
-
         start_time = time.time()
 
         child_query = select(Child).where(Child.id == request.child_id)
@@ -383,6 +522,18 @@ class StoryGeneratorService:
             theme=request.theme,
             word_count_target=request.word_count_target,
         )
+
+        if not self.llm_service:
+            print("[StoryGenerator] No LLM service available, using offline fallback story.")
+            return await self._generate_story_offline(
+                db,
+                request,
+                child,
+                words,
+                start_time,
+                prompt,
+                reason="LLM service not initialized",
+            )
 
         try:
             messages = [LLMMessage(role="user", content=prompt)]
@@ -461,7 +612,7 @@ class StoryGeneratorService:
                 story_text_ssml=self._build_story_ssml(story_text),
                 story_generate_provdier=str(self.provider),
                 story_generate_model=self.llm_service.model if self.llm_service else "unknown",
-                featured_words=[w.word_id for w in words],
+                featured_words=vocab_terms,
                 word_usage=word_usage_dict,
                 audio_url=(generated_audio["audio_url"] if generated_audio else None),
                 audio_duration_seconds=(generated_audio["audio_duration_seconds"] if generated_audio else None),
@@ -502,6 +653,17 @@ class StoryGeneratorService:
 
         except Exception as e:
             print(f"[StoryGenerator] Error generating story: {str(e)}")
+            if self._should_use_offline_fallback(e):
+                print("[StoryGenerator] Falling back to offline template story.")
+                return await self._generate_story_offline(
+                    db,
+                    request,
+                    child,
+                    words,
+                    start_time,
+                    prompt,
+                    reason=str(e),
+                )
             raise
 
 

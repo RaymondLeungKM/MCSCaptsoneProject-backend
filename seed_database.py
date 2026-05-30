@@ -567,7 +567,7 @@ async def seed_comprehensive_data():
 
 if __name__ == "__main__":
     if "--repair" in sys.argv:
-        print("Running in repair mode to fix Mandarin Pinyin jyutping...\n")
+        print("\ud83d� Running in repair mode to fix Mandarin Pinyin jyutping...\n")
         asyncio.run(repair_mandarin_words())
     else:
         print("🌱 Starting comprehensive database seeding...\n")
