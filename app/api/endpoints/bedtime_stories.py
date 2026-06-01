@@ -13,7 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from typing import List
 from datetime import datetime, date
 
-from app.db.session import get_db
+from app.db.session import get_db, engine
 from app.core.security import get_current_user
 from app.models.user import User, Child
 from app.models.daily_words import DailyWordTracking, GeneratedStory
@@ -90,58 +90,46 @@ def _build_external_word_usage(words: List[DailyWordSummary]) -> dict[str, str]:
 
 
 async def _insert_generated_story_log_audit(
-    db: AsyncSession,
-    story: GeneratedStory,
+    story_id: str,
+    audit_values: dict[str, object],
 ) -> None:
     """Best-effort audit row for legacy generated_stories_log consumers."""
     try:
-        await db.execute(
-            text(
-                """
-                INSERT INTO generated_stories_log (
-                    vocab_used,
-                    story_text,
-                    story_text_ssml,
-                    story_generate_provdier,
-                    story_generate_model,
-                    audio_filename,
-                    audio_generate_provider,
-                    audio_generate_voice_name,
-                    generated_at,
-                    generated_by
-                ) VALUES (
-                    :vocab_used,
-                    :story_text,
-                    :story_text_ssml,
-                    :story_generate_provdier,
-                    :story_generate_model,
-                    :audio_filename,
-                    :audio_generate_provider,
-                    :audio_generate_voice_name,
-                    :generated_at,
-                    :generated_by
-                )
-                """
-            ),
-            {
-                "vocab_used": story.vocab_used,
-                "story_text": story.story_text,
-                "story_text_ssml": story.story_text_ssml,
-                "story_generate_provdier": story.story_generate_provdier,
-                "story_generate_model": story.story_generate_model,
-                "audio_filename": story.audio_filename,
-                "audio_generate_provider": story.audio_generate_provider,
-                "audio_generate_voice_name": story.audio_generate_voice_name,
-                "generated_at": story.generated_at,
-                "generated_by": "external_story_program_backend_api",
-            },
-        )
-        await db.commit()
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO generated_stories_log (
+                        vocab_used,
+                        story_text,
+                        story_text_ssml,
+                        story_generate_provdier,
+                        story_generate_model,
+                        audio_filename,
+                        audio_generate_provider,
+                        audio_generate_voice_name,
+                        generated_at,
+                        generated_by
+                    ) VALUES (
+                        :vocab_used,
+                        :story_text,
+                        :story_text_ssml,
+                        :story_generate_provdier,
+                        :story_generate_model,
+                        :audio_filename,
+                        :audio_generate_provider,
+                        :audio_generate_voice_name,
+                        :generated_at,
+                        :generated_by
+                    )
+                    """
+                ),
+                audit_values,
+            )
     except SQLAlchemyError as error:
-        await db.rollback()
         logger.warning(
             "Failed to insert generated_stories_log audit row for generated story %s: %s",
-            story.id,
+            story_id,
             error,
         )
 
@@ -420,10 +408,25 @@ async def invoke_external_story_program(
         db.add(story)
         await db.commit()
         await db.refresh(story)
-        await _insert_generated_story_log_audit(db, story)
+        story_response = GeneratedStoryResponse.model_validate(story)
+        await _insert_generated_story_log_audit(
+            story.id,
+            {
+                "vocab_used": story.vocab_used,
+                "story_text": story.story_text,
+                "story_text_ssml": story.story_text_ssml,
+                "story_generate_provdier": story.story_generate_provdier,
+                "story_generate_model": story.story_generate_model,
+                "audio_filename": story.audio_filename,
+                "audio_generate_provider": story.audio_generate_provider,
+                "audio_generate_voice_name": story.audio_generate_voice_name,
+                "generated_at": story.generated_at,
+                "generated_by": "external_story_program_backend_api",
+            },
+        )
 
         return StoryGenerationResponse(
-            story=GeneratedStoryResponse.model_validate(story),
+            story=story_response,
             words_used=words_used,
             generation_time_seconds=story.generation_time_seconds or 0.0,
             success=True,
