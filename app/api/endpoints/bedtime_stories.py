@@ -1,13 +1,15 @@
 """
 Endpoints for AI-generated bedtime stories
 """
+import logging
 import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, func, text
+from sqlalchemy.exc import SQLAlchemyError
 from typing import List
 from datetime import datetime, date
 
@@ -34,6 +36,7 @@ from app.services.external_story_program_service import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 THEME_VOCAB_HINTS = {
     "adventure": "冒險",
@@ -84,6 +87,63 @@ def _build_external_word_usage(words: List[DailyWordSummary]) -> dict[str, str]:
         )
         for word in words
     }
+
+
+async def _insert_generated_story_log_audit(
+    db: AsyncSession,
+    story: GeneratedStory,
+) -> None:
+    """Best-effort audit row for legacy generated_stories_log consumers."""
+    try:
+        await db.execute(
+            text(
+                """
+                INSERT INTO generated_stories_log (
+                    vocab_used,
+                    story_text,
+                    story_text_ssml,
+                    story_generate_provdier,
+                    story_generate_model,
+                    audio_filename,
+                    audio_generate_provider,
+                    audio_generate_voice_name,
+                    generated_at,
+                    generated_by
+                ) VALUES (
+                    :vocab_used,
+                    :story_text,
+                    :story_text_ssml,
+                    :story_generate_provdier,
+                    :story_generate_model,
+                    :audio_filename,
+                    :audio_generate_provider,
+                    :audio_generate_voice_name,
+                    :generated_at,
+                    :generated_by
+                )
+                """
+            ),
+            {
+                "vocab_used": story.vocab_used,
+                "story_text": story.story_text,
+                "story_text_ssml": story.story_text_ssml,
+                "story_generate_provdier": story.story_generate_provdier,
+                "story_generate_model": story.story_generate_model,
+                "audio_filename": story.audio_filename,
+                "audio_generate_provider": story.audio_generate_provider,
+                "audio_generate_voice_name": story.audio_generate_voice_name,
+                "generated_at": story.generated_at,
+                "generated_by": "external_story_program_backend_api",
+            },
+        )
+        await db.commit()
+    except SQLAlchemyError as error:
+        await db.rollback()
+        logger.warning(
+            "Failed to insert generated_stories_log audit row for generated story %s: %s",
+            story.id,
+            error,
+        )
 
 
 async def _generate_story_with_internal_generator(
@@ -360,6 +420,7 @@ async def invoke_external_story_program(
         db.add(story)
         await db.commit()
         await db.refresh(story)
+        await _insert_generated_story_log_audit(db, story)
 
         return StoryGenerationResponse(
             story=GeneratedStoryResponse.model_validate(story),
