@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     
     # AI/LLM Configuration
     # LLM_PROVIDER: "openai", "openrouter", "anthropic", or "ollama"
-    LLM_PROVIDER: str = "ollama"  # Default to Ollama for local testing
+    LLM_PROVIDER: str = "openrouter"  # Default to OpenRouter for hosted generation
     
     # OpenAI
     OPENAI_API_KEY: str = ""
