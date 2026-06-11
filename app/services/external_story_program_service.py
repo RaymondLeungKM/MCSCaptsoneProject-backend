@@ -22,6 +22,7 @@ class ExternalStoryProgramError(RuntimeError):
 @dataclass
 class ExternalStoryInvocationResult:
     story_text: str
+    story_text_ssml: str
     vocab_used: str
     audio_url: str
     audio_filename: str
@@ -29,6 +30,7 @@ class ExternalStoryInvocationResult:
     external_story_id: Optional[str]
     llm_model: Optional[str]
     tts_provider: Optional[str]
+    voice_name: Optional[str]
     generated_at: datetime
 
 
@@ -36,10 +38,12 @@ class ExternalStoryProgramService:
     """Run the external story program as a subprocess and normalize outputs."""
 
     STORY_BLOCK_PATTERN = re.compile(r"Generated Story:\s*(.*?)\n={10,}", re.DOTALL)
+    SSML_BLOCK_PATTERN = re.compile(r"Generated SSML:\s*(.*?)\n={10,}", re.DOTALL)
     AUDIO_PATH_PATTERN = re.compile(r"Success!\s*Audio saved to:\s*(.+)")
     STORY_ID_PATTERN = re.compile(r"Story record saved to database \(ID:\s*([^)]+)\)")
     MODEL_PATTERN = re.compile(r"Using model:\s*(.+)")
     TTS_PROVIDER_PATTERN = re.compile(r"Using (Google Cloud TTS|AWS Polly|Azure TTS)\.\.\.")
+    VOICE_NAME_PATTERN = re.compile(r"Voice used:\s*(.+)")
 
     def __init__(self) -> None:
         self.backend_audio_dir = Path("uploads/audio")
@@ -117,6 +121,13 @@ class ExternalStoryProgramService:
         )
 
     @classmethod
+    def _extract_story_ssml(cls, stdout: str) -> str:
+        match = cls.SSML_BLOCK_PATTERN.search(stdout)
+        if not match:
+            return ""
+        return match.group(1).strip()
+
+    @classmethod
     def _extract_audio_path(cls, stdout: str, program_dir: Path) -> Path:
         match = cls.AUDIO_PATH_PATTERN.search(stdout)
         if not match:
@@ -154,17 +165,13 @@ class ExternalStoryProgramService:
         }
         return provider_map.get(provider_label)
 
-    def invoke(self, vocab_words: list[str]) -> ExternalStoryInvocationResult:
-        words = self._sanitize_words(vocab_words)
-        vocab_csv = ", ".join(words)
-        program_dir = self._resolve_program_dir()
-        python_bin = self._resolve_python_bin(program_dir)
-        timeout_seconds = max(30, int(settings.EXTERNAL_STORY_TIMEOUT_SECONDS))
-        env = os.environ.copy()
-        env["STORY_PROGRAM_SKIP_DB_INSERT"] = "1"
-
-        command = [python_bin, str(program_dir / "main.py"), vocab_csv]
-
+    def _run_program(
+        self,
+        program_dir: Path,
+        env: dict[str, str],
+        command: list[str],
+        timeout_seconds: int,
+    ) -> tuple[str, str]:
         try:
             completed = subprocess.run(
                 command,
@@ -176,6 +183,7 @@ class ExternalStoryProgramService:
                 check=False,
             )
         except FileNotFoundError as error:
+            python_bin = command[0] if command else "python3"
             raise ExternalStoryProgramError(
                 f"Python executable '{python_bin}' was not found. "
                 "Set EXTERNAL_STORY_PYTHON_BIN to a valid interpreter."
@@ -196,20 +204,47 @@ class ExternalStoryProgramService:
                 f"External story program failed with exit code {completed.returncode}. {detail}"
             )
 
+        return stdout, stderr
+
+    def _copy_external_audio(self, external_audio_path: Path, prefix: str) -> tuple[str, str]:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        copied_filename = f"{prefix}_{timestamp}_{external_audio_path.name}"
+        copied_path = self.backend_audio_dir / copied_filename
+        shutil.copy2(external_audio_path, copied_path)
+        return copied_filename, str(copied_path)
+
+    def invoke(self, vocab_words: list[str]) -> ExternalStoryInvocationResult:
+        words = self._sanitize_words(vocab_words)
+        vocab_csv = ", ".join(words)
+        program_dir = self._resolve_program_dir()
+        python_bin = self._resolve_python_bin(program_dir)
+        timeout_seconds = max(30, int(settings.EXTERNAL_STORY_TIMEOUT_SECONDS))
+        env = os.environ.copy()
+        env["STORY_PROGRAM_SKIP_DB_INSERT"] = "1"
+
+        command = [python_bin, str(program_dir / "main.py"), vocab_csv]
+
+        stdout, _ = self._run_program(
+            program_dir=program_dir,
+            env=env,
+            command=command,
+            timeout_seconds=timeout_seconds,
+        )
+
         story_text = self._extract_story_text(stdout)
+        story_text_ssml = self._extract_story_ssml(stdout)
         external_audio_path = self._extract_audio_path(stdout, program_dir)
         external_story_id = self._extract_optional(self.STORY_ID_PATTERN, stdout)
         llm_model = self._extract_optional(self.MODEL_PATTERN, stdout)
         tts_provider_label = self._extract_optional(self.TTS_PROVIDER_PATTERN, stdout)
         tts_provider = self._provider_alias(tts_provider_label)
+        voice_name = self._extract_optional(self.VOICE_NAME_PATTERN, stdout)
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        copied_filename = f"external_story_{timestamp}_{external_audio_path.name}"
-        copied_path = self.backend_audio_dir / copied_filename
-        shutil.copy2(external_audio_path, copied_path)
+        copied_filename, _ = self._copy_external_audio(external_audio_path, "external_story")
 
         return ExternalStoryInvocationResult(
             story_text=story_text,
+            story_text_ssml=story_text_ssml,
             vocab_used=vocab_csv,
             audio_url=f"/uploads/audio/{copied_filename}",
             audio_filename=copied_filename,
@@ -217,6 +252,50 @@ class ExternalStoryProgramService:
             external_story_id=external_story_id,
             llm_model=llm_model,
             tts_provider=tts_provider,
+            voice_name=voice_name,
+            generated_at=datetime.now(timezone.utc),
+        )
+
+    def invoke_from_story_text(self, story_text: str) -> ExternalStoryInvocationResult:
+        normalized_story_text = (story_text or "").strip()
+        if not normalized_story_text:
+            raise ExternalStoryProgramError("Story text is required to generate SSML and audio.")
+
+        program_dir = self._resolve_program_dir()
+        python_bin = self._resolve_python_bin(program_dir)
+        timeout_seconds = max(30, int(settings.EXTERNAL_STORY_TIMEOUT_SECONDS))
+        env = os.environ.copy()
+        env["STORY_PROGRAM_SKIP_DB_INSERT"] = "1"
+        env["STORY_PROGRAM_STORY_TEXT"] = normalized_story_text
+
+        command = [python_bin, str(program_dir / "main.py")]
+
+        stdout, _ = self._run_program(
+            program_dir=program_dir,
+            env=env,
+            command=command,
+            timeout_seconds=timeout_seconds,
+        )
+
+        story_text_ssml = self._extract_story_ssml(stdout)
+        external_audio_path = self._extract_audio_path(stdout, program_dir)
+        llm_model = self._extract_optional(self.MODEL_PATTERN, stdout)
+        tts_provider_label = self._extract_optional(self.TTS_PROVIDER_PATTERN, stdout)
+        tts_provider = self._provider_alias(tts_provider_label)
+        voice_name = self._extract_optional(self.VOICE_NAME_PATTERN, stdout)
+        copied_filename, _ = self._copy_external_audio(external_audio_path, "curated_story")
+
+        return ExternalStoryInvocationResult(
+            story_text=normalized_story_text,
+            story_text_ssml=story_text_ssml,
+            vocab_used="",
+            audio_url=f"/uploads/audio/{copied_filename}",
+            audio_filename=copied_filename,
+            external_audio_path=str(external_audio_path),
+            external_story_id=None,
+            llm_model=llm_model,
+            tts_provider=tts_provider,
+            voice_name=voice_name,
             generated_at=datetime.now(timezone.utc),
         )
 
