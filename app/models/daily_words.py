@@ -43,7 +43,8 @@ class GeneratedStory(Base):
     __tablename__ = "generated_stories"
     
     id = Column(String, primary_key=True, index=True)
-    child_id = Column(String, ForeignKey("children.id"), nullable=False)
+    child_id = Column(String, ForeignKey("children.id"), nullable=True)
+    story_type = Column(String, nullable=False, default="generated")
     
     # Story metadata
     title = Column(String, nullable=False)
@@ -86,6 +87,8 @@ class GeneratedStory(Base):
     read_count = Column(Integer, default=0)
     is_favorite = Column(Boolean, default=False)
     parent_approved = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=True)
+    sort_order = Column(Integer, default=0)
     
     # AI generation metadata
     ai_model = Column(String)  # e.g., "gpt-4", "claude-3"

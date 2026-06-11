@@ -69,6 +69,7 @@ class Story(Base):
     
     id = Column(String, primary_key=True, index=True)
     title = Column(String, nullable=False)
+    theme = Column(String)
     cover_image_url = Column(String)
     duration = Column(String)  # e.g., "5 min"
     description = Column(Text)
