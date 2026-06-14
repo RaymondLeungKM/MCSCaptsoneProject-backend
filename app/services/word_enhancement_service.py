@@ -8,7 +8,12 @@ import re
 from pydantic import BaseModel
 
 from app.services.curated_cantonese_vocabulary import get_curated_cantonese_content
-from app.services.llm_service import get_llm_service, LLMMessage, LLMProvider
+from app.services.llm_service import (
+    get_llm_service,
+    LLMMessage,
+    LLMProvider,
+    resolve_llm_provider,
+)
 
 
 class EnhancedWordContent(BaseModel):
@@ -29,8 +34,9 @@ class WordEnhancementService:
     Used for words learned from external sources (object detection, etc.)
     """
     
-    def __init__(self, provider: LLMProvider = LLMProvider.OLLAMA):
-        self.llm = get_llm_service(provider)
+    def __init__(self, provider: Optional[LLMProvider] = None):
+        self.provider = resolve_llm_provider(provider)
+        self.llm = get_llm_service(self.provider)
     
     @staticmethod
     def _is_valid_jyutping(jyutping: str) -> bool:
@@ -284,15 +290,15 @@ class WordEnhancementService:
         )
 
 
-# Global instance
-_enhancement_service: Optional[WordEnhancementService] = None
+# Global instances keyed by provider
+_enhancement_services: dict[LLMProvider, WordEnhancementService] = {}
 
 
 def get_word_enhancement_service(
-    provider: LLMProvider = LLMProvider.OLLAMA
+    provider: Optional[LLMProvider] = None
 ) -> WordEnhancementService:
     """Get or create the word enhancement service singleton"""
-    global _enhancement_service
-    if _enhancement_service is None:
-        _enhancement_service = WordEnhancementService(provider)
-    return _enhancement_service
+    resolved_provider = resolve_llm_provider(provider)
+    if resolved_provider not in _enhancement_services:
+        _enhancement_services[resolved_provider] = WordEnhancementService(resolved_provider)
+    return _enhancement_services[resolved_provider]

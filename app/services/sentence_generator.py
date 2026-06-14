@@ -8,7 +8,12 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
-from app.services.llm_service import get_llm_service, LLMMessage, LLMProvider
+from app.services.llm_service import (
+    get_llm_service,
+    LLMMessage,
+    LLMProvider,
+    resolve_llm_provider,
+)
 from app.models.vocabulary import Word
 from app.models.generated_sentences import GeneratedSentence as GeneratedSentenceModel
 
@@ -46,8 +51,9 @@ class SentenceGenerator:
         {"id": "bedtime", "name": "睡覺時間", "name_en": "Bedtime", "description": "睡前時間"},
     ]
     
-    def __init__(self, provider: LLMProvider = LLMProvider.OLLAMA):
-        self.llm = get_llm_service(provider)
+    def __init__(self, provider: Optional[LLMProvider] = None):
+        self.provider = resolve_llm_provider(provider)
+        self.llm = get_llm_service(self.provider)
     
     def _build_generation_prompt(
         self,
@@ -318,13 +324,13 @@ Jyutping: go4 go1 heoi3 gung1 jyun4 waan2 (6個音節 ✓)
         return result.sentences
 
 
-# Singleton instance
-_sentence_generator: Optional[SentenceGenerator] = None
+# Singleton instances keyed by provider
+_sentence_generators: Dict[LLMProvider, SentenceGenerator] = {}
 
 
-def get_sentence_generator(provider: LLMProvider = LLMProvider.OLLAMA) -> SentenceGenerator:
+def get_sentence_generator(provider: Optional[LLMProvider] = None) -> SentenceGenerator:
     """Get or create SentenceGenerator instance"""
-    global _sentence_generator
-    if _sentence_generator is None:
-        _sentence_generator = SentenceGenerator(provider=provider)
-    return _sentence_generator
+    resolved_provider = resolve_llm_provider(provider)
+    if resolved_provider not in _sentence_generators:
+        _sentence_generators[resolved_provider] = SentenceGenerator(provider=resolved_provider)
+    return _sentence_generators[resolved_provider]

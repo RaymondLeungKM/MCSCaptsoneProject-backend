@@ -80,6 +80,7 @@ class StoryPage(BaseModel):
 
 class StoryBase(BaseModel):
     title: str
+    theme: Optional[str] = None
     cover_image_url: Optional[str] = None
     duration: str = "5 min"
     description: Optional[str] = None
@@ -90,15 +91,22 @@ class StoryCreate(StoryBase):
     pages: List[StoryPage]
     target_words: List[str]
     comprehension_questions: Optional[List[DialogicPrompt]] = None
+    is_active: bool = True
+    sort_order: int = 0
 
 
 class StoryUpdate(BaseModel):
     title: Optional[str] = None
+    theme: Optional[str] = None
     cover_image_url: Optional[str] = None
     duration: Optional[str] = None
     description: Optional[str] = None
     pages: Optional[List[StoryPage]] = None
     target_words: Optional[List[str]] = None
+    comprehension_questions: Optional[List[DialogicPrompt]] = None
+    difficulty: Optional[str] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
 
 
 class StoryResponse(StoryBase):
@@ -107,7 +115,9 @@ class StoryResponse(StoryBase):
     target_words: List[str]
     comprehension_questions: Optional[List[DialogicPrompt]] = None
     is_active: bool
+    sort_order: int
     created_at: datetime
+    updated_at: Optional[datetime] = None
     
     class Config:
         from_attributes = True
@@ -322,3 +332,11 @@ class MissionSummaryResponse(BaseModel):
     recent_completions: List[MissionCompletionHistoryItem] = Field(
         default_factory=list
     )
+
+
+class ParentMicroMissionCreate(BaseModel):
+    title: str = Field(..., min_length=2, max_length=80)
+    description: str = Field(..., min_length=6, max_length=240)
+    context: MissionContext = MissionContext.GENERAL
+    target_words: List[str] = Field(default_factory=list, max_length=8)
+    conversation_prompts: List[str] = Field(default_factory=list, max_length=4)

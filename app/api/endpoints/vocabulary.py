@@ -99,6 +99,57 @@ def _is_child_safe_word_payload(payload: dict) -> bool:
     )
 
 
+def _humanize_learning_source(source: str) -> str:
+    normalized = (source or "external_learning").strip().replace("_", " ")
+    return normalized or "external learning"
+
+
+def _build_external_placeholder_content(word: str, source: str) -> dict[str, Optional[str]]:
+    normalized_word = (word or "").strip()
+    display_word = normalized_word.capitalize() if normalized_word else "Word"
+    source_label = _humanize_learning_source(source)
+    example_word = normalized_word.lower() if normalized_word else "word"
+
+    return {
+        "word": display_word,
+        "word_cantonese": None,
+        "jyutping": None,
+        "definition": f"A word learned from {source_label}",
+        "definition_cantonese": f"透過{source_label}學識嘅詞語",
+        "example": f"I learned {example_word} from {source_label}.",
+        "example_cantonese": f"我透過{source_label}學識咗{display_word}。",
+    }
+
+
+def _build_captured_word_response(
+    word: Word,
+    captured_at: Optional[datetime] = None,
+) -> dict:
+    word_dict = WordResponse.model_validate(word).model_dump()
+    word_dict["category_name"] = word.category_rel.name if word.category_rel else None
+    word_dict["category_name_cantonese"] = word.category_rel.name_cantonese if word.category_rel else None
+    if captured_at is not None:
+        word_dict["created_at"] = captured_at
+    return word_dict
+
+
+def _merge_captured_word_payloads(
+    tracked_words: List[dict],
+    owned_words: List[dict],
+    limit: int,
+) -> List[dict]:
+    combined: dict[str, dict] = {}
+
+    for payload in tracked_words + owned_words:
+        combined.setdefault(str(payload["id"]), payload)
+
+    return sorted(
+        combined.values(),
+        key=lambda payload: payload["created_at"],
+        reverse=True,
+    )[:limit]
+
+
 async def _get_category_or_404(category_id: str, db: AsyncSession) -> Category:
     result = await db.execute(select(Category).where(Category.id == category_id))
     category = result.scalar_one_or_none()
@@ -233,22 +284,47 @@ async def get_external_captured_words(
             detail=f"Child not found: {child_id}",
         )
 
-    query = (
+    tracked_subquery = (
+        select(
+            DailyWordTracking.word_id.label("word_id"),
+            func.max(DailyWordTracking.date).label("captured_at"),
+        )
+        .where(
+            DailyWordTracking.child_id == child_id,
+            DailyWordTracking.learned_context.contains({"source": "external_word_learning"}),
+        )
+        .group_by(DailyWordTracking.word_id)
+        .subquery()
+    )
+
+    tracked_query = (
+        select(Word, tracked_subquery.c.captured_at)
+        .options(selectinload(Word.category_rel))
+        .join(tracked_subquery, tracked_subquery.c.word_id == Word.id)
+        .where(Word.is_active == True)
+        .order_by(tracked_subquery.c.captured_at.desc())
+        .limit(limit)
+    )
+    tracked_result = await db.execute(tracked_query)
+    tracked_words = [
+        _build_captured_word_response(word, captured_at)
+        for word, captured_at in tracked_result.all()
+    ]
+
+    owned_query = (
         select(Word)
         .options(selectinload(Word.category_rel))
         .where(Word.is_active == True, Word.created_by_child_id == child_id)
         .order_by(Word.created_at.desc())
         .limit(limit)
     )
-    result = await db.execute(query)
-    sql_words = result.scalars().all()
+    owned_result = await db.execute(owned_query)
+    owned_words = [
+        _build_captured_word_response(word)
+        for word in owned_result.scalars().all()
+    ]
 
-    response_words: List[dict] = []
-    for word in sql_words:
-        word_dict = WordResponse.model_validate(word).model_dump()
-        word_dict["category_name"] = word.category_rel.name if word.category_rel else None
-        word_dict["category_name_cantonese"] = word.category_rel.name_cantonese if word.category_rel else None
-        response_words.append(word_dict)
+    response_words = _merge_captured_word_payloads(tracked_words, owned_words, limit)
 
     if include_mongodb:
         mongo_words = await _fetch_mongo_captured_words(child_id=child_id, limit=limit)
@@ -342,6 +418,58 @@ async def generate_sentences_background(word_id: str, word_text: str):
         print(f"[Background Task] ERROR generating sentences for {word_text}: {e}")
         import traceback
         traceback.print_exc()
+
+
+async def enhance_word_and_generate_sentences_background(
+    word_id: str,
+    word_text: str,
+    source: str,
+    image_url: Optional[str],
+):
+    """
+    Background task that fills in AI-enhanced bilingual content for a placeholder word
+    and only then generates example sentences.
+    """
+    try:
+        print(f"[Background Task] Starting AI enhancement for word: {word_text} (ID: {word_id})")
+
+        enhancement_service = get_word_enhancement_service()
+        enhanced_content = await enhancement_service.enhance_word(
+            word=word_text,
+            source=source,
+            image_url=image_url,
+        )
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Word).where(Word.id == word_id))
+            word = result.scalar_one_or_none()
+
+            if not word:
+                print(f"[Background Task] ERROR: Word not found for enhancement: {word_id}")
+                return
+
+            word.word = enhanced_content.word_english.capitalize()
+            word.word_cantonese = enhanced_content.word_cantonese
+            word.jyutping = enhanced_content.jyutping
+            word.definition = enhanced_content.definition_english
+            word.definition_cantonese = enhanced_content.definition_cantonese
+            word.example = enhanced_content.example_english
+            word.example_cantonese = enhanced_content.example_cantonese
+            word.difficulty = enhanced_content.difficulty
+
+            if image_url and not word.image_url:
+                word.image_url = image_url
+
+            await db.commit()
+
+        print(f"[Background Task] ✓ AI enhancement completed for: {word_text}")
+
+    except Exception as e:
+        print(f"[Background Task] ERROR enhancing word {word_text}: {e}")
+        import traceback
+        traceback.print_exc()
+
+    await generate_sentences_background(word_id=word_id, word_text=word_text)
 
 
 @router.get("/", response_model=List[WordResponse])
@@ -1139,8 +1267,9 @@ async def record_external_word_learning(
         print(f"[External Word Learning] NOTE: For existing words, we only update image. The word text '{word_obj.word}' remains unchanged.")
     
     if not word_obj:
-        # Create new word from object detection with AI-enhanced bilingual content
-        print(f"[External Word Learning] Creating new word with AI enhancement: '{word}'")
+        # Create a lightweight placeholder word immediately and finish AI enhancement
+        # in the background so mobile clients do not wait on LLM latency.
+        print(f"[External Word Learning] Creating placeholder word for background AI enhancement: '{word}'")
         word_created = True
         
         # Ensure "general" category exists
@@ -1167,56 +1296,26 @@ async def record_external_word_learning(
             db.add(general_category)
             await db.flush()  # Ensure category is created before creating word
         
-        # Use AI to generate complete bilingual content
-        try:
-            enhancement_service = get_word_enhancement_service()
-            enhanced_content = await enhancement_service.enhance_word(
-                word=word,
-                source=source,
-                image_url=final_image_url
-            )
-            
-            print(f"[External Word Learning] ✓ AI-enhanced content generated")
-            print(f"  - Cantonese: {enhanced_content.word_cantonese} ({enhanced_content.jyutping})")
-            
-            word_obj = Word(
-                id=str(uuid.uuid4()),
-                word=enhanced_content.word_english.capitalize(),
-                word_cantonese=enhanced_content.word_cantonese,
-                jyutping=enhanced_content.jyutping,
-                category=general_category.id,
-                difficulty=enhanced_content.difficulty,
-                definition=enhanced_content.definition_english,
-                definition_cantonese=enhanced_content.definition_cantonese,
-                example=enhanced_content.example_english,
-                example_cantonese=enhanced_content.example_cantonese,
-                pronunciation=None,
-                physical_action=None,
-                image_url=final_image_url,
-                audio_url=None,
-                contexts=[source],
-                related_words=[],
-                created_by_child_id=child_id  # Mark as user-uploaded
-            )
-        except Exception as e:
-            print(f"[External Word Learning] WARNING: AI enhancement failed: {e}")
-            print(f"[External Word Learning] Falling back to basic word creation")
-            # Fallback to basic word creation
-            word_obj = Word(
-                id=str(uuid.uuid4()),
-                word=word.capitalize(),
-                category=general_category.id,
-                difficulty="easy",
-                definition=f"A word learned from {source}",
-                example=f"I saw a {word.lower()}.",
-                pronunciation=None,
-                physical_action=None,
-                image_url=final_image_url,
-                audio_url=None,
-                contexts=[source],
-                related_words=[],
-                created_by_child_id=child_id  # Mark as user-uploaded
-            )
+        placeholder_content = _build_external_placeholder_content(word, source)
+        word_obj = Word(
+            id=str(uuid.uuid4()),
+            word=placeholder_content["word"],
+            word_cantonese=placeholder_content["word_cantonese"],
+            jyutping=placeholder_content["jyutping"],
+            category=general_category.id,
+            difficulty="easy",
+            definition=placeholder_content["definition"],
+            definition_cantonese=placeholder_content["definition_cantonese"],
+            example=placeholder_content["example"],
+            example_cantonese=placeholder_content["example_cantonese"],
+            pronunciation=None,
+            physical_action=None,
+            image_url=final_image_url,
+            audio_url=None,
+            contexts=[source],
+            related_words=[],
+            created_by_child_id=child_id  # Mark as user-uploaded
+        )
         
         db.add(word_obj)
         
@@ -1343,8 +1442,17 @@ async def record_external_word_learning(
     await db.refresh(child)
     await db.refresh(word_obj)
     
-    # Schedule AI sentence generation in background (non-blocking)
-    if word_created or is_new_word:
+    # Finish AI work after the response so mobile clients do not block on LLM latency.
+    if word_created:
+        print(f"[External Word Learning] Scheduling background AI enhancement for: {word_obj.word}")
+        background_tasks.add_task(
+            enhance_word_and_generate_sentences_background,
+            word_id=word_obj.id,
+            word_text=word_obj.word,
+            source=source,
+            image_url=final_image_url,
+        )
+    elif is_new_word:
         print(f"[External Word Learning] Scheduling background sentence generation for: {word_obj.word}")
         background_tasks.add_task(
             generate_sentences_background,
@@ -1475,10 +1583,26 @@ async def generate_word_sentences(
         import traceback
         traceback.print_exc()
         error_str = str(e)
-        if any(kw in error_str for kw in ["Cannot connect to Ollama", "ollama", "Ollama", "connect", "Connection refused"]):
+        llm_provider = (settings.LLM_PROVIDER or "ollama").strip().lower()
+        provider_error_markers = [
+            "Cannot connect to Ollama",
+            "Connection refused",
+            "API key required",
+            "401",
+            "403",
+            "429",
+            "timeout",
+            "timed out",
+            llm_provider,
+            llm_provider.capitalize(),
+        ]
+        if any(marker in error_str for marker in provider_error_markers):
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="AI service unavailable. Please ensure Ollama is running: ollama serve"
+                detail=(
+                    f"AI service unavailable for configured provider '{llm_provider}'. "
+                    "Check LLM_PROVIDER and the corresponding provider credentials/configuration."
+                )
             )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

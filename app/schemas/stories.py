@@ -52,10 +52,11 @@ class DailyWordSummary(BaseModel):
 
 
 class GeneratedStoryCreate(BaseModel):
-    child_id: str
+    child_id: Optional[str] = None
     title: str
     title_english: Optional[str] = None
     theme: Optional[str] = None
+    story_type: str = "curated"
     generated_at: Optional[datetime] = None
     generated_by: Optional[str] = None
     content_cantonese: str
@@ -80,14 +81,17 @@ class GeneratedStoryCreate(BaseModel):
     ai_model: Optional[str] = None
     generation_prompt: Optional[str] = None
     generation_time_seconds: Optional[float] = None
+    is_active: bool = True
+    sort_order: int = 0
 
 
 class GeneratedStoryResponse(BaseModel):
     id: str
-    child_id: str
+    child_id: Optional[str]
     title: str
     title_english: Optional[str]
     theme: Optional[str]
+    story_type: str
     generation_date: datetime
     generated_at: datetime
     generated_by: Optional[str]
@@ -113,6 +117,8 @@ class GeneratedStoryResponse(BaseModel):
     read_count: int
     is_favorite: bool
     parent_approved: bool
+    is_active: bool
+    sort_order: int
     ai_model: Optional[str]
     created_at: datetime
     updated_at: Optional[datetime]

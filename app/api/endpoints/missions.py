@@ -14,6 +14,7 @@ from app.schemas.content import (
     AssignedMissionResponse,
     MissionCreate,
     MissionCompletionHistoryItem,
+    ParentMicroMissionCreate,
     MissionProgressResponse,
     MissionProgressUpdate,
     MissionResponse,
@@ -22,6 +23,7 @@ from app.schemas.content import (
 )
 from app.models.content import (
     Mission,
+    MissionContext,
     MissionAssignment,
     MissionAssignmentSource,
     MissionAssignmentStatus,
@@ -65,6 +67,27 @@ def _current_hkt_date(now_utc: datetime | None = None) -> date:
 
 def _enum_value(value):
     return value.value if hasattr(value, "value") else value
+
+
+def _normalize_string_list(
+    values: list[str],
+    *,
+    max_items: int,
+    max_length: int,
+) -> list[str]:
+    normalized: list[str] = []
+    for value in values:
+        cleaned = value.strip()
+        if not cleaned:
+            continue
+        if len(cleaned) > max_length:
+            cleaned = cleaned[:max_length]
+        if cleaned in normalized:
+            continue
+        normalized.append(cleaned)
+        if len(normalized) >= max_items:
+            break
+    return normalized
 
 
 async def _get_mission_by_id(mission_id: str, db: AsyncSession) -> Mission:
@@ -713,6 +736,102 @@ async def get_offline_missions(
         is_offline=True,
         surfaces=[MissionSurface.PARENT, MissionSurface.BOTH],
         db=db,
+    )
+
+
+@router.post(
+    "/parent/{child_id}/micro",
+    response_model=AssignedMissionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_parent_micro_mission(
+    child_id: str,
+    payload: ParentMicroMissionCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a short parent-authored mission and assign it for today's child mode."""
+    child = await _ensure_child_belongs_to_user(child_id, current_user, db)
+    assignment_date = _current_hkt_date()
+
+    target_words = _normalize_string_list(
+        payload.target_words,
+        max_items=8,
+        max_length=24,
+    )
+    prompts = _normalize_string_list(
+        payload.conversation_prompts,
+        max_items=4,
+        max_length=120,
+    )
+
+    priority_result = await db.execute(
+        select(sa.func.min(MissionAssignment.priority)).where(
+            MissionAssignment.child_id == child.id,
+            MissionAssignment.assignment_date == assignment_date,
+        )
+    )
+    current_min_priority = priority_result.scalar_one_or_none()
+    priority = max((current_min_priority if current_min_priority is not None else 1) - 1, 0)
+
+    mission_id = str(uuid.uuid4())
+    slug = f"parent-micro-{child.id[:8]}-{assignment_date.strftime('%Y%m%d')}-{mission_id[:8]}"
+
+    mission = Mission(
+        id=mission_id,
+        slug=slug,
+        title=payload.title.strip(),
+        description=payload.description.strip(),
+        context=payload.context,
+        target_words=target_words,
+        conversation_prompts=prompts,
+        selection_tags=["parent_authored", "micro_mission"],
+        is_offline=True,
+        status=MissionStatus.PUBLISHED,
+        locale="zh-HK",
+        surface=MissionSurface.BOTH,
+        sort_order=0,
+        is_active=True,
+        catalog_metadata={
+            "author_type": "parent",
+            "author_user_id": current_user.id,
+            "child_id": child.id,
+            "micro_mission": True,
+            "created_local_date": assignment_date.isoformat(),
+            "delivery": "child_mode_direct",
+            "context": payload.context.value if isinstance(payload.context, MissionContext) else str(payload.context),
+        },
+    )
+    _apply_mission_lifecycle_defaults(mission)
+    db.add(mission)
+
+    assignment = MissionAssignment(
+        id=str(uuid.uuid4()),
+        child_id=child.id,
+        mission_id=mission.id,
+        assignment_date=assignment_date,
+        source=MissionAssignmentSource.PARENT,
+        status=MissionAssignmentStatus.ASSIGNED,
+        surface=MissionSurface.BOTH,
+        priority=priority,
+        selection_reason="Parent-authored micro-mission delivered to child mode",
+        selection_metadata={
+            "parent_authored": True,
+            "micro_mission": True,
+            "delivery": "child_mode_direct",
+        },
+    )
+    db.add(assignment)
+
+    await db.commit()
+    await db.refresh(mission)
+    await db.refresh(assignment)
+
+    return _serialize_assigned_mission(
+        mission=mission,
+        child_id=child.id,
+        assignment_date=assignment_date,
+        assignment=assignment,
     )
 
 
