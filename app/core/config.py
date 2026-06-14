@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     # Silicon Flow (image generation via Kolors)
     SILICONFLOW_API_KEY: str = ""
 
+    # Cloudflare Workers AI (transcription, image generation)
+    CLOUDFLARE_ACCOUNT_ID: str = ""
+    CF_ACCOUNT_ID: str = ""
+    CLOUDFLARE_AI_API_TOKEN: str = ""
+
     # AWS S3
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""

@@ -2,6 +2,11 @@
 FastAPI Backend for Preschool Vocabulary Platform
 Main application entry point
 """
+# Load .env into os.environ before any other imports so os.getenv() works
+# throughout the app (pydantic_settings alone does not populate os.environ).
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 from fastapi.middleware.cors import CORSMiddleware
