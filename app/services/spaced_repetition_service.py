@@ -145,6 +145,17 @@ async def get_review_queue(
     )
     due_cards = due_result.scalars().all()
 
+    # Existing new cards that were created earlier but not yet reviewed.
+    # Without this, is_new cards can disappear after reload because they are
+    # excluded from due-cards and also excluded from fresh-card creation.
+    existing_new_result = await db.execute(
+        select(SpacedRepetitionCard).where(
+            SpacedRepetitionCard.child_id == child_id,
+            SpacedRepetitionCard.is_new == True,
+        ).order_by(SpacedRepetitionCard.created_at.desc()).limit(max_new)
+    )
+    existing_new_cards = existing_new_result.scalars().all()
+
     # New cards – words the child has been exposed to but not yet in SR
     from app.models.vocabulary import WordProgress
     exposure_result = await db.execute(
@@ -162,7 +173,11 @@ async def get_review_queue(
     )
     existing_sr_ids = {row[0] for row in existing_sr_result.all()}
 
-    new_word_ids = [wid for wid in exposed_word_ids if wid not in existing_sr_ids][:max_new]
+    remaining_new_slots = max(max_new - len(existing_new_cards), 0)
+    new_word_ids = [
+        wid for wid in exposed_word_ids
+        if wid not in existing_sr_ids
+    ][:remaining_new_slots]
 
     # Create SR cards for new words
     new_cards: List[SpacedRepetitionCard] = []
@@ -171,7 +186,9 @@ async def get_review_queue(
         new_cards.append(card)
     await db.commit()
 
-    all_cards = list(due_cards) + new_cards
+    remaining_card_slots = max(max_cards - len(due_cards), 0)
+    pending_new_cards = (existing_new_cards + new_cards)[:remaining_card_slots]
+    all_cards = list(due_cards) + pending_new_cards
     all_word_ids = [c.word_id for c in all_cards]
 
     # Fetch words in one query
