@@ -24,8 +24,10 @@ from app.services.word_graph_service import (
     get_word_graph, get_graph_recommendations, add_relationship
 )
 from app.services.spaced_repetition_service import (
-    get_review_queue, process_review, get_learning_speed_profile
+    get_review_queue, process_review, get_learning_speed_profile,
+    AnkiSRSettings,
 )
+from app.models.parent_analytics import ParentalControl as ParentalControlModel
 
 router = APIRouter()
 
@@ -549,7 +551,21 @@ async def submit_review_result(
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Child not found")
 
-    return await process_review(db, child_id, payload.word_id, payload.quality)
+    # Load parent-configured Anki SM-2 settings (falls back to defaults if not set).
+    ctrl_result = await db.execute(
+        select(ParentalControlModel).where(ParentalControlModel.child_id == child_id)
+    )
+    ctrl = ctrl_result.scalar_one_or_none()
+    sr_settings = AnkiSRSettings(
+        easy_bonus          = getattr(ctrl, 'sr_easy_bonus',          1.3)    if ctrl else 1.3,
+        interval_modifier   = getattr(ctrl, 'sr_interval_modifier',   1.0)    if ctrl else 1.0,
+        max_interval_days   = getattr(ctrl, 'sr_max_interval_days',   36500)  if ctrl else 36500,
+        graduating_interval = getattr(ctrl, 'sr_graduating_interval', 1)      if ctrl else 1,
+        easy_interval       = getattr(ctrl, 'sr_easy_interval',       4)      if ctrl else 4,
+        lapse_interval_pct  = getattr(ctrl, 'sr_lapse_interval_pct',  0.0)    if ctrl else 0.0,
+    )
+
+    return await process_review(db, child_id, payload.word_id, payload.quality, sr_settings)
 
 
 @router.get(

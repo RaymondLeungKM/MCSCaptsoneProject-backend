@@ -1,19 +1,33 @@
 """
-Spaced Repetition Service – SM-2 Algorithm  (Epic 8.2)
+Spaced Repetition Service – Anki-modified SM-2 Algorithm  (Epic 8.2)
 
-The SuperMemo SM-2 algorithm determines the optimal next review date for
-each vocabulary card so that children revise words *just before* they would
-forget them, maximising long-term retention with minimal study time.
+Anki departs from the original SM-2 paper in several ways that improve
+real-world retention:
 
-Quality ratings (q) passed in from the frontend:
-  5 – perfect response, instant recall
-  4 – correct response, slight hesitation
-  3 – correct response, with serious difficulty
-  2 – incorrect; but upon seeing the answer it felt obvious  (reset)
-  1 – incorrect; the answer was hard to recall even after seeing it (reset)
-  0 – complete blackout                                               (reset)
+  1. Quality scale collapsed to four semantic buckets:
+       0-1  Again  – failed; card lapses and interval is reduced
+       2    Hard   – correct but harder than expected; small penalty
+       3    Good   – correct as expected; normal progression
+       4-5  Easy   – correct, easier than expected; bonus interval + EF boost
 
-Reference: https://www.supermemo.com/en/archives1990-2015/english/ol/sm2
+  2. Interval computation:
+       Again  →  max(lapse_min, round(old_interval * lapse_pct))   EF −0.20
+       Hard   →  max(1, round(old_interval * 1.2 * modifier))      EF −0.15
+       Good   →  graduating/easy interval for new cards;            EF unchanged
+                  round(old_interval * EF * modifier) for reviews
+       Easy   →  easy_interval for new cards;                       EF +0.15
+                  round(old_interval * EF * easy_bonus * modifier) for reviews
+
+  3. All intervals are capped at max_interval_days.
+  4. EF has a floor of 1.3 (same as original SM-2).
+
+Parent-configurable parameters (stored in parental_controls):
+  sr_easy_bonus          float  default 1.3   – multiplier added on Easy reviews
+  sr_interval_modifier   float  default 1.0   – global scale on every interval
+  sr_max_interval_days   int    default 36500  – ceiling
+  sr_graduating_interval int    default 1      – days after first Good on new card
+  sr_easy_interval       int    default 4      – days after first Easy on new/graduating card
+  sr_lapse_interval_pct  float  default 0.0   – fraction of interval kept after Again
 """
 from __future__ import annotations
 
@@ -33,41 +47,105 @@ from app.schemas.phase8 import (
 
 
 # ---------------------------------------------------------------------------
-# Pure SM-2 maths (no DB dependency)
+# Anki-modified SM-2 maths (no DB dependency)
 # ---------------------------------------------------------------------------
 
+class AnkiSRSettings:
+    """Value object holding Anki SM-2 tuning knobs."""
+    def __init__(
+        self,
+        easy_bonus: float = 1.3,
+        interval_modifier: float = 1.0,
+        max_interval_days: int = 36500,
+        graduating_interval: int = 1,
+        easy_interval: int = 4,
+        lapse_interval_pct: float = 0.0,
+    ) -> None:
+        self.easy_bonus          = max(1.0, easy_bonus)
+        self.interval_modifier   = max(0.1, interval_modifier)
+        self.max_interval_days   = max(1, max_interval_days)
+        self.graduating_interval = max(1, graduating_interval)
+        self.easy_interval       = max(1, easy_interval)
+        self.lapse_interval_pct  = max(0.0, min(1.0, lapse_interval_pct))
+
+
+DEFAULT_ANKI_SETTINGS = AnkiSRSettings()
+
+
+def anki_sm2_next(
+    quality: int,
+    repetitions: int,
+    easiness_factor: float,
+    interval: int,
+    settings: AnkiSRSettings = DEFAULT_ANKI_SETTINGS,
+) -> tuple[int, float, int]:
+    """
+    Compute the next Anki-modified SM-2 state.
+
+    Returns (new_interval_days, new_easiness_factor, new_repetitions).
+
+    Quality buckets (maps the 0-5 frontend scale):
+      0-1  → Again   (lapse)
+      2    → Hard
+      3    → Good
+      4-5  → Easy
+    """
+    quality = max(0, min(5, quality))
+    ef = max(1.3, easiness_factor)
+    mod = settings.interval_modifier
+    cap = settings.max_interval_days
+
+    if quality <= 1:
+        # Again / lapse
+        new_ef   = max(1.3, ef - 0.20)
+        lapse_iv = max(1, round(interval * settings.lapse_interval_pct))
+        new_interval  = min(lapse_iv, cap)
+        new_reps = 0
+
+    elif quality == 2:
+        # Hard – slightly punish EF, interval grows slowly
+        new_ef  = max(1.3, ef - 0.15)
+        if repetitions == 0:
+            # Hard on a brand-new card: stay at graduating interval
+            new_interval = min(settings.graduating_interval, cap)
+        else:
+            new_interval = min(max(1, round(interval * 1.2 * mod)), cap)
+        new_reps = repetitions + 1
+
+    elif quality == 3:
+        # Good – normal progression, EF unchanged
+        new_ef = ef
+        if repetitions == 0:
+            new_interval = min(settings.graduating_interval, cap)
+        elif repetitions == 1:
+            new_interval = min(settings.easy_interval, cap)
+        else:
+            new_interval = min(max(1, round(interval * ef * mod)), cap)
+        new_reps = repetitions + 1
+
+    else:
+        # Easy (quality 4-5) – bonus interval + EF boost
+        new_ef = min(ef + 0.15, 5.0)
+        if repetitions <= 1:
+            new_interval = min(settings.easy_interval, cap)
+        else:
+            new_interval = min(
+                max(1, round(interval * ef * settings.easy_bonus * mod)), cap
+            )
+        new_reps = repetitions + 1
+
+    return new_interval, round(new_ef, 4), new_reps
+
+
+# Keep the old name as an alias so any other callers don't break.
 def sm2_next(
     quality: int,
     repetitions: int,
     easiness_factor: float,
     interval: int,
 ) -> tuple[int, float, int]:
-    """
-    Compute the next SM-2 state.
-
-    Returns (new_interval_days, new_easiness_factor, new_repetitions).
-    """
-    # Cap quality to valid range
-    quality = max(0, min(5, quality))
-
-    if quality < 3:
-        # Incorrect – reset streak
-        new_repetitions = 0
-        new_interval    = 1
-    else:
-        if repetitions == 0:
-            new_interval = 1
-        elif repetitions == 1:
-            new_interval = 6
-        else:
-            new_interval = round(interval * easiness_factor)
-        new_repetitions = repetitions + 1
-
-    # Update easiness factor
-    new_ef = easiness_factor + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
-    new_ef = max(1.3, new_ef)   # floor at 1.3
-
-    return new_interval, round(new_ef, 4), new_repetitions
+    """Legacy wrapper – delegates to anki_sm2_next with default settings."""
+    return anki_sm2_next(quality, repetitions, easiness_factor, interval)
 
 
 # ---------------------------------------------------------------------------
@@ -211,14 +289,16 @@ async def process_review(
     child_id: str,
     word_id: str,
     quality: int,
+    settings: AnkiSRSettings = DEFAULT_ANKI_SETTINGS,
 ) -> ReviewResultResponse:
     """
-    Apply SM-2 to the card and persist the new state.
+    Apply Anki-modified SM-2 to the card and persist the new state.
+    Pass a populated AnkiSRSettings to use parent-configured tuning.
     """
     card = await _get_or_create_card(db, child_id, word_id)
 
-    new_interval, new_ef, new_reps = sm2_next(
-        quality, card.repetitions, card.easiness_factor, card.interval
+    new_interval, new_ef, new_reps = anki_sm2_next(
+        quality, card.repetitions, card.easiness_factor, card.interval, settings
     )
 
     now = datetime.now(timezone.utc)

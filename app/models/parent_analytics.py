@@ -187,6 +187,14 @@ class ParentalControl(Base):
     bedtime_story_reminder = Column(Boolean, default=True)
     weekly_report_enabled = Column(Boolean, default=True)
     achievement_notifications = Column(Boolean, default=True)
+
+    # Anki-modified SM-2 algorithm settings
+    sr_easy_bonus          = Column(Float,   default=1.3)    # Extra multiplier for Easy reviews
+    sr_interval_modifier   = Column(Float,   default=1.0)    # Global scale on every interval
+    sr_max_interval_days   = Column(Integer, default=36500)  # Hard ceiling (~100 yr)
+    sr_graduating_interval = Column(Integer, default=1)      # Days after first correct on new card
+    sr_easy_interval       = Column(Integer, default=4)      # Days for Easy on new card
+    sr_lapse_interval_pct  = Column(Float,   default=0.0)    # Fraction of interval kept after lapse
     
     created_at = Column(String, default=lambda: datetime.utcnow().isoformat())
     updated_at = Column(String, default=lambda: datetime.utcnow().isoformat(), onupdate=lambda: datetime.utcnow().isoformat())
