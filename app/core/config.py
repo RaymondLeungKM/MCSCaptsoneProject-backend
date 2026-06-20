@@ -56,7 +56,11 @@ class Settings(BaseSettings):
     # External bedtime story program adapter
     EXTERNAL_STORY_PROGRAM_DIR: str = "../story-generation-program"
     EXTERNAL_STORY_PYTHON_BIN: str = "python3"
-    EXTERNAL_STORY_TIMEOUT_SECONDS: int = 300
+    #EXTERNAL_STORY_TIMEOUT_SECONDS: int = 300
+    EXTERNAL_STORY_TIMEOUT_SECONDS: int = 1200 #vvn:20260618
+    # Directory where the external story program writes its outputs (audio, logs)
+    # By default this is a sibling folder next to the program dir
+    EXTERNAL_STORY_OUTPUT_DIR: str = "../story-generation-output"
     
     # Anthropic Claude
     ANTHROPIC_API_KEY: str = ""

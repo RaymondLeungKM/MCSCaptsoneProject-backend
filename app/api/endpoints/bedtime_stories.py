@@ -8,12 +8,11 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import select, and_, func
 from typing import List
 from datetime import datetime, date
 
-from app.db.session import get_db, engine
+from app.db.session import get_db
 from app.core.security import get_current_user
 from app.models.user import User, Child
 from app.models.daily_words import DailyWordTracking, GeneratedStory
@@ -56,6 +55,15 @@ THEME_TITLE_LABELS = {
     "bedtime": ("睡前", "Bedtime"),
 }
 
+THEME_ENGLISH_ALIASES = {
+    "冒險": "adventure",
+    "家庭": "family",
+    "動物": "animals",
+    "大自然": "nature",
+    "友誼": "friendship",
+    "睡前": "bedtime",
+}
+
 
 def _word_label(word: DailyWordSummary) -> str:
     return (word.word_cantonese or word.word or word.word_id).strip()
@@ -89,49 +97,19 @@ def _build_external_word_usage(words: List[DailyWordSummary]) -> dict[str, str]:
     }
 
 
-async def _insert_generated_story_log_audit(
-    story_id: str,
-    audit_values: dict[str, object],
-) -> None:
-    """Best-effort audit row for legacy generated_stories_log consumers."""
-    try:
-        async with engine.begin() as connection:
-            await connection.execute(
-                text(
-                    """
-                    INSERT INTO generated_stories_log (
-                        vocab_used,
-                        story_text,
-                        story_text_ssml,
-                        story_generate_provdier,
-                        story_generate_model,
-                        audio_filename,
-                        audio_generate_provider,
-                        audio_generate_voice_name,
-                        generated_at,
-                        generated_by
-                    ) VALUES (
-                        :vocab_used,
-                        :story_text,
-                        :story_text_ssml,
-                        :story_generate_provdier,
-                        :story_generate_model,
-                        :audio_filename,
-                        :audio_generate_provider,
-                        :audio_generate_voice_name,
-                        :generated_at,
-                        :generated_by
-                    )
-                    """
-                ),
-                audit_values,
-            )
-    except SQLAlchemyError as error:
-        logger.warning(
-            "Failed to insert generated_stories_log audit row for generated story %s: %s",
-            story_id,
-            error,
-        )
+def _normalize_theme_to_english(theme: str | None) -> str:
+    if not theme:
+        return "bedtime"
+
+    cleaned = theme.strip()
+    if not cleaned:
+        return "bedtime"
+
+    lowered = cleaned.lower()
+    if lowered in THEME_TITLE_LABELS:
+        return lowered
+
+    return THEME_ENGLISH_ALIASES.get(cleaned, "bedtime")
 
 
 async def _generate_story_with_internal_generator(
@@ -324,6 +302,9 @@ async def invoke_external_story_program(
     db: AsyncSession = Depends(get_db),
 ):
     """Invoke the external story-generation-program and persist into generated_stories."""
+    normalized_theme = _normalize_theme_to_english(request.theme)
+    normalized_request = request.model_copy(update={"theme": normalized_theme})
+
     child_query = select(Child).where(
         and_(Child.id == request.child_id, Child.parent_id == current_user.id)
     )
@@ -343,13 +324,12 @@ async def invoke_external_story_program(
             detail="No words learned today to include in story. Please complete some learning activities first.",
         )
 
-    vocab_words = _build_external_vocab_words(request.theme, words_used)
     generation_started = time.perf_counter()
 
     external_program_error = external_story_program_service.availability_error()
     if external_program_error:
         return await _generate_story_with_internal_generator(
-            request,
+            normalized_request,
             db,
             words_used,
             message=(
@@ -359,26 +339,29 @@ async def invoke_external_story_program(
         )
 
     try:
+        gen_date = (request.date or datetime.utcnow()).strftime("%Y-%m-%d")
         result = await run_in_threadpool(
             external_story_program_service.invoke,
-            vocab_words,
+            request.child_id,
+            gen_date,
+            normalized_theme,
         )
 
         persisted_at = datetime.utcnow()
-        title, title_english = _build_external_title(child.name, request.theme)
+        title, title_english = _build_external_title(child.name, normalized_theme)
         story = GeneratedStory(
             id=str(uuid.uuid4()),
             child_id=request.child_id,
             title=title,
             title_english=title_english,
-            theme=request.theme,
+            theme=normalized_theme,
             generation_date=persisted_at,
             generated_at=persisted_at,
             generated_by="external_story_program",
             content_cantonese=result.story_text,
             content_english=None,
             jyutping=None,
-            vocab_used=result.vocab_used[:500],
+            vocab_used=", ".join([_word_label(word) for word in words_used]),
             story_text=result.story_text,
             story_text_ssml=story_generator._build_story_ssml(result.story_text),
             story_generate_provdier="OpenRouter",
@@ -400,7 +383,7 @@ async def invoke_external_story_program(
             ai_model=result.llm_model,
             generation_prompt=(
                 f"External story program invoked for child={request.child_id}, "
-                f"theme={request.theme or 'bedtime'}, vocab={result.vocab_used}"
+                f"theme={normalized_theme}, vocab={result.vocab_used}"
             ),
             generation_time_seconds=time.perf_counter() - generation_started,
         )
@@ -409,21 +392,6 @@ async def invoke_external_story_program(
         await db.commit()
         await db.refresh(story)
         story_response = GeneratedStoryResponse.model_validate(story)
-        await _insert_generated_story_log_audit(
-            story.id,
-            {
-                "vocab_used": story.vocab_used,
-                "story_text": story.story_text,
-                "story_text_ssml": story.story_text_ssml,
-                "story_generate_provdier": story.story_generate_provdier,
-                "story_generate_model": story.story_generate_model,
-                "audio_filename": story.audio_filename,
-                "audio_generate_provider": story.audio_generate_provider,
-                "audio_generate_voice_name": story.audio_generate_voice_name,
-                "generated_at": story.generated_at,
-                "generated_by": "external_story_program_backend_api",
-            },
-        )
 
         return StoryGenerationResponse(
             story=story_response,
@@ -434,7 +402,7 @@ async def invoke_external_story_program(
         )
     except ExternalStoryProgramError as error:
         return await _generate_story_with_internal_generator(
-            request,
+            normalized_request,
             db,
             words_used,
             message=(

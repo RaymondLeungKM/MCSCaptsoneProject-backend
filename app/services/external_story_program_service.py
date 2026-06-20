@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Optional
 
 from app.core.config import settings
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 
 class ExternalStoryProgramError(RuntimeError):
@@ -93,14 +95,15 @@ class ExternalStoryProgramService:
                 if candidate.is_file():
                     return str(candidate)
 
+            # Avoid PATH-dependent resolution when backend runs inside a venv
+            # that may miss standalone dependencies (e.g. boto3 for AWS Polly).
+            system_python = Path("/usr/bin/python3")
+            if system_python.is_file():
+                return str(system_python)
+
         return configured_bin
 
-    @staticmethod
-    def _sanitize_words(vocab_words: list[str]) -> list[str]:
-        words = [w.strip() for w in vocab_words if isinstance(w, str) and w.strip()]
-        if not words:
-            raise ExternalStoryProgramError("At least one non-empty vocabulary word is required.")
-        return words
+
 
     @classmethod
     def _extract_story_text(cls, stdout: str) -> str:
@@ -213,16 +216,13 @@ class ExternalStoryProgramService:
         shutil.copy2(external_audio_path, copied_path)
         return copied_filename, str(copied_path)
 
-    def invoke(self, vocab_words: list[str]) -> ExternalStoryInvocationResult:
-        words = self._sanitize_words(vocab_words)
-        vocab_csv = ", ".join(words)
+    def invoke(self, child_id: str, gen_date: str, story_category: str) -> ExternalStoryInvocationResult:
         program_dir = self._resolve_program_dir()
         python_bin = self._resolve_python_bin(program_dir)
         timeout_seconds = max(30, int(settings.EXTERNAL_STORY_TIMEOUT_SECONDS))
         env = os.environ.copy()
-        env["STORY_PROGRAM_SKIP_DB_INSERT"] = "1"
 
-        command = [python_bin, str(program_dir / "main.py"), vocab_csv]
+        command = [python_bin, str(program_dir / "main.py"), child_id, gen_date, story_category]
 
         stdout, _ = self._run_program(
             program_dir=program_dir,
@@ -231,21 +231,100 @@ class ExternalStoryProgramService:
             timeout_seconds=timeout_seconds,
         )
 
-        story_text = self._extract_story_text(stdout)
-        story_text_ssml = self._extract_story_ssml(stdout)
-        external_audio_path = self._extract_audio_path(stdout, program_dir)
+        # Try to extract story text from stdout first. If it's not present
+        # but the external program printed a DB record id, fetch the story
+        # from the database instead.
         external_story_id = self._extract_optional(self.STORY_ID_PATTERN, stdout)
-        llm_model = self._extract_optional(self.MODEL_PATTERN, stdout)
+        vocab_from_db = None
+        llm_model_from_db = None
+        try:
+            story_text = self._extract_story_text(stdout)
+            story_text_ssml = self._extract_story_ssml(stdout)
+            external_audio_path = self._extract_audio_path(stdout, program_dir)
+        except ExternalStoryProgramError:
+            if not external_story_id:
+                # No story block and no record id — cannot continue
+                raise
+
+            # Query the backend DB for the generated story record
+            story_text = ""
+            story_text_ssml = ""
+            external_audio_path = None
+            try:
+                # Connect using sync psycopg2 to the configured DATABASE_URL
+                with psycopg2.connect(settings.DATABASE_URL) as conn:
+                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                        cur.execute(
+                            "SELECT story_text, story_text_ssml, audio_filename, vocab_used, story_generate_model_story1 "
+                            "FROM generated_stories_log WHERE story_id = %s",
+                            (external_story_id,)
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            story_text = row.get("story_text") or ""
+                            story_text_ssml = row.get("story_text_ssml") or ""
+                            audio_filename = row.get("audio_filename") or ""
+                            vocab_from_db = row.get("vocab_used") or ""
+                            llm_model_from_db = row.get("story_generate_model_story1") or None
+                            # Resolve audio path: try absolute, then program dir, then audio-output,
+                            # then try the sibling story-generation-output/audio-output directory
+                            candidate = Path(audio_filename)
+                            if not candidate.is_absolute():
+                                candidate = (program_dir / audio_filename).resolve()
+
+                            if not candidate.is_file():
+                                candidate = (program_dir / "audio-output" / audio_filename).resolve()
+
+                            if not candidate.is_file():
+                                # external program may write to a configured output dir (project root or absolute)
+                                configured_out = (settings.EXTERNAL_STORY_OUTPUT_DIR or "").strip() or "../story-generation-output"
+                                out_dir = Path(configured_out).expanduser()
+                                if not out_dir.is_absolute():
+                                    out_dir = (program_dir / out_dir).resolve()
+
+                                candidate = (out_dir / "audio-output" / audio_filename).resolve()
+
+                            if not candidate.is_file():
+                                # also try the output dir root (in case audio_filename includes subpath)
+                                configured_out = (settings.EXTERNAL_STORY_OUTPUT_DIR or "").strip() or "../story-generation-output"
+                                out_dir = Path(configured_out).expanduser()
+                                if not out_dir.is_absolute():
+                                    out_dir = (program_dir / out_dir).resolve()
+
+                                candidate = (out_dir / audio_filename).resolve()
+
+                            if candidate.is_file():
+                                external_audio_path = candidate
+                            else:
+                                external_audio_path = None
+                        else:
+                            raise ExternalStoryProgramError(
+                                f"External story record {external_story_id} not found in database."
+                            )
+            except Exception as db_err:
+                raise ExternalStoryProgramError(
+                    f"Failed to fetch story from DB for id {external_story_id}: {db_err}"
+                ) from db_err
+        llm_model = self._extract_optional(self.MODEL_PATTERN, stdout) or llm_model_from_db
         tts_provider_label = self._extract_optional(self.TTS_PROVIDER_PATTERN, stdout)
         tts_provider = self._provider_alias(tts_provider_label)
         voice_name = self._extract_optional(self.VOICE_NAME_PATTERN, stdout)
 
+        if not external_audio_path:
+            raise ExternalStoryProgramError("External audio file path not found in stdout or database record.")
+
         copied_filename, _ = self._copy_external_audio(external_audio_path, "external_story")
 
+        # Extract vocab_used from the stdout or DB result if available
+        try:
+            vocab_used = self._extract_optional(re.compile(r"Vocab used:\s*(.+)"), stdout) or vocab_from_db or ""
+        except Exception:
+            vocab_used = ""
+        
         return ExternalStoryInvocationResult(
             story_text=story_text,
             story_text_ssml=story_text_ssml,
-            vocab_used=vocab_csv,
+            vocab_used=vocab_used,
             audio_url=f"/uploads/audio/{copied_filename}",
             audio_filename=copied_filename,
             external_audio_path=str(external_audio_path),
@@ -265,7 +344,6 @@ class ExternalStoryProgramService:
         python_bin = self._resolve_python_bin(program_dir)
         timeout_seconds = max(30, int(settings.EXTERNAL_STORY_TIMEOUT_SECONDS))
         env = os.environ.copy()
-        env["STORY_PROGRAM_SKIP_DB_INSERT"] = "1"
         env["STORY_PROGRAM_STORY_TEXT"] = normalized_story_text
 
         command = [python_bin, str(program_dir / "main.py")]
