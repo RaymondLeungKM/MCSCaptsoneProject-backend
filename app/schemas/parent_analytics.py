@@ -133,6 +133,14 @@ class ParentalControlResponse(BaseModel):
     weekly_report_enabled: bool = True
     achievement_notifications: bool = True
 
+    # Anki-modified SM-2 settings
+    sr_easy_bonus: float = 1.3
+    sr_interval_modifier: float = 1.0
+    sr_max_interval_days: int = 36500
+    sr_graduating_interval: int = 1
+    sr_easy_interval: int = 4
+    sr_lapse_interval_pct: float = 0.0
+
     class Config:
         from_attributes = True
 
@@ -158,6 +166,14 @@ class ParentalControlUpdateRequest(BaseModel):
     bedtime_story_reminder: Optional[bool] = None
     weekly_report_enabled: Optional[bool] = None
     achievement_notifications: Optional[bool] = None
+
+    # Anki-modified SM-2 settings
+    sr_easy_bonus: Optional[float] = None
+    sr_interval_modifier: Optional[float] = None
+    sr_max_interval_days: Optional[int] = None
+    sr_graduating_interval: Optional[int] = None
+    sr_easy_interval: Optional[int] = None
+    sr_lapse_interval_pct: Optional[float] = None
 
 
 # Dashboard Summary Schemas
