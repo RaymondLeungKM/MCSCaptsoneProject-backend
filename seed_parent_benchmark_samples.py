@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import random
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
@@ -60,6 +62,15 @@ BENCHMARK_WORDS_PER_CATEGORY = 4
 BENCHMARK_MISSION_SOURCE = "seed"
 
 MISSION_CONTEXT_OPTIONS = ["playtime", "mealtime", "bedtime", "outdoor", "general"]
+WEEKDAY_ACTIVITY_BIAS = {
+    0: 0.10,
+    1: 0.06,
+    2: 0.03,
+    3: 0.05,
+    4: 0.08,
+    5: -0.07,
+    6: -0.10,
+}
 
 
 @dataclass(frozen=True)
@@ -88,6 +99,117 @@ def _age_for_band(age_band: str, index: int = 0) -> int:
     if age_band == "7+":
         return 7 + (index % 3)
     return 5
+
+
+def _clamp_int(value: int, lower: int, upper: int) -> int:
+    return max(lower, min(upper, value))
+
+
+def _clamp_float(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _build_daily_participation_profile(
+    *,
+    day: date,
+    day_index: int,
+    total_days: int,
+    child_seed: int,
+    child_index: int,
+    is_target: bool,
+) -> dict[str, object]:
+    profile_rng = random.Random(f"benchmark-profile:{child_seed}:{child_index}:{int(is_target)}")
+    day_rng = random.Random(f"benchmark-day:{child_seed}:{child_index}:{day.toordinal()}")
+
+    phase = day_index / max(total_days - 1, 1)
+    weekday_bias = WEEKDAY_ACTIVITY_BIAS[day.weekday()]
+    child_baseline = 0.50 + (0.05 if is_target else -0.02) + profile_rng.uniform(-0.08, 0.07)
+    trend = profile_rng.uniform(-0.04, 0.06) * phase
+    burst = 0.0
+    burst_roll = day_rng.random()
+    if burst_roll < 0.08:
+        burst = 0.12 + profile_rng.uniform(0.0, 0.05)
+    elif burst_roll < 0.14:
+        burst = -0.10 - profile_rng.uniform(0.0, 0.04)
+
+    score = child_baseline + weekday_bias + trend + burst + day_rng.uniform(-0.10, 0.10)
+    active_threshold = 0.56 if is_target else 0.58
+    is_active = score >= active_threshold
+
+    if not is_active:
+        return {"is_active": False}
+
+    intensity = _clamp_float(0.38 + (score * 0.42) + day_rng.uniform(-0.04, 0.06), 0.22, 0.94)
+    words_encountered = _clamp_int(
+        int(round(5 + (score * 6) + day_rng.randint(0, 3))),
+        4,
+        14,
+    )
+    words_mastered = _clamp_int(
+        int(round(1 + (score * 2.5) + day_rng.randint(0, 1))),
+        1,
+        max(1, words_encountered - 1),
+    )
+    minutes_total = _clamp_int(
+        int(round(10 + (score * 16) + day_rng.randint(-1, 5))),
+        8,
+        28,
+    )
+    mission_assigned = _clamp_int(
+        1 + int(score > 0.68) + int(day_rng.random() > 0.75),
+        1,
+        3,
+    )
+    mission_completed = min(
+        mission_assigned,
+        1 + int(score > 0.74) + int(day_rng.random() > 0.58),
+    )
+
+    return {
+        "is_active": True,
+        "words_encountered": words_encountered,
+        "words_mastered": words_mastered,
+        "minutes_total": minutes_total,
+        "mission_assigned": mission_assigned,
+        "mission_completed": mission_completed,
+        "engagement_avg": round(intensity, 2),
+    }
+
+
+def _count_recent_active_days(active_days: list[date], current_day: date, window_days: int) -> int:
+    start_day = current_day - timedelta(days=window_days - 1)
+    return sum(1 for active_day in active_days if start_day <= active_day <= current_day)
+
+
+async def _clear_seeded_participation_rows(
+    db,
+    *,
+    child_ids: list[str],
+    start_day: date,
+    end_day: date,
+) -> None:
+    await db.execute(
+        delete(ChildDayAnalytics).where(
+            ChildDayAnalytics.child_id.in_(child_ids),
+            ChildDayAnalytics.activity_day >= start_day,
+            ChildDayAnalytics.activity_day <= end_day,
+        )
+    )
+    await db.execute(
+        delete(ContentPerformanceAnalytics).where(
+            ContentPerformanceAnalytics.child_id.in_(child_ids),
+            ContentPerformanceAnalytics.activity_day >= start_day,
+            ContentPerformanceAnalytics.activity_day <= end_day,
+        )
+    )
+    await db.execute(
+        delete(MissionOutcomeAnalytics).where(
+            MissionOutcomeAnalytics.child_id.in_(child_ids),
+            MissionOutcomeAnalytics.activity_day >= start_day,
+            MissionOutcomeAnalytics.activity_day <= end_day,
+            MissionOutcomeAnalytics.source.in_(["seed", "seed-benchmark"]),
+        )
+    )
 
 
 async def _resolve_target_context(db, *, target_email: str, child_id: str | None) -> TargetContext:
@@ -253,8 +375,8 @@ async def _upsert_day_row(
     row.engagement_events_count = max(minutes_total // 5, 1)
     row.engagement_score_sum = engagement_avg * row.engagement_events_count
     row.engagement_score_avg = engagement_avg
-    row.active_days_7d = min(7, 1)
-    row.active_days_28d = min(28, 1)
+    row.active_days_7d = 1
+    row.active_days_28d = 1
 
 
 async def _load_benchmark_category_word_pool(
@@ -571,35 +693,71 @@ async def seed_benchmark_samples(
         # Persist parent/child rows first so analytics upserts satisfy FK checks.
         await db.flush()
 
-        # One active day every 3 days across the selected window keeps rows compact
-        # while still making the benchmark cards meaningful for 90-day views.
+        seeded_child_ids = [target.child.id, *[child.id for child in peer_children]]
         today = date.today()
-        practiced_at = datetime.now(timezone.utc)
-        day_offsets = list(range(0, range_days, 3))
+        range_start = today - timedelta(days=range_days - 1)
+        await _clear_seeded_participation_rows(
+            db,
+            child_ids=seeded_child_ids,
+            start_day=range_start,
+            end_day=today,
+        )
 
-        for offset in day_offsets:
+        practiced_at = datetime.now(timezone.utc)
+        day_offsets = list(range(range_days - 1, -1, -1))
+        active_history_by_child: dict[str, list[date]] = defaultdict(list)
+        target_seed = 1000
+
+        for day_index, offset in enumerate(day_offsets):
             day = today - timedelta(days=offset)
             day_seed = (today - day).days
 
-            # Target child profile: slightly stronger than cohort average so card is visible.
-            await _upsert_day_row(
-                db,
-                child_id=target.child.id,
+            target_profile = _build_daily_participation_profile(
                 day=day,
-                age_band=age_band,
-                words_encountered=8,
-                words_mastered=3,
-                minutes_total=22,
-                mission_assigned=2,
-                mission_completed=2,
-                engagement_avg=0.78,
+                day_index=day_index,
+                total_days=range_days,
+                child_seed=target_seed,
+                child_index=0,
+                is_target=True,
             )
+            if target_profile["is_active"]:
+                active_history_by_child[target.child.id].append(day)
+                await _upsert_day_row(
+                    db,
+                    child_id=target.child.id,
+                    day=day,
+                    age_band=age_band,
+                    words_encountered=int(target_profile["words_encountered"]),
+                    words_mastered=int(target_profile["words_mastered"]),
+                    minutes_total=int(target_profile["minutes_total"]),
+                    mission_assigned=int(target_profile["mission_assigned"]),
+                    mission_completed=int(target_profile["mission_completed"]),
+                    engagement_avg=float(target_profile["engagement_avg"]),
+                )
+                target_row_result = await db.execute(
+                    select(ChildDayAnalytics).where(
+                        ChildDayAnalytics.child_id == target.child.id,
+                        ChildDayAnalytics.activity_day == day,
+                    )
+                )
+                target_row = target_row_result.scalar_one_or_none()
+                if target_row is not None:
+                    target_row.active_days_7d = _count_recent_active_days(
+                        active_history_by_child[target.child.id],
+                        day,
+                        7,
+                    )
+                    target_row.active_days_28d = _count_recent_active_days(
+                        active_history_by_child[target.child.id],
+                        day,
+                        28,
+                    )
             await _replace_seeded_mission_outcomes_for_day(
                 db,
                 child_id=target.child.id,
                 day=day,
                 age_band=age_band,
-                child_seed=1000 + day_seed,
+                child_seed=target_seed + day_seed,
             )
             await _seed_content_performance_profile(
                 db,
@@ -607,28 +765,57 @@ async def seed_benchmark_samples(
                 child_id=target.child.id,
                 age_band=age_band,
                 templates=content_templates,
-                child_seed=1000 + day_seed,
+                child_seed=target_seed + day_seed,
             )
 
             for index, peer in enumerate(peer_children, start=1):
-                await _upsert_day_row(
-                    db,
-                    child_id=peer.id,
+                peer_seed = 2000 + (index * 37)
+                peer_profile = _build_daily_participation_profile(
                     day=day,
-                    age_band=age_band,
-                    words_encountered=5 + (index % 4),
-                    words_mastered=1 + (index % 3),
-                    minutes_total=14 + (index % 8),
-                    mission_assigned=2,
-                    mission_completed=1 + (index % 2),
-                    engagement_avg=0.55 + ((index % 5) * 0.06),
+                    day_index=day_index,
+                    total_days=range_days,
+                    child_seed=peer_seed,
+                    child_index=index,
+                    is_target=False,
                 )
+                if peer_profile["is_active"]:
+                    active_history_by_child[peer.id].append(day)
+                    await _upsert_day_row(
+                        db,
+                        child_id=peer.id,
+                        day=day,
+                        age_band=age_band,
+                        words_encountered=int(peer_profile["words_encountered"]),
+                        words_mastered=int(peer_profile["words_mastered"]),
+                        minutes_total=int(peer_profile["minutes_total"]),
+                        mission_assigned=int(peer_profile["mission_assigned"]),
+                        mission_completed=int(peer_profile["mission_completed"]),
+                        engagement_avg=float(peer_profile["engagement_avg"]),
+                    )
+                    peer_row_result = await db.execute(
+                        select(ChildDayAnalytics).where(
+                            ChildDayAnalytics.child_id == peer.id,
+                            ChildDayAnalytics.activity_day == day,
+                        )
+                    )
+                    peer_row = peer_row_result.scalar_one_or_none()
+                    if peer_row is not None:
+                        peer_row.active_days_7d = _count_recent_active_days(
+                            active_history_by_child[peer.id],
+                            day,
+                            7,
+                        )
+                        peer_row.active_days_28d = _count_recent_active_days(
+                            active_history_by_child[peer.id],
+                            day,
+                            28,
+                        )
                 await _replace_seeded_mission_outcomes_for_day(
                     db,
                     child_id=peer.id,
                     day=day,
                     age_band=age_band,
-                    child_seed=index + day_seed,
+                    child_seed=peer_seed + day_seed,
                 )
                 await _seed_content_performance_profile(
                     db,
@@ -636,7 +823,7 @@ async def seed_benchmark_samples(
                     child_id=peer.id,
                     age_band=age_band,
                     templates=content_templates,
-                    child_seed=index + day_seed,
+                    child_seed=peer_seed + day_seed,
                 )
 
         await _seed_category_progress_profile(
@@ -670,7 +857,7 @@ async def seed_benchmark_samples(
         print(f"[seed-benchmark] target_child={target.child.name} id={target.child.id}")
         print(f"[seed-benchmark] age_band={age_band}")
         print(f"[seed-benchmark] peer_children_seeded={len(peer_children)}")
-        print(f"[seed-benchmark] day_rows_per_child={len(day_offsets)}")
+        print(f"[seed-benchmark] day_window_days={range_days}")
         print(f"[seed-benchmark] mission_source={BENCHMARK_MISSION_SOURCE}")
         print(f"[seed-benchmark] content_templates={len(content_templates)}")
         print(
