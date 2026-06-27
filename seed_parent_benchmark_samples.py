@@ -141,15 +141,23 @@ def _build_daily_participation_profile(
 
     intensity = _clamp_float(0.38 + (score * 0.42) + day_rng.uniform(-0.04, 0.06), 0.22, 0.94)
     words_encountered = _clamp_int(
-        int(round(5 + (score * 6) + day_rng.randint(0, 3))),
-        4,
-        14,
+        int(round(3 + (score * 4) + day_rng.randint(0, 2))),
+        2,
+        9,
     )
-    words_mastered = _clamp_int(
-        int(round(1 + (score * 2.5) + day_rng.randint(0, 1))),
-        1,
-        max(1, words_encountered - 1),
-    )
+
+    # Keep mastery sparse in benchmark seeding so platform-level daily averages
+    # are plausible even with a larger synthetic peer cohort.
+    if is_target:
+        mastery_probability = _clamp_float(0.20 + max(score - 0.56, 0.0) * 0.60, 0.06, 0.62)
+    else:
+        mastery_probability = _clamp_float(0.07 + max(score - 0.60, 0.0) * 0.30, 0.02, 0.30)
+
+    words_mastered = 1 if day_rng.random() < mastery_probability else 0
+    if words_mastered > 0 and score > 0.82 and day_rng.random() < (0.10 if is_target else 0.03):
+        words_mastered += 1
+    words_mastered = _clamp_int(words_mastered, 0, max(0, words_encountered // 2))
+
     minutes_total = _clamp_int(
         int(round(10 + (score * 16) + day_rng.randint(-1, 5))),
         8,
