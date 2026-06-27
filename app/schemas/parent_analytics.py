@@ -257,3 +257,39 @@ class AnalyticsChartsResponse(BaseModel):
     learning_style_distribution: Dict[str, int]  # activity_type: count
     best_time_of_day: str
     average_session_length: int  # minutes
+
+
+class BenchmarkSuppression(BaseModel):
+    is_suppressed: bool
+    reason: Optional[str] = None
+    minimum_cohort_threshold: int
+
+
+class BenchmarkCard(BaseModel):
+    band: str
+    percentile_band: str
+    trend: str
+    child_value: float
+    cohort_value: float
+    tips: str
+
+
+class CategoryBenchmarkCard(BaseModel):
+    category_id: str
+    category_name: str
+    band: str
+    percentile_band: str
+    trend: str
+    child_value: float
+    cohort_value: float
+    tips: str
+
+
+class ParentBenchmarksResponse(BaseModel):
+    child_id: str
+    age_band: str
+    range_days: int
+    pace_benchmark: Optional[BenchmarkCard] = None
+    engagement_benchmark: Optional[BenchmarkCard] = None
+    category_benchmarks: List[CategoryBenchmarkCard] = Field(default_factory=list)
+    suppression: BenchmarkSuppression

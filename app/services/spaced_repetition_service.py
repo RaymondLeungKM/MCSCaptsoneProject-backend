@@ -31,18 +31,24 @@ Parent-configurable parameters (stored in parental_controls):
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.phase8 import SpacedRepetitionCard
-from app.models.vocabulary import Word
-from app.schemas.phase8 import (
+from app.models.word_personalization import SpacedRepetitionCard, WordRelationship
+from app.models.vocabulary import Word, WordProgress
+from app.schemas.word_personalization import (
+    ReviewQueueFeatures,
     SpacedRepetitionCardResponse,
     ReviewQueueResponse,
     ReviewResultResponse,
+)
+from app.services.word_graph_service import (
+    build_relationship_maps,
+    compute_graph_queue_score,
 )
 
 
@@ -152,7 +158,12 @@ def sm2_next(
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def _enrich(card: SpacedRepetitionCard, word: Word) -> SpacedRepetitionCardResponse:
+def _enrich(
+    card: SpacedRepetitionCard,
+    word: Word,
+    queue_reason: str | None = None,
+    queue_features: ReviewQueueFeatures | None = None,
+) -> SpacedRepetitionCardResponse:
     return SpacedRepetitionCardResponse(
         id=card.id,
         child_id=card.child_id,
@@ -171,6 +182,8 @@ def _enrich(card: SpacedRepetitionCard, word: Word) -> SpacedRepetitionCardRespo
         image_url=word.image_url if word else None,
         audio_url=word.audio_url if word else None,
         definition_cantonese=word.definition_cantonese if word else None,
+        queue_reason=queue_reason,
+        queue_features=queue_features,
     )
 
 
@@ -194,6 +207,137 @@ async def _get_or_create_card(
         db.add(card)
         await db.flush()  # get the id
     return card
+
+
+@dataclass
+class _QueueCandidate:
+    card: SpacedRepetitionCard
+    word: Word | None
+    reason: str
+    due_score: float
+    graph_score: float
+    bridge_score: float
+    centrality_score: float
+    weak_link_boost: float
+    quick_win_score: float
+    base_score: float
+    category: str
+    diversity_penalty: float = 0.0
+    final_score: float = 0.0
+
+
+def _compute_due_score(card: SpacedRepetitionCard, now: datetime) -> float:
+    if card.is_new:
+        return 0.05
+
+    overdue_seconds = max((now - card.next_review).total_seconds(), 0.0)
+    overdue_days = overdue_seconds / 86400
+    overdue_component = min(1.2, overdue_days / 3.0)
+    repetition_component = min(0.3, card.repetitions * 0.04)
+
+    return round(min(1.5, overdue_component + repetition_component), 4)
+
+
+def _compute_weak_link_ratio(progress: WordProgress | None) -> float:
+    if not progress or progress.total_attempts <= 0:
+        return 0.0
+
+    low_success = max(0.0, (0.8 - progress.success_rate) / 0.8)
+    exposure_pressure = min(1.0, progress.exposure_count / 10.0)
+    not_mastered_bonus = 0.2 if not progress.mastered else 0.0
+
+    return round(min(1.0, low_success * 0.7 + exposure_pressure * 0.3 + not_mastered_bonus), 4)
+
+
+def _compute_quick_win_score(
+    card: SpacedRepetitionCard,
+    progress: WordProgress | None,
+) -> float:
+    if card.is_new:
+        return 0.0
+
+    success_rate = progress.success_rate if progress and progress.total_attempts > 0 else 0.75
+    success_component = max(0.0, min(1.0, success_rate)) * 0.5
+    repetition_component = min(1.0, card.repetitions / 6.0) * 0.3
+    ef_component = min(1.0, max(card.easiness_factor - 2.0, 0.0) / 1.5) * 0.2
+
+    return round(success_component + repetition_component + ef_component, 4)
+
+
+def _resolve_primary_reason(
+    *,
+    due_score: float,
+    bridge_score: float,
+    weak_link_ratio: float,
+    quick_win_score: float,
+) -> str:
+    if weak_link_ratio >= 0.65:
+        return "weak_link"
+    if bridge_score >= 0.55:
+        return "bridge"
+    if due_score >= 0.75:
+        return "due"
+    if quick_win_score >= 0.7:
+        return "quick_win"
+    return "balance"
+
+
+def _composition_caps(max_cards: int) -> dict[str, int]:
+    return {
+        "due": max(1, int(max_cards * 0.6)),
+        "bridge": max(1, int(max_cards * 0.2)),
+        "quick_win": max(1, int(max_cards * 0.2)),
+        "weak_link": max(1, int(max_cards * 0.25)),
+    }
+
+
+def _select_ranked_candidates(
+    candidates: list[_QueueCandidate],
+    max_cards: int,
+) -> list[_QueueCandidate]:
+    selected: list[_QueueCandidate] = []
+    remaining = list(candidates)
+    reason_counts: dict[str, int] = {}
+    caps = _composition_caps(max_cards)
+
+    while remaining and len(selected) < max_cards:
+        best_index = 0
+        best_score = float("-inf")
+
+        for index, candidate in enumerate(remaining):
+            penalty = 0.0
+            reason_cap = caps.get(candidate.reason)
+
+            if reason_cap is not None and reason_counts.get(candidate.reason, 0) >= reason_cap:
+                penalty += 0.28
+
+            if selected:
+                if selected[-1].category == candidate.category:
+                    penalty += 0.12
+                if len(selected) >= 2 and selected[-2].category == candidate.category:
+                    penalty += 0.23
+
+            adjusted_score = candidate.base_score - penalty
+            tie_breaker = (candidate.base_score, -candidate.card.next_review.timestamp(), candidate.card.word_id)
+            if (adjusted_score, tie_breaker) > (
+                best_score,
+                (
+                    remaining[best_index].base_score,
+                    -remaining[best_index].card.next_review.timestamp(),
+                    remaining[best_index].card.word_id,
+                ),
+            ):
+                best_score = adjusted_score
+                best_index = index
+
+        picked = remaining.pop(best_index)
+
+        picked.diversity_penalty = round(max(0.0, picked.base_score - best_score), 4)
+        picked.final_score = round(best_score, 4)
+        selected.append(picked)
+        reason_counts[picked.reason] = reason_counts.get(picked.reason, 0) + 1
+
+    return selected
 
 
 # ---------------------------------------------------------------------------
@@ -269,13 +413,114 @@ async def get_review_queue(
     all_cards = list(due_cards) + pending_new_cards
     all_word_ids = [c.word_id for c in all_cards]
 
+    if not all_cards:
+        return ReviewQueueResponse(cards=[], total_due=0, new_cards_today=0)
+
     # Fetch words in one query
     words_result = await db.execute(
         select(Word).where(Word.id.in_(all_word_ids))
     )
     word_map = {w.id: w for w in words_result.scalars().all()}
 
-    enriched = [_enrich(c, word_map.get(c.word_id)) for c in all_cards]
+    progress_result = await db.execute(
+        select(WordProgress).where(
+            WordProgress.child_id == child_id,
+            WordProgress.word_id.in_(all_word_ids),
+        )
+    )
+    progress_map = {progress.word_id: progress for progress in progress_result.scalars().all()}
+
+    known_progress_result = await db.execute(
+        select(WordProgress.word_id).where(
+            WordProgress.child_id == child_id,
+            WordProgress.exposure_count > 0,
+        )
+    )
+    known_word_ids = {row[0] for row in known_progress_result.all()}
+
+    graph_scope_word_ids = set(all_word_ids) | known_word_ids
+    relationships_result = await db.execute(
+        select(WordRelationship).where(
+            WordRelationship.word_id.in_(list(graph_scope_word_ids)),
+            WordRelationship.related_word_id.in_(list(graph_scope_word_ids)),
+        )
+    )
+    relationships = relationships_result.scalars().all()
+    outgoing_map, incoming_degree = build_relationship_maps(relationships)
+
+    candidates: list[_QueueCandidate] = []
+    for card in all_cards:
+        progress = progress_map.get(card.word_id)
+        weak_link_ratio = _compute_weak_link_ratio(progress)
+        graph_score = compute_graph_queue_score(
+            card.word_id,
+            outgoing_map=outgoing_map,
+            incoming_degree=incoming_degree,
+            known_word_ids=known_word_ids,
+            weak_link_ratio=weak_link_ratio,
+        )
+        due_score = _compute_due_score(card, now)
+        quick_win_score = _compute_quick_win_score(card, progress)
+        base_score = round(
+            due_score * 0.52
+            + graph_score.graph_score * 0.33
+            + quick_win_score * 0.15,
+            4,
+        )
+        reason = _resolve_primary_reason(
+            due_score=due_score,
+            bridge_score=graph_score.bridge_score,
+            weak_link_ratio=weak_link_ratio,
+            quick_win_score=quick_win_score,
+        )
+
+        word = word_map.get(card.word_id)
+        category = word.category if word and word.category else "unknown"
+
+        candidates.append(
+            _QueueCandidate(
+                card=card,
+                word=word,
+                reason=reason,
+                due_score=due_score,
+                graph_score=graph_score.graph_score,
+                bridge_score=graph_score.bridge_score,
+                centrality_score=graph_score.centrality_score,
+                weak_link_boost=graph_score.weak_link_boost,
+                quick_win_score=quick_win_score,
+                base_score=base_score,
+                category=category,
+            )
+        )
+
+    # Deterministic baseline ordering before applying composition and diversity balancing.
+    candidates.sort(
+        key=lambda candidate: (
+            -candidate.base_score,
+            candidate.card.next_review,
+            candidate.card.word_id,
+        )
+    )
+
+    selected_candidates = _select_ranked_candidates(candidates, max_cards)
+
+    enriched = [
+        _enrich(
+            candidate.card,
+            candidate.word,
+            queue_reason=candidate.reason,
+            queue_features=ReviewQueueFeatures(
+                due_score=candidate.due_score,
+                graph_score=candidate.graph_score,
+                bridge_score=candidate.bridge_score,
+                centrality_score=candidate.centrality_score,
+                weak_link_boost=candidate.weak_link_boost,
+                diversity_penalty=candidate.diversity_penalty,
+                final_score=candidate.final_score,
+            ),
+        )
+        for candidate in selected_candidates
+    ]
 
     return ReviewQueueResponse(
         cards=enriched,

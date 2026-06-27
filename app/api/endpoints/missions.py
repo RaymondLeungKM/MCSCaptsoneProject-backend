@@ -34,6 +34,12 @@ from app.models.content import (
 from app.models.user import User, Child
 from app.core.child_age import calculate_child_age
 from app.core.security import get_current_active_user, get_current_admin_user
+from app.services.analytics_foundation import (
+    AnalyticsEventInput,
+    AnalyticsEventType,
+    write_analytics_event,
+)
+from app.services.cluster_mission_service import generate_cluster_mission_draft
 
 router = APIRouter()
 
@@ -342,6 +348,31 @@ def _select_missions_for_assignment(
     return selected
 
 
+def _dedupe_missions_by_id(missions: list[Mission]) -> list[Mission]:
+    deduped: list[Mission] = []
+    seen_ids: set[str] = set()
+
+    for mission in missions:
+        if mission.id in seen_ids:
+            continue
+        seen_ids.add(mission.id)
+        deduped.append(mission)
+
+    return deduped
+
+
+def _is_generated_cluster_mission(mission: Mission) -> bool:
+    metadata = mission.catalog_metadata or {}
+    tags = mission.selection_tags or []
+    if metadata.get("cluster_id"):
+        return True
+    return "concept_cluster" in tags and "graph_generated" in tags
+
+
+def _exclude_generated_cluster_missions(missions: list[Mission]) -> list[Mission]:
+    return [mission for mission in missions if not _is_generated_cluster_mission(mission)]
+
+
 def _mission_created_at_sort_value(mission: Mission) -> datetime:
     if mission.created_at is None:
         return datetime.min
@@ -575,7 +606,9 @@ async def _generate_assignments_for_date(
         )
         .order_by(Mission.sort_order.asc(), Mission.created_at.asc())
     )
-    candidate_missions = catalog_result.scalars().all()
+    candidate_missions = _exclude_generated_cluster_missions(
+        catalog_result.scalars().all()
+    )
     assignment_history = await _get_assignment_history(
         child_id=child.id,
         mission_ids=[mission.id for mission in candidate_missions],
@@ -587,58 +620,179 @@ async def _generate_assignments_for_date(
         assignment_history=assignment_history,
         assignment_date=assignment_date,
     )
+    assignment_limit = MAX_OFFLINE_ASSIGNMENTS if is_offline else MAX_DAILY_ASSIGNMENTS
     selected_missions = _select_missions_for_assignment(
         ranked_missions,
-        limit=MAX_OFFLINE_ASSIGNMENTS if is_offline else MAX_DAILY_ASSIGNMENTS,
+        limit=assignment_limit,
     )
+
+    if not is_offline and assignment_limit > 0:
+        cluster_draft = await generate_cluster_mission_draft(
+            db,
+            child_id=child.id,
+            assignment_date=assignment_date,
+        )
+        if cluster_draft:
+            cluster_slug = (
+                f"cluster-{child.id[:8]}-{assignment_date.strftime('%Y%m%d')}-{cluster_draft.seed_word_id[:8]}"
+            )
+            cluster_metadata = {
+                "cluster_id": cluster_draft.cluster_id,
+                "seed_word_id": cluster_draft.seed_word_id,
+                "cluster_depth": cluster_draft.cluster_depth,
+                "cluster_strategy": cluster_draft.cluster_strategy,
+                "cluster_theme_label": cluster_draft.theme_label,
+                "cluster_related_theme_labels": cluster_draft.related_theme_labels,
+                "target_word_ids": cluster_draft.target_word_ids,
+                "target_words_display": cluster_draft.target_words_display,
+                "generated_for_child_id": child.id,
+                "generated_local_date": assignment_date.isoformat(),
+            }
+
+            existing_cluster_result = await db.execute(
+                select(Mission).where(Mission.slug == cluster_slug)
+            )
+            cluster_mission = existing_cluster_result.scalar_one_or_none()
+
+            if cluster_mission:
+                # Reuse deterministic cluster slug and refresh mission content so
+                # retries remain idempotent and avoid unique-slug collisions.
+                cluster_mission.title = cluster_draft.title
+                cluster_mission.description = cluster_draft.description
+                cluster_mission.context = MissionContext(cluster_draft.context)
+                cluster_mission.target_words = cluster_draft.target_words_display
+                cluster_mission.conversation_prompts = cluster_draft.conversation_prompts
+                cluster_mission.selection_tags = ["concept_cluster", "graph_generated"]
+                cluster_mission.is_offline = False
+                cluster_mission.status = MissionStatus.PUBLISHED
+                cluster_mission.locale = "zh-HK"
+                cluster_mission.age_min = max(child_age - 1, 2)
+                cluster_mission.age_max = child_age + 1
+                cluster_mission.surface = MissionSurface.CHILD
+                cluster_mission.sort_order = 0
+                cluster_mission.is_active = True
+                cluster_mission.catalog_metadata = cluster_metadata
+            else:
+                cluster_mission = Mission(
+                    id=str(uuid.uuid4()),
+                    slug=cluster_slug,
+                    title=cluster_draft.title,
+                    description=cluster_draft.description,
+                    context=MissionContext(cluster_draft.context),
+                    target_words=cluster_draft.target_words_display,
+                    conversation_prompts=cluster_draft.conversation_prompts,
+                    selection_tags=["concept_cluster", "graph_generated"],
+                    is_offline=False,
+                    status=MissionStatus.PUBLISHED,
+                    locale="zh-HK",
+                    age_min=max(child_age - 1, 2),
+                    age_max=child_age + 1,
+                    surface=MissionSurface.CHILD,
+                    sort_order=0,
+                    is_active=True,
+                    catalog_metadata=cluster_metadata,
+                )
+                _apply_mission_lifecycle_defaults(cluster_mission)
+                db.add(cluster_mission)
+
+            remainder = _select_missions_for_assignment(
+                ranked_missions,
+                limit=max(assignment_limit - 1, 0),
+            )
+            selected_missions = _dedupe_missions_by_id(
+                [cluster_mission] + remainder
+            )[:assignment_limit]
+
+    selected_missions = _dedupe_missions_by_id(selected_missions)[:assignment_limit]
 
     if not selected_missions:
         return
+
+    created_assignments: list[tuple[MissionAssignment, Mission]] = []
 
     for index, mission in enumerate(selected_missions, start=1):
         last_assignment_date, last_completed_at = assignment_history.get(
             mission.id,
             (None, None),
         )
-        db.add(
-            MissionAssignment(
-                id=str(uuid.uuid4()),
-                child_id=child.id,
-                mission_id=mission.id,
-                assignment_date=assignment_date,
-                source=MissionAssignmentSource.SYSTEM,
-                status=MissionAssignmentStatus.ASSIGNED,
-                surface=mission.surface,
-                priority=index,
-                selection_reason=(
+        mission_metadata = mission.catalog_metadata or {}
+        is_cluster = bool(mission_metadata.get("cluster_id"))
+        assignment = MissionAssignment(
+            id=str(uuid.uuid4()),
+            child_id=child.id,
+            mission_id=mission.id,
+            assignment_date=assignment_date,
+            source=MissionAssignmentSource.SYSTEM,
+            status=MissionAssignmentStatus.ASSIGNED,
+            surface=mission.surface,
+            priority=index,
+            selection_reason=(
+                "Graph concept cluster mission"
+                if is_cluster
+                else (
                     "Rotated from published offline mission catalog"
                     if is_offline
                     else "Rotated from published daily mission catalog"
+                )
+            ),
+            selection_metadata={
+                "catalog_sort_order": mission.sort_order,
+                "context": mission.context.value,
+                "is_offline": is_offline,
+                "last_assignment_date": (
+                    last_assignment_date.isoformat()
+                    if last_assignment_date
+                    else None
                 ),
-                selection_metadata={
-                    "catalog_sort_order": mission.sort_order,
-                    "context": mission.context.value,
-                    "is_offline": is_offline,
-                    "last_assignment_date": (
-                        last_assignment_date.isoformat()
-                        if last_assignment_date
-                        else None
-                    ),
-                    "last_completed_at": (
-                        last_completed_at.isoformat()
-                        if last_completed_at
-                        else None
-                    ),
-                    "completion_cooldown_days": MISSION_COMPLETION_COOLDOWN_DAYS,
-                    "deferred_recent_completion": _was_completed_recently(
-                        last_completed_at,
-                        assignment_date=assignment_date,
-                    ),
-                },
-            )
+                "last_completed_at": (
+                    last_completed_at.isoformat()
+                    if last_completed_at
+                    else None
+                ),
+                "completion_cooldown_days": MISSION_COMPLETION_COOLDOWN_DAYS,
+                "deferred_recent_completion": _was_completed_recently(
+                    last_completed_at,
+                    assignment_date=assignment_date,
+                ),
+                "is_cluster": is_cluster,
+                "cluster_id": mission_metadata.get("cluster_id"),
+                "seed_word_id": mission_metadata.get("seed_word_id"),
+                "cluster_depth": mission_metadata.get("cluster_depth"),
+                "cluster_strategy": mission_metadata.get("cluster_strategy"),
+                "cluster_theme_label": mission_metadata.get("cluster_theme_label"),
+                "cluster_related_theme_labels": mission_metadata.get("cluster_related_theme_labels"),
+                "target_words_display": mission_metadata.get("target_words_display"),
+            },
         )
+        db.add(assignment)
+        created_assignments.append((assignment, mission))
 
     await db.commit()
+
+    for assignment, mission in created_assignments:
+        await write_analytics_event(
+            db,
+            AnalyticsEventInput(
+                event_type=AnalyticsEventType.MISSION_ASSIGNED,
+                child_id=assignment.child_id,
+                mission_id=assignment.mission_id,
+                occurred_at=datetime.combine(
+                    assignment.assignment_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                ),
+                source="api.missions._generate_assignments_for_date",
+                idempotency_key=f"mission-assigned:{assignment.id}",
+                payload={
+                    "assignment_id": assignment.id,
+                    "context": mission.context.value,
+                    "is_offline": mission.is_offline,
+                    "is_cluster": bool((assignment.selection_metadata or {}).get("is_cluster", False)),
+                    "cluster_id": (assignment.selection_metadata or {}).get("cluster_id"),
+                    "seed_word_id": (assignment.selection_metadata or {}).get("seed_word_id"),
+                },
+            ),
+        )
 
 
 async def _get_assigned_or_catalog_missions(
@@ -827,6 +981,30 @@ async def create_parent_micro_mission(
     await db.refresh(mission)
     await db.refresh(assignment)
 
+    await write_analytics_event(
+        db,
+        AnalyticsEventInput(
+            event_type=AnalyticsEventType.MISSION_ASSIGNED,
+            child_id=assignment.child_id,
+            parent_id=current_user.id,
+            mission_id=assignment.mission_id,
+            occurred_at=datetime.combine(
+                assignment.assignment_date,
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            ),
+            source="api.missions.create_parent_micro_mission",
+            idempotency_key=f"mission-assigned:{assignment.id}",
+            payload={
+                "assignment_id": assignment.id,
+                "context": mission.context.value,
+                "is_offline": mission.is_offline,
+                "source": "parent",
+                "is_cluster": False,
+            },
+        ),
+    )
+
     return _serialize_assigned_mission(
         mission=mission,
         child_id=child.id,
@@ -943,5 +1121,33 @@ async def complete_mission(
     
     await db.commit()
     await db.refresh(progress)
+
+    event_type = (
+        AnalyticsEventType.MISSION_COMPLETED
+        if progress_data.completed
+        else AnalyticsEventType.MISSION_ASSIGNED
+    )
+    key_prefix = "mission-completed" if progress_data.completed else "mission-assigned"
+    await write_analytics_event(
+        db,
+        AnalyticsEventInput(
+            event_type=event_type,
+            child_id=child_id,
+            parent_id=current_user.id,
+            mission_id=mission_id,
+            occurred_at=now,
+            source="api.missions.complete_mission",
+            idempotency_key=f"{key_prefix}:{assignment.id}:{int(progress_data.completed)}",
+            payload={
+                "assignment_id": assignment.id,
+                "context": mission.context.value,
+                "is_offline": mission.is_offline,
+                "completion_minutes": None,
+                "is_cluster": bool((assignment.selection_metadata or {}).get("is_cluster", False)),
+                "cluster_id": (assignment.selection_metadata or {}).get("cluster_id"),
+                "seed_word_id": (assignment.selection_metadata or {}).get("seed_word_id"),
+            },
+        ),
+    )
 
     return progress

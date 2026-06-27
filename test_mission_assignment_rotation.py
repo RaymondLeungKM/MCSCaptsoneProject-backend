@@ -5,6 +5,9 @@ from types import SimpleNamespace
 from app.api.endpoints.missions import (
     _build_mission_summary_payload,
     _current_hkt_date,
+    _dedupe_missions_by_id,
+    _exclude_generated_cluster_missions,
+    _is_generated_cluster_mission,
     _rank_candidate_missions,
     _serialize_assigned_mission,
     _was_completed_recently,
@@ -262,6 +265,47 @@ class MissionAssignmentRotationTests(unittest.TestCase):
         self.assertEqual(payload["assignment"]["status"], MissionAssignmentStatus.ASSIGNED)
         self.assertIsNone(payload["assignment"]["completed_at"])
         self.assertIsNone(payload["assignment"]["completion_notes"])
+
+    def test_dedupe_missions_by_id_preserves_order(self):
+        m1 = make_mission(
+            "m-1",
+            sort_order=0,
+            created_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        )
+        m2 = make_mission(
+            "m-2",
+            sort_order=1,
+            created_at=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        )
+        duplicate_m1 = make_mission(
+            "m-1",
+            sort_order=2,
+            created_at=datetime(2026, 5, 3, tzinfo=timezone.utc),
+        )
+
+        deduped = _dedupe_missions_by_id([m1, m2, duplicate_m1])
+
+        self.assertEqual([mission.id for mission in deduped], ["m-1", "m-2"])
+
+    def test_generated_cluster_mission_is_excluded_from_catalog_rotation(self):
+        regular = make_mission(
+            "regular-1",
+            sort_order=0,
+            created_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        )
+        generated_cluster = make_mission(
+            "cluster-1",
+            sort_order=1,
+            created_at=datetime(2026, 5, 2, tzinfo=timezone.utc),
+        )
+        generated_cluster.selection_tags = ["concept_cluster", "graph_generated"]
+        generated_cluster.catalog_metadata = {"cluster_id": "cluster-child-1-20260622-seed"}
+
+        self.assertTrue(_is_generated_cluster_mission(generated_cluster))
+        self.assertFalse(_is_generated_cluster_mission(regular))
+
+        filtered = _exclude_generated_cluster_missions([generated_cluster, regular])
+        self.assertEqual([mission.id for mission in filtered], ["regular-1"])
 
 
 if __name__ == "__main__":

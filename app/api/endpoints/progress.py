@@ -24,10 +24,69 @@ from app.models.user import User, Child
 from app.models.vocabulary import Category, Word, WordProgress
 from app.core.security import get_current_active_user
 from app.services.child_metrics import sync_child_metrics
+from app.services.analytics_foundation import (
+    AnalyticsEventInput,
+    AnalyticsEventType,
+    write_analytics_event,
+)
 
 router = APIRouter()
 
 MAX_SESSION_MINUTES = 90
+
+
+def _engagement_to_score(engagement_level: object) -> float:
+    value = getattr(engagement_level, "value", engagement_level)
+    if isinstance(value, str):
+        normalized = value.lower()
+    else:
+        normalized = str(value).lower()
+
+    if normalized == "high":
+        return 0.9
+    if normalized == "medium":
+        return 0.65
+    if normalized == "low":
+        return 0.35
+    return 0.0
+
+
+def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _derive_engagement_level(
+    *,
+    duration_minutes: int,
+    interactions_count: int,
+    activities_count: int,
+    words_used_actively_count: int,
+    words_encountered_count: int,
+) -> str:
+    safe_duration = max(duration_minutes, 0)
+    safe_interactions = max(interactions_count, 0)
+    safe_activities = max(activities_count, 0)
+    safe_words_used = max(words_used_actively_count, 0)
+    safe_words_encountered = max(words_encountered_count, 0)
+
+    duration_norm = _clamp(safe_duration / 20.0)
+    interactions_per_minute = safe_interactions / max(safe_duration, 1)
+    interaction_norm = _clamp(interactions_per_minute / 2.0)
+    activities_norm = _clamp(safe_activities / 3.0)
+    active_usage_norm = _clamp(safe_words_used / max(safe_words_encountered, 1))
+
+    engagement_index = (
+        interaction_norm * 0.40
+        + activities_norm * 0.25
+        + active_usage_norm * 0.20
+        + duration_norm * 0.15
+    )
+
+    if engagement_index >= 0.70:
+        return "high"
+    if engagement_index >= 0.38:
+        return "medium"
+    return "low"
 
 
 def _is_my_collection_category_name(
@@ -190,6 +249,23 @@ async def start_learning_session(
     db.add(session)
     await db.commit()
     await db.refresh(session)
+
+    await write_analytics_event(
+        db,
+        AnalyticsEventInput(
+            event_type=AnalyticsEventType.SESSION_STARTED,
+            child_id=session.child_id,
+            parent_id=current_user.id,
+            occurred_at=_ensure_utc(session.start_time),
+            source="api.progress.start_learning_session",
+            idempotency_key=f"session-started:{session.id}",
+            payload={
+                "session_id": session.id,
+                "words_encountered_count": len(session.words_encountered or []),
+                "activities_count": len(session.activities_completed or []),
+            },
+        ),
+    )
     
     return session
 
@@ -218,7 +294,11 @@ async def end_learning_session(
     session.words_encountered = session_data.words_encountered
     session.words_used_actively = session_data.words_used_actively
     session.activities_completed = [act.dict() for act in session_data.activities_completed]
-    session.engagement_level = session_data.engagement_level
+    reported_engagement_level = getattr(
+        session_data.engagement_level,
+        "value",
+        session_data.engagement_level,
+    )
     session.interactions_count = session_data.interactions_count
     
     # Calculate duration
@@ -227,12 +307,48 @@ async def end_learning_session(
             _ensure_utc(session.start_time),
             _ensure_utc(session.end_time),
         )
+
+    words_encountered_count = len(session.words_encountered or [])
+    words_used_actively_count = len(session.words_used_actively or [])
+    activities_count = len(session.activities_completed or [])
+    derived_engagement_level = _derive_engagement_level(
+        duration_minutes=int(session.duration_minutes or 0),
+        interactions_count=int(session.interactions_count or 0),
+        activities_count=activities_count,
+        words_used_actively_count=words_used_actively_count,
+        words_encountered_count=words_encountered_count,
+    )
+    session.engagement_level = derived_engagement_level
     
     # Calculate XP earned
     session.xp_earned = len(session.words_encountered) * 10 + session.interactions_count * 5
     
     await db.commit()
     await db.refresh(session)
+
+    await write_analytics_event(
+        db,
+        AnalyticsEventInput(
+            event_type=AnalyticsEventType.SESSION_ENDED,
+            child_id=session.child_id,
+            parent_id=current_user.id,
+            occurred_at=_ensure_utc(session.end_time) if session.end_time else datetime.now(timezone.utc),
+            source="api.progress.end_learning_session",
+            idempotency_key=f"session-ended:{session.id}",
+            payload={
+                "session_id": session.id,
+                "duration_minutes": int(session.duration_minutes or 0),
+                "engagement_score": _engagement_to_score(session.engagement_level),
+                "engagement_level_reported": reported_engagement_level,
+                "engagement_level_derived": derived_engagement_level,
+                "xp_earned": int(session.xp_earned or 0),
+                "words_encountered_count": words_encountered_count,
+                "words_used_actively_count": words_used_actively_count,
+                "activities_count": activities_count,
+                "interactions_count": int(session.interactions_count or 0),
+            },
+        ),
+    )
     
     return session
 

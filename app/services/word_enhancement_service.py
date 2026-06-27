@@ -1,11 +1,12 @@
 """
 Word Enhancement Service
 Automatically generate bilingual content (Cantonese + English) for words using AI
+and suggest graph relationships for newly created words.
 """
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Sequence
 import json
 import re
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.services.curated_cantonese_vocabulary import get_curated_cantonese_content
 from app.services.llm_service import (
@@ -26,6 +27,15 @@ class EnhancedWordContent(BaseModel):
     example_english: str
     example_cantonese: str
     difficulty: str = "easy"
+    related_terms: list["RelatedWordSuggestion"] = Field(default_factory=list)
+
+
+class RelatedWordSuggestion(BaseModel):
+    """Candidate relationship proposed by the AI enrichment step."""
+
+    word: str
+    relationship_type: str = "semantic"
+    strength: float = Field(default=0.6, ge=0.0, le=1.0)
 
 
 class WordEnhancementService:
@@ -139,6 +149,91 @@ class WordEnhancementService:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ]
+
+    @staticmethod
+    def _normalize_relationship_type(value: Optional[str]) -> str:
+        normalized = (value or "semantic").strip().lower()
+        if normalized in {"semantic", "category", "phonetic", "contextual", "opposite"}:
+            return normalized
+        return "semantic"
+
+    def _parse_related_terms(self, data: Dict[str, Any]) -> list[RelatedWordSuggestion]:
+        raw_terms = data.get("related_terms") or []
+        parsed_terms: list[RelatedWordSuggestion] = []
+
+        if not isinstance(raw_terms, list):
+            return parsed_terms
+
+        for term in raw_terms[:5]:
+            if not isinstance(term, dict):
+                continue
+
+            related_word = str(term.get("word") or "").strip()
+            if not related_word:
+                continue
+
+            parsed_terms.append(
+                RelatedWordSuggestion(
+                    word=related_word,
+                    relationship_type=self._normalize_relationship_type(
+                        term.get("relationship_type")
+                    ),
+                    strength=term.get("strength", 0.6),
+                )
+            )
+
+        return parsed_terms
+
+    def _build_relationship_prompt(
+        self,
+        *,
+        word: str,
+        word_cantonese: Optional[str],
+        category: Optional[str],
+        candidate_words: Sequence[Dict[str, str]],
+    ) -> list[LLMMessage]:
+        candidate_lines = "\n".join(
+            f'- {candidate["word"]} | 粵語: {candidate.get("word_cantonese") or "-"} | 類別: {candidate.get("category") or "-"} | 場景: {candidate.get("contexts") or "-"}'
+            for candidate in candidate_words
+        )
+
+        system_prompt = """你是一位香港幼兒詞彙知識圖譜助理。
+你的任務是從現有詞彙清單中，為新詞語挑選最相關的詞語連結。
+
+規則：
+1. 只可以從提供的候選清單入面揀詞語，唔好自己發明新詞。
+2. 最多揀 5 個關聯詞。
+3. relationship_type 只可以係 semantic / category / phonetic / contextual / opposite。
+4. strength 係 0.0 至 1.0，表示連結強度。
+5. 優先揀對幼兒學習最有幫助、最自然嘅關聯。
+6. 如果冇合適關聯，回傳空陣列。"""
+
+        user_prompt = f"""請根據以下新詞語資料，從候選詞語清單中揀出最合適嘅關聯。
+
+新詞語：
+- English: {word}
+- 粵語: {word_cantonese or '-'}
+- 類別: {category or '-'}
+
+候選詞語清單：
+{candidate_lines or '- 無'}
+
+請直接輸出 JSON，格式如下：
+{{
+  "related_terms": [
+    {{
+      "word": "Cat",
+      "relationship_type": "semantic",
+      "strength": 0.85
+    }}
+  ]
+}}
+"""
+
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
     
     async def enhance_word(
         self,
@@ -232,6 +327,7 @@ class WordEnhancementService:
                     raise ValueError(f"Invalid jyutping (appears to be Pinyin, not Jyutping): '{jyutping_val}'")
 
                 # Create result
+                data["related_terms"] = self._parse_related_terms(data)
                 result = EnhancedWordContent(**data)
                 
                 print(f"[WordEnhancement] ✓ Successfully generated content for: {word}")
@@ -269,6 +365,65 @@ class WordEnhancementService:
         print(f"[WordEnhancement] Last error: {last_error}")
         print(f"[WordEnhancement] Using fallback content")
         return self._create_fallback_content(word, source)
+
+    async def suggest_related_words(
+        self,
+        *,
+        word: str,
+        word_cantonese: Optional[str],
+        category: Optional[str],
+        candidate_words: Sequence[Dict[str, str]],
+        max_retries: int = 2,
+    ) -> list[RelatedWordSuggestion]:
+        """Suggest related existing words for graph linkage."""
+
+        if not candidate_words:
+            return []
+
+        messages = self._build_relationship_prompt(
+            word=word,
+            word_cantonese=word_cantonese,
+            category=category,
+            candidate_words=candidate_words[:30],
+        )
+
+        for attempt in range(max_retries):
+            try:
+                response = await self.llm.generate(
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=700,
+                )
+                response_text = response.strip()
+
+                if "```json" in response_text:
+                    start = response_text.find("```json") + 7
+                    end = response_text.find("```", start)
+                    if end != -1:
+                        response_text = response_text[start:end].strip()
+                elif "```" in response_text:
+                    start = response_text.find("```") + 3
+                    end = response_text.find("```", start)
+                    if end != -1:
+                        response_text = response_text[start:end].strip()
+
+                if not response_text.startswith("{"):
+                    start_idx = response_text.find("{")
+                    if start_idx != -1:
+                        response_text = response_text[start_idx:]
+                if not response_text.endswith("}"):
+                    end_idx = response_text.rfind("}")
+                    if end_idx != -1:
+                        response_text = response_text[: end_idx + 1]
+
+                payload = json.loads(response_text)
+                return self._parse_related_terms(payload)
+            except Exception as exc:
+                print(
+                    f"[WordEnhancement] Relationship suggestion attempt {attempt + 1} failed for {word}: {exc}"
+                )
+
+        return []
     
     def _create_fallback_content(self, word: str, source: Optional[str] = None) -> EnhancedWordContent:
         """Create basic fallback content if AI generation fails"""
@@ -286,7 +441,8 @@ class WordEnhancementService:
             definition_cantonese=f"透過睇嘢學識嘅詞語",
             example_english=f"I learned about {word.lower()}",
             example_cantonese=f"我學識咗{word}",
-            difficulty="easy"
+            difficulty="easy",
+            related_terms=[],
         )
 
 

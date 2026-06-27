@@ -90,6 +90,14 @@ class LLMService:
             return settings.OLLAMA_MODEL
         return "gpt-4o"
 
+    @staticmethod
+    def _get_openrouter_fallback_models() -> List[str]:
+        """Return fallback models ordered from cheapest/most accessible to broader compatibility."""
+        return [
+            "openai/gpt-oss-120b:free",
+            "openai/gpt-4o-mini",
+        ]
+
     def _normalize_messages(self, messages: List[Any]) -> List[LLMMessage]:
         normalized_messages: List[LLMMessage] = []
 
@@ -143,6 +151,26 @@ class LLMService:
             return await self._generate_ollama(normalized_messages, temperature, max_tokens, **kwargs)
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
+
+    async def embed_texts(
+        self,
+        texts: List[str],
+        *,
+        model: Optional[str] = None,
+        **kwargs,
+    ) -> List[List[float]]:
+        """Generate embedding vectors for the provided texts."""
+        if not texts:
+            return []
+
+        if self.provider == LLMProvider.OPENAI:
+            return await self._embed_openai(texts, model=model, **kwargs)
+        elif self.provider == LLMProvider.OPENROUTER:
+            return await self._embed_openrouter(texts, model=model, **kwargs)
+
+        raise ValueError(
+            f"Embeddings are not implemented for provider: {self.provider}"
+        )
     
     async def _generate_openai(
         self, 
@@ -172,6 +200,32 @@ class LLMService:
             data = response.json()
             return data["choices"][0]["message"]["content"]
 
+    async def _embed_openai(
+        self,
+        texts: List[str],
+        *,
+        model: Optional[str] = None,
+        **kwargs,
+    ) -> List[List[float]]:
+        url = "https://api.openai.com/v1/embeddings"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": model or self.model,
+            "input": texts,
+            "encoding_format": "float",
+            **kwargs,
+        }
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return [item["embedding"] for item in data.get("data", [])]
+
     async def _generate_openrouter(
         self,
         messages: List[LLMMessage],
@@ -186,11 +240,66 @@ class LLMService:
             "Content-Type": "application/json",
         }
 
+        async def _post_with_model(model_name: str) -> str:
+            payload = {
+                "model": model_name,
+                "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                **kwargs,
+            }
+
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+
+        candidate_models = [self.model] + [
+            model_name
+            for model_name in self._get_openrouter_fallback_models()
+            if model_name != self.model
+        ]
+
+        last_error: Optional[httpx.HTTPStatusError] = None
+        for index, model_name in enumerate(candidate_models):
+            try:
+                if index > 0:
+                    print(
+                        f"[LLMService] Retrying OpenRouter request with fallback model '{model_name}'"
+                    )
+                return await _post_with_model(model_name)
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if exc.response.status_code not in {403, 404} or index == len(candidate_models) - 1:
+                    raise
+
+                print(
+                    f"[LLMService] OpenRouter model '{model_name}' returned "
+                    f"{exc.response.status_code}; trying next fallback model"
+                )
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("OpenRouter generation failed before an HTTP request was completed")
+
+    async def _embed_openrouter(
+        self,
+        texts: List[str],
+        *,
+        model: Optional[str] = None,
+        **kwargs,
+    ) -> List[List[float]]:
+        url = f"{self.base_url.rstrip('/')}/embeddings"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
         payload = {
-            "model": self.model,
-            "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
+            "model": model or settings.OPENROUTER_EMBEDDING_MODEL,
+            "input": texts,
+            "encoding_format": "float",
             **kwargs,
         }
 
@@ -198,7 +307,7 @@ class LLMService:
             response = await client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            return [item["embedding"] for item in data.get("data", [])]
     
     async def _generate_anthropic(
         self, 

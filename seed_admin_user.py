@@ -14,7 +14,7 @@ from app.models import content  # noqa: F401
 from app.models import daily_words  # noqa: F401
 from app.models import generated_sentences  # noqa: F401
 from app.models import parent_analytics  # noqa: F401
-from app.models import phase8  # noqa: F401
+from app.models import word_personalization  # noqa: F401
 from app.models import vocabulary  # noqa: F401
 from app.models.user import User, UserRole
 

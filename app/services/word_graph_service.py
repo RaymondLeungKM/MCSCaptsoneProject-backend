@@ -14,17 +14,86 @@ Design notes
 """
 from __future__ import annotations
 
-import uuid
-from typing import List, Optional, Set
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Set
 
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.phase8 import WordRelationship, RelationshipType
+from app.models.word_personalization import WordRelationship, RelationshipType
 from app.models.vocabulary import Word, WordProgress
-from app.schemas.phase8 import (
+from app.schemas.word_personalization import (
     WordNode, WordEdge, WordGraphResponse, GraphRecommendationResponse
 )
+
+
+@dataclass(frozen=True)
+class GraphQueueScore:
+    bridge_score: float
+    centrality_score: float
+    weak_link_boost: float
+    graph_score: float
+    bridge_strength: float
+    connection_count: int
+    centrality_degree: int
+
+
+def build_relationship_maps(
+    relationships: Iterable[WordRelationship],
+) -> tuple[Dict[str, List[WordRelationship]], Dict[str, int]]:
+    outgoing: Dict[str, List[WordRelationship]] = {}
+    incoming_degree: Dict[str, int] = {}
+
+    for relationship in relationships:
+        outgoing.setdefault(relationship.word_id, []).append(relationship)
+        incoming_degree[relationship.related_word_id] = (
+            incoming_degree.get(relationship.related_word_id, 0) + 1
+        )
+
+    return outgoing, incoming_degree
+
+
+def compute_graph_queue_score(
+    word_id: str,
+    *,
+    outgoing_map: Dict[str, List[WordRelationship]],
+    incoming_degree: Dict[str, int],
+    known_word_ids: set[str],
+    weak_link_ratio: float,
+) -> GraphQueueScore:
+    outgoing_edges = outgoing_map.get(word_id, [])
+
+    bridge_strength = sum(
+        edge.strength
+        for edge in outgoing_edges
+        if edge.related_word_id in known_word_ids
+    )
+    connection_count = sum(
+        1
+        for edge in outgoing_edges
+        if edge.related_word_id in known_word_ids
+    )
+
+    centrality_degree = len(outgoing_edges) + incoming_degree.get(word_id, 0)
+    centrality_score = min(1.0, centrality_degree / 6.0)
+    bridge_score = min(1.0, bridge_strength / 2.0)
+    weak_link_boost = max(0.0, min(1.0, weak_link_ratio))
+
+    graph_score = (
+        bridge_score * 0.5
+        + centrality_score * 0.35
+        + weak_link_boost * 0.15
+    )
+
+    return GraphQueueScore(
+        bridge_score=round(bridge_score, 4),
+        centrality_score=round(centrality_score, 4),
+        weak_link_boost=round(weak_link_boost, 4),
+        graph_score=round(graph_score, 4),
+        bridge_strength=round(bridge_strength, 4),
+        connection_count=connection_count,
+        centrality_degree=centrality_degree,
+    )
 
 
 # ---------------------------------------------------------------------------

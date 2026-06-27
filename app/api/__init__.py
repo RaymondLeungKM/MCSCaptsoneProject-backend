@@ -23,6 +23,7 @@ from app.api.endpoints import (
     community,
     social,
     images,
+    admin_analytics,
 )
 
 api_router = APIRouter()
@@ -47,3 +48,4 @@ api_router.include_router(uploads.router, prefix="/uploads", tags=["File Uploads
 api_router.include_router(community.router, prefix="/community", tags=["Community"])
 api_router.include_router(social.router, prefix="/social", tags=["Social"])
 api_router.include_router(images.router, prefix="/images", tags=["Images"])
+api_router.include_router(admin_analytics.router, prefix="/admin/analytics", tags=["Admin Analytics"])
