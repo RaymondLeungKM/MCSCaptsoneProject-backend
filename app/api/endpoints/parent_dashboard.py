@@ -17,6 +17,7 @@ from app.models.parent_analytics import (
     WeeklyReport,
     ParentalControl
 )
+from app.models.analytics_foundation import ChildDayAnalytics, ContentPerformanceAnalytics
 from app.models.vocabulary import WordProgress, Word, Category
 from app.models.analytics import LearningSession
 from app.models.daily_words import DailyWordTracking
@@ -34,9 +35,19 @@ from app.schemas.parent_analytics import (
     LearningTimeSeriesData,
     WeeklyDeltaMetric,
     WeeklyDeltaResponse,
+    BenchmarkCard,
+    BenchmarkSuppression,
+    CategoryBenchmarkCard,
+    ParentBenchmarksResponse,
 )
 from app.core.security import get_current_user
 from app.services.child_metrics import sync_child_metrics
+from app.services.analytics_foundation import resolve_age_band
+from app.services.privacy_gate import (
+    DEFAULT_MINIMUM_COHORT_THRESHOLD,
+    evaluate_privacy_gate,
+    suppression_payload,
+)
 
 router = APIRouter(prefix="/parent-dashboard", tags=["parent-dashboard"])
 
@@ -340,6 +351,58 @@ def _rounded_minutes_from_total_seconds(
         return 1
 
     return 0
+
+
+def _percentile_band(values: list[float], child_value: float) -> str:
+    if not values:
+        return "P0-P25"
+
+    sorted_values = sorted(values)
+    position = sum(1 for value in sorted_values if value <= child_value) / len(sorted_values)
+
+    if position < 0.25:
+        return "P0-P25"
+    if position < 0.5:
+        return "P25-P50"
+    if position < 0.75:
+        return "P50-P75"
+    return "P75-P100"
+
+
+def _benchmark_band(child_value: float, cohort_value: float) -> str:
+    if cohort_value <= 0:
+        return "on_track"
+
+    ratio = child_value / cohort_value
+    if ratio >= 1.2:
+        return "ahead"
+    if ratio >= 0.9:
+        return "on_track"
+    return "needs_support"
+
+
+def _benchmark_tip(metric: str, band: str) -> str:
+    tips = {
+        "pace": {
+            "ahead": "孩子目前進度較快，可把新詞語放進故事與對話，增加主動輸出。",
+            "on_track": "孩子進度與同齡組相若，維持每日短練習最有幫助。",
+            "needs_support": "建議把任務切成更短回合，並多做舊詞重溫再接新詞。",
+        },
+        "engagement": {
+            "ahead": "孩子投入時間穩定，可加入更多情境任務提升語用能力。",
+            "on_track": "目前投入度穩定，保持固定時段學習即可。",
+            "needs_support": "可以先揀你嘅小朋友鍾意嘅主題開始，每次做 5–10 分鐘，慢慢建立習慣。",
+        },
+    }
+    return tips.get(metric, {}).get(band, "維持穩定節奏，逐步增加真實情境練習。")
+
+
+def _trend_label(first_half_value: float, second_half_value: float) -> str:
+    if second_half_value > first_half_value * 1.1:
+        return "up"
+    if second_half_value < first_half_value * 0.9:
+        return "down"
+    return "flat"
 
 
 async def _get_recent_tracking_activity(
@@ -1198,6 +1261,231 @@ async def get_dashboard_summary(
         recent_insights=[LearningInsightResponse.from_orm(i) for i in insights],
         latest_report=latest_report,
         parental_control=ParentalControlResponse.from_orm(parental_control) if parental_control else None
+    )
+
+
+@router.get("/{child_id}/benchmarks", response_model=ParentBenchmarksResponse)
+async def get_parent_benchmarks(
+    child_id: str,
+    range_days: int = Query(28, ge=7, le=90),
+    minimum_cohort_threshold: int = Query(
+        DEFAULT_MINIMUM_COHORT_THRESHOLD,
+        ge=1,
+        le=100,
+    ),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Child).where(and_(Child.id == child_id, Child.parent_id == current_user.id))
+    )
+    child = result.scalar_one_or_none()
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    today = _local_today()
+    start_day = today - timedelta(days=range_days - 1)
+    child_age_band = resolve_age_band(child.age)
+
+    child_rows_result = await db.execute(
+        select(ChildDayAnalytics).where(
+            ChildDayAnalytics.child_id == child_id,
+            ChildDayAnalytics.activity_day >= start_day,
+            ChildDayAnalytics.activity_day <= today,
+        )
+    )
+    child_rows = child_rows_result.scalars().all()
+
+    cohort_rows_result = await db.execute(
+        select(ChildDayAnalytics).where(
+            ChildDayAnalytics.age_band == child_age_band,
+            ChildDayAnalytics.activity_day >= start_day,
+            ChildDayAnalytics.activity_day <= today,
+        )
+    )
+    cohort_rows = cohort_rows_result.scalars().all()
+
+    cohort_by_child: dict[str, dict[str, float]] = {}
+    for row in cohort_rows:
+        state = cohort_by_child.setdefault(
+            row.child_id,
+            {
+                "words_mastered": 0.0,
+                "session_minutes": 0.0,
+                "active_days": 0.0,
+            },
+        )
+        state["words_mastered"] += row.words_mastered or 0
+        state["session_minutes"] += row.session_minutes_total or 0
+        state["active_days"] += 1
+
+    cohort_size = len(cohort_by_child)
+    gate = evaluate_privacy_gate(
+        user=current_user,
+        cohort_size=cohort_size,
+        minimum_cohort_threshold=minimum_cohort_threshold,
+    )
+    suppression = BenchmarkSuppression(**suppression_payload(gate))
+
+    if not gate.allowed:
+        return ParentBenchmarksResponse(
+            child_id=child.id,
+            age_band=child_age_band,
+            range_days=range_days,
+            pace_benchmark=None,
+            engagement_benchmark=None,
+            category_benchmarks=[],
+            suppression=suppression,
+        )
+
+    child_words_mastered = sum((row.words_mastered or 0) for row in child_rows)
+    child_session_minutes = sum((row.session_minutes_total or 0) for row in child_rows)
+    child_active_days = max(len(child_rows), 1)
+    child_pace = child_words_mastered / child_active_days
+    child_engagement = child_session_minutes / child_active_days
+
+    cohort_pace_values = [
+        stats["words_mastered"] / max(stats["active_days"], 1)
+        for stats in cohort_by_child.values()
+    ]
+    cohort_engagement_values = [
+        stats["session_minutes"] / max(stats["active_days"], 1)
+        for stats in cohort_by_child.values()
+    ]
+    cohort_pace = sum(cohort_pace_values) / max(len(cohort_pace_values), 1)
+    cohort_engagement = sum(cohort_engagement_values) / max(len(cohort_engagement_values), 1)
+
+    midpoint = start_day + timedelta(days=max(range_days // 2, 1))
+    first_half_rows = [row for row in child_rows if row.activity_day < midpoint]
+    second_half_rows = [row for row in child_rows if row.activity_day >= midpoint]
+
+    first_half_pace = (
+        sum((row.words_mastered or 0) for row in first_half_rows)
+        / max(len(first_half_rows), 1)
+    )
+    second_half_pace = (
+        sum((row.words_mastered or 0) for row in second_half_rows)
+        / max(len(second_half_rows), 1)
+    )
+    first_half_engagement = (
+        sum((row.session_minutes_total or 0) for row in first_half_rows)
+        / max(len(first_half_rows), 1)
+    )
+    second_half_engagement = (
+        sum((row.session_minutes_total or 0) for row in second_half_rows)
+        / max(len(second_half_rows), 1)
+    )
+
+    pace_band = _benchmark_band(child_pace, cohort_pace)
+    engagement_band = _benchmark_band(child_engagement, cohort_engagement)
+
+    pace_benchmark = BenchmarkCard(
+        band=pace_band,
+        percentile_band=_percentile_band(cohort_pace_values, child_pace),
+        trend=_trend_label(first_half_pace, second_half_pace),
+        child_value=round(child_pace, 2),
+        cohort_value=round(cohort_pace, 2),
+        tips=_benchmark_tip("pace", pace_band),
+    )
+    engagement_benchmark = BenchmarkCard(
+        band=engagement_band,
+        percentile_band=_percentile_band(cohort_engagement_values, child_engagement),
+        trend=_trend_label(first_half_engagement, second_half_engagement),
+        child_value=round(child_engagement, 2),
+        cohort_value=round(cohort_engagement, 2),
+        tips=_benchmark_tip("engagement", engagement_band),
+    )
+
+    child_category_rows_result = await db.execute(
+        select(
+            Word.category,
+            func.count(WordProgress.id).label("total_count"),
+            func.count(WordProgress.id).filter(WordProgress.mastered.is_(True)).label("mastered_count"),
+        )
+        .join(Word, WordProgress.word_id == Word.id)
+        .where(WordProgress.child_id == child.id, Word.is_active == True)
+        .group_by(Word.category)
+    )
+    child_category_rows = child_category_rows_result.all()
+
+    cohort_peer_ids = [
+        cohort_child_id
+        for cohort_child_id in cohort_by_child.keys()
+        if cohort_child_id != child.id
+    ]
+    cohort_category_ratios: dict[str, list[float]] = {}
+    if cohort_peer_ids:
+        cohort_category_rows_result = await db.execute(
+            select(
+                WordProgress.child_id,
+                Word.category,
+                func.count(WordProgress.id).label("total_count"),
+                func.count(WordProgress.id).filter(WordProgress.mastered.is_(True)).label("mastered_count"),
+            )
+            .join(Word, WordProgress.word_id == Word.id)
+            .where(
+                WordProgress.child_id.in_(cohort_peer_ids),
+                Word.is_active == True,
+            )
+            .group_by(WordProgress.child_id, Word.category)
+        )
+
+        for peer_row in cohort_category_rows_result.all():
+            total_count = peer_row.total_count or 0
+            if total_count <= 0:
+                continue
+
+            peer_ratio = (peer_row.mastered_count or 0) / total_count
+            cohort_category_ratios.setdefault(peer_row.category, []).append(peer_ratio)
+
+    category_name_rows = await db.execute(
+        select(Category.id, Category.name_cantonese, Category.name).where(
+            Category.id.in_([row.category for row in child_category_rows])
+        )
+    )
+    category_name_map = {
+        row.id: (row.name_cantonese or row.name or row.id)
+        for row in category_name_rows
+    }
+
+    category_benchmarks: list[CategoryBenchmarkCard] = []
+    for row in sorted(
+        child_category_rows,
+        key=lambda item: (item.mastered_count or 0) / max(item.total_count or 1, 1),
+        reverse=True,
+    )[:3]:
+        child_ratio = (row.mastered_count or 0) / max(row.total_count or 1, 1)
+        cohort_ratio_values = cohort_category_ratios.get(row.category, [])
+        if not cohort_ratio_values:
+            continue
+
+        cohort_ratio = sum(cohort_ratio_values) / len(cohort_ratio_values)
+        band = _benchmark_band(child_ratio, cohort_ratio)
+        category_benchmarks.append(
+            CategoryBenchmarkCard(
+                category_id=row.category,
+                category_name=category_name_map.get(row.category, row.category),
+                band=band,
+                percentile_band=_percentile_band(cohort_ratio_values, child_ratio),
+                trend="flat",
+                child_value=round(child_ratio * 100, 1),
+                cohort_value=round(cohort_ratio * 100, 1),
+                tips=(
+                    "可在生活情境加入更多主動開口練習。"
+                    if band == "ahead"
+                    else "可透過圖片+動作+對話三步驟提升掌握。"
+                ),
+            )
+        )
+
+    return ParentBenchmarksResponse(
+        child_id=child.id,
+        age_band=child_age_band,
+        range_days=range_days,
+        pace_benchmark=pace_benchmark,
+        engagement_benchmark=engagement_benchmark,
+        category_benchmarks=category_benchmarks,
+        suppression=suppression,
     )
 
 

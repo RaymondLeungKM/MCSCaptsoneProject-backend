@@ -19,12 +19,19 @@ from app.models.content import Story, StoryProgress, Game, Mission, MissionProgr
 from app.models.analytics import LearningSession, DailyStats, Achievement, ChildAchievement, GameSession
 from app.models.daily_words import DailyWordTracking, GeneratedStory
 from app.models.parent_analytics import DailyLearningStats, LearningInsight, WeeklyReport, ParentalControl
+from app.models.analytics_foundation import (
+    AnalyticsEventLog,
+    ChildDayAnalytics,
+    MissionOutcomeAnalytics,
+    ContentPerformanceAnalytics,
+)
 from app.models.community import (
     CommunityPost,
     PostReaction,
     FriendChallenge,
     FriendChallengeParticipant,
 )
+from app.models.word_personalization import WordRelationship, SpacedRepetitionCard, WordEmbedding
 
 # this is the Alembic Config object
 config = context.config

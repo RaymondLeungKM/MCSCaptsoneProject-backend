@@ -26,6 +26,7 @@ from app.models import analytics  # noqa: F401
 from app.models import parent_analytics  # noqa: F401
 from app.models import generated_sentences  # noqa: F401
 from app.models import daily_words  # noqa: F401
+from app.models import word_personalization  # noqa: F401
 
 async def init_db():
     print("Creating database tables...")

@@ -5,21 +5,24 @@ learning-style assessment, and learning-speed profiling.
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, or_
+from sqlalchemy.orm import aliased
 from typing import List
 
 from app.db.session import get_db
 from app.schemas.analytics import AdaptiveLearningRecommendation, WordOfTheDayResponse
-from app.schemas.phase8 import (
+from app.schemas.word_personalization import (
     WordRelationshipCreate, WordRelationshipResponse,
+    WordRelationshipReviewItem, WordRelationshipReviewListResponse,
+    WordRelationshipReviewActionResponse,
     WordGraphResponse, GraphRecommendationResponse,
     ReviewQueueResponse, ReviewResultRequest, ReviewResultResponse,
     LearningStyleAssessment, LearningStyleResponse,
 )
 from app.models.user import User, Child
 from app.models.vocabulary import Word, WordProgress
-from app.models.phase8 import WordRelationship, RelationshipType
-from app.core.security import get_current_active_user
+from app.models.word_personalization import WordRelationship, RelationshipType
+from app.core.security import get_current_active_user, get_current_admin_user
 from app.services.word_graph_service import (
     get_word_graph, get_graph_recommendations, add_relationship
 )
@@ -30,6 +33,13 @@ from app.services.spaced_repetition_service import (
 from app.models.parent_analytics import ParentalControl as ParentalControlModel
 
 router = APIRouter()
+
+
+def _is_pending_ai_relationship(source: str | None) -> bool:
+    normalized = (source or "").strip().lower()
+    if not normalized.startswith("ai_"):
+        return False
+    return "approved" not in normalized and "rejected" not in normalized
 
 
 def _normalize_learning_style(value: str | None) -> str:
@@ -499,6 +509,160 @@ async def create_word_relationship(
     if not rel:
         raise HTTPException(status_code=500, detail="Failed to create relationship")
     return rel
+
+
+@router.get(
+    "/admin/word-relationships/pending",
+    response_model=WordRelationshipReviewListResponse,
+    summary="List pending AI-generated word relationships for admin review",
+)
+async def list_pending_word_relationship_reviews(
+    limit: int = 100,
+    current_user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    del current_user  # authentication is enforced by dependency
+
+    max_limit = max(1, min(limit, 300))
+    source_filters = [
+        WordRelationship.source.ilike("ai_%"),
+    ]
+    exclusion_filters = [
+        WordRelationship.source.ilike("%approved%"),
+        WordRelationship.source.ilike("%rejected%"),
+    ]
+
+    total_result = await db.execute(
+        select(func.count())
+        .select_from(WordRelationship)
+        .where(or_(*source_filters))
+        .where(~or_(*exclusion_filters))
+    )
+    total_pending = int(total_result.scalar() or 0)
+
+    source_word = aliased(Word)
+    related_word = aliased(Word)
+
+    rows_result = await db.execute(
+        select(
+            WordRelationship,
+            source_word.word,
+            source_word.word_cantonese,
+            related_word.word,
+            related_word.word_cantonese,
+        )
+        .join(source_word, source_word.id == WordRelationship.word_id)
+        .join(related_word, related_word.id == WordRelationship.related_word_id)
+        .where(or_(*source_filters))
+        .where(~or_(*exclusion_filters))
+        .order_by(WordRelationship.created_at.desc(), WordRelationship.id.desc())
+        .limit(max_limit)
+    )
+
+    items: list[WordRelationshipReviewItem] = []
+    for rel, word, word_cantonese, related, related_cantonese in rows_result.all():
+        if not _is_pending_ai_relationship(rel.source):
+            continue
+        items.append(
+            WordRelationshipReviewItem(
+                id=rel.id,
+                word_id=rel.word_id,
+                word=word,
+                word_cantonese=word_cantonese,
+                related_word_id=rel.related_word_id,
+                related_word=related,
+                related_word_cantonese=related_cantonese,
+                relationship_type=rel.relationship_type,
+                strength=rel.strength,
+                source=rel.source,
+                created_at=rel.created_at,
+            )
+        )
+
+    return WordRelationshipReviewListResponse(
+        items=items,
+        total_pending=total_pending,
+        limit=max_limit,
+    )
+
+
+@router.post(
+    "/admin/word-relationships/{relationship_id}/approve",
+    response_model=WordRelationshipReviewActionResponse,
+    summary="Approve an AI-generated relationship",
+)
+async def approve_pending_word_relationship(
+    relationship_id: int,
+    current_user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(WordRelationship).where(WordRelationship.id == relationship_id)
+    )
+    rel = result.scalar_one_or_none()
+    if not rel:
+        raise HTTPException(status_code=404, detail="Relationship not found")
+
+    if not _is_pending_ai_relationship(rel.source):
+        raise HTTPException(
+            status_code=400,
+            detail="This relationship is not pending AI review",
+        )
+
+    rel.source = f"ai_approved:{current_user.id}"
+    await db.commit()
+
+    return WordRelationshipReviewActionResponse(
+        id=relationship_id,
+        action="approved",
+        success=True,
+    )
+
+
+@router.post(
+    "/admin/word-relationships/{relationship_id}/reject",
+    response_model=WordRelationshipReviewActionResponse,
+    summary="Reject an AI-generated relationship",
+)
+async def reject_pending_word_relationship(
+    relationship_id: int,
+    current_user: User = Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
+):
+    del current_user  # authentication is enforced by dependency
+
+    result = await db.execute(
+        select(WordRelationship).where(WordRelationship.id == relationship_id)
+    )
+    rel = result.scalar_one_or_none()
+    if not rel:
+        raise HTTPException(status_code=404, detail="Relationship not found")
+
+    if not _is_pending_ai_relationship(rel.source):
+        raise HTTPException(
+            status_code=400,
+            detail="This relationship is not pending AI review",
+        )
+
+    reverse_result = await db.execute(
+        select(WordRelationship).where(
+            WordRelationship.word_id == rel.related_word_id,
+            WordRelationship.related_word_id == rel.word_id,
+            WordRelationship.relationship_type == rel.relationship_type,
+        )
+    )
+    reverse = reverse_result.scalar_one_or_none()
+
+    await db.delete(rel)
+    if reverse and _is_pending_ai_relationship(reverse.source):
+        await db.delete(reverse)
+    await db.commit()
+
+    return WordRelationshipReviewActionResponse(
+        id=relationship_id,
+        action="rejected",
+        success=True,
+    )
 
 
 # ---------------------------------------------------------------------------

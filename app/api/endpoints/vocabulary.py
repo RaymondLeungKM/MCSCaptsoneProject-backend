@@ -12,6 +12,7 @@ from pathlib import Path
 import aiofiles
 import os
 import json
+import re
 
 from app.db.session import get_db, AsyncSessionLocal
 from app.schemas.vocabulary import (
@@ -34,7 +35,13 @@ from app.core.security import get_current_active_user, get_current_admin_user
 from app.core.category_colors import get_category_color
 from app.core.config import settings
 from app.services.sentence_generator import get_sentence_generator, SentenceGenerationResult
-from app.services.word_enhancement_service import get_word_enhancement_service
+from app.services.word_enhancement_service import (
+    RelatedWordSuggestion,
+    get_word_enhancement_service,
+)
+from app.services.word_embedding_service import get_word_embedding_service
+from app.services.word_graph_service import add_relationship
+from app.models.word_personalization import RelationshipType
 
 router = APIRouter()
 
@@ -119,6 +126,242 @@ def _build_external_placeholder_content(word: str, source: str) -> dict[str, Opt
         "example": f"I learned {example_word} from {source_label}.",
         "example_cantonese": f"我透過{source_label}學識咗{display_word}。",
     }
+
+
+def _normalize_relationship_lookup_value(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return "".join(
+        ch for ch in value.strip().lower() if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"
+    )
+
+
+def _extract_relationship_tokens(*values: Optional[str]) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+
+        text = str(value).strip().lower()
+        normalized = _normalize_relationship_lookup_value(text)
+        if normalized:
+            tokens.add(normalized)
+
+        for token in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text):
+            if len(token) >= 2 or any("\u4e00" <= ch <= "\u9fff" for ch in token):
+                tokens.add(token)
+
+    return tokens
+
+
+def _extract_relationship_contexts(word: Word) -> set[str]:
+    contexts = getattr(word, "contexts", None) or []
+    if not isinstance(contexts, list):
+        return set()
+    return {
+        _normalize_relationship_lookup_value(context)
+        for context in contexts
+        if _normalize_relationship_lookup_value(context)
+    }
+
+
+def _rank_relationship_candidates(
+    *,
+    current_word: Word,
+    catalog_words: List[Word],
+    limit: int = 30,
+) -> list[Word]:
+    current_contexts = _extract_relationship_contexts(current_word)
+    current_tokens = _extract_relationship_tokens(
+        current_word.word,
+        current_word.word_cantonese,
+        getattr(current_word, "definition", None),
+        getattr(current_word, "definition_cantonese", None),
+        getattr(current_word, "physical_action", None),
+        *list(getattr(current_word, "contexts", None) or []),
+    )
+    current_related_ids = set(getattr(current_word, "related_words", None) or [])
+
+    ranked: list[tuple[float, int, float, str, Word]] = []
+    for candidate in catalog_words:
+        if candidate.id == current_word.id or not candidate.word:
+            continue
+
+        score = 0.0
+        if candidate.category == current_word.category:
+            score += 6.0
+
+        candidate_contexts = _extract_relationship_contexts(candidate)
+        shared_contexts = current_contexts & candidate_contexts
+        score += min(len(shared_contexts), 3) * 1.5
+
+        candidate_tokens = _extract_relationship_tokens(
+            candidate.word,
+            candidate.word_cantonese,
+            getattr(candidate, "definition", None),
+            getattr(candidate, "definition_cantonese", None),
+            getattr(candidate, "physical_action", None),
+            *list(getattr(candidate, "contexts", None) or []),
+        )
+        shared_tokens = current_tokens & candidate_tokens
+        score += min(len(shared_tokens), 4) * 0.75
+
+        candidate_related_ids = set(getattr(candidate, "related_words", None) or [])
+        if candidate.id in current_related_ids or current_word.id in candidate_related_ids:
+            score += 2.0
+
+        if getattr(candidate, "created_by_child_id", None) is None:
+            score += 0.25
+
+        exposure_score = min(float(getattr(candidate, "total_exposures", 0) or 0.0), 20.0) / 20.0
+        score += exposure_score
+
+        ranked.append(
+            (
+                score,
+                1 if getattr(candidate, "created_by_child_id", None) is not None else 0,
+                exposure_score,
+                candidate.word.lower(),
+                candidate,
+            )
+        )
+
+    ranked.sort(key=lambda item: (-item[0], item[1], -item[2], item[3]))
+    return [candidate for _, _, _, _, candidate in ranked[:limit]]
+
+
+def _build_relationship_candidate_payload(words: List[Word], limit: int = 30) -> list[dict[str, str]]:
+    return [
+        {
+            "word": candidate.word,
+            "word_cantonese": candidate.word_cantonese or "",
+            "category": candidate.category or "",
+            "contexts": ", ".join(
+                str(context).strip()
+                for context in (candidate.contexts or [])[:3]
+                if str(context).strip()
+            ),
+        }
+        for candidate in words[:limit]
+        if candidate.word
+    ]
+
+
+def _resolve_related_word_matches(
+    *,
+    current_word: Word,
+    catalog_words: List[Word],
+    suggestions: List[RelatedWordSuggestion],
+) -> list[tuple[Word, str, float]]:
+    lookup: dict[str, Word] = {}
+    for candidate in catalog_words:
+        if candidate.id == current_word.id:
+            continue
+
+        english_key = _normalize_relationship_lookup_value(candidate.word)
+        cantonese_key = _normalize_relationship_lookup_value(candidate.word_cantonese)
+        if english_key and english_key not in lookup:
+            lookup[english_key] = candidate
+        if cantonese_key and cantonese_key not in lookup:
+            lookup[cantonese_key] = candidate
+
+    resolved: list[tuple[Word, str, float]] = []
+    seen_word_ids: set[str] = set()
+    for suggestion in suggestions:
+        lookup_key = _normalize_relationship_lookup_value(suggestion.word)
+        if not lookup_key:
+            continue
+
+        candidate = lookup.get(lookup_key)
+        if not candidate or candidate.id in seen_word_ids:
+            continue
+
+        resolved.append(
+            (
+                candidate,
+                suggestion.relationship_type,
+                max(0.0, min(1.0, suggestion.strength)),
+            )
+        )
+        seen_word_ids.add(candidate.id)
+
+    return resolved
+
+
+async def _attach_ai_relationship_suggestions(
+    *,
+    db: AsyncSession,
+    word: Word,
+    enhancement_service=None,
+) -> int:
+    enhancement_service = enhancement_service or get_word_enhancement_service()
+    embedding_service = get_word_embedding_service()
+
+    candidate_result = await db.execute(
+        select(Word).where(
+            Word.is_active == True,
+            Word.id != word.id,
+        )
+    )
+    catalog_words = candidate_result.scalars().all()
+    if not catalog_words:
+        return 0
+
+    try:
+        candidate_pool = await embedding_service.find_similar_words(
+            db,
+            current_word=word,
+            catalog_words=catalog_words,
+            limit=30,
+        )
+    except Exception as exc:
+        print(f"[WordEmbedding] Semantic retrieval failed for {word.word}: {exc}")
+        candidate_pool = []
+
+    if not candidate_pool:
+        candidate_pool = _rank_relationship_candidates(
+            current_word=word,
+            catalog_words=catalog_words,
+            limit=30,
+        )
+    if not candidate_pool:
+        return 0
+
+    suggestions = await enhancement_service.suggest_related_words(
+        word=word.word,
+        word_cantonese=word.word_cantonese,
+        category=word.category,
+        candidate_words=_build_relationship_candidate_payload(candidate_pool, limit=30),
+    )
+    resolved_matches = _resolve_related_word_matches(
+        current_word=word,
+        catalog_words=candidate_pool,
+        suggestions=suggestions,
+    )
+    if not resolved_matches:
+        return 0
+
+    existing_related_ids = list(word.related_words or [])
+    related_ids = list(existing_related_ids)
+
+    for matched_word, relationship_type, strength in resolved_matches:
+        await add_relationship(
+            db,
+            word.id,
+            matched_word.id,
+            RelationshipType(relationship_type),
+            strength=strength,
+            source="ai_generated",
+            bidirectional=True,
+        )
+        if matched_word.id not in related_ids:
+            related_ids.append(matched_word.id)
+
+    if related_ids != existing_related_ids:
+        word.related_words = related_ids
+        await db.commit()
+
+    return len(resolved_matches)
 
 
 def _build_captured_word_response(
@@ -450,7 +693,6 @@ async def enhance_word_and_generate_sentences_background(
 
             word.word = enhanced_content.word_english.capitalize()
             word.word_cantonese = enhanced_content.word_cantonese
-            word.jyutping = enhanced_content.jyutping
             word.definition = enhanced_content.definition_english
             word.definition_cantonese = enhanced_content.definition_cantonese
             word.example = enhanced_content.example_english
@@ -461,6 +703,15 @@ async def enhance_word_and_generate_sentences_background(
                 word.image_url = image_url
 
             await db.commit()
+            linked_count = await _attach_ai_relationship_suggestions(
+                db=db,
+                word=word,
+                enhancement_service=enhancement_service,
+            )
+            if linked_count:
+                print(
+                    f"[Background Task] ✓ Added {linked_count} AI graph relationships for: {word.word}"
+                )
 
         print(f"[Background Task] ✓ AI enhancement completed for: {word_text}")
 
@@ -470,6 +721,25 @@ async def enhance_word_and_generate_sentences_background(
         traceback.print_exc()
 
     await generate_sentences_background(word_id=word_id, word_text=word_text)
+
+
+async def enrich_word_relationships_background(word_id: str):
+    """Background task to attach AI-suggested graph relationships to an existing word."""
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Word).where(Word.id == word_id))
+            word = result.scalar_one_or_none()
+            if not word or not word.is_active:
+                return
+
+            linked_count = await _attach_ai_relationship_suggestions(db=db, word=word)
+            print(
+                f"[Background Task] Relationship enrichment for {word.word}: {linked_count} link(s) added"
+            )
+    except Exception as e:
+        print(f"[Background Task] ERROR enriching graph relationships for {word_id}: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 @router.get("/", response_model=List[WordResponse])
@@ -832,7 +1102,8 @@ async def approve_active_vocab_request(
     end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=999999)
 
     tracking_result = await db.execute(
-        select(DailyWordTracking).where(
+        select(DailyWordTracking)
+        .where(
             and_(
                 DailyWordTracking.child_id == child_id,
                 DailyWordTracking.word_id == word_id,
@@ -840,8 +1111,10 @@ async def approve_active_vocab_request(
                 DailyWordTracking.date <= end_of_day,
             )
         )
+        .order_by(DailyWordTracking.date.desc(), DailyWordTracking.id.desc())
     )
-    tracking = tracking_result.scalar_one_or_none()
+    tracking_rows = tracking_result.scalars().all()
+    tracking = tracking_rows[0] if tracking_rows else None
 
     if tracking:
         tracking.used_actively = True
@@ -918,6 +1191,7 @@ async def reject_active_vocab_request(
 @router.post("/", response_model=WordResponse, status_code=status.HTTP_201_CREATED)
 async def create_word(
     word_data: WordCreate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_admin_user)
 ):
@@ -948,6 +1222,8 @@ async def create_word(
     await _recount_category_word_count(word.category, db)
     await db.commit()
     await db.refresh(word)
+
+    background_tasks.add_task(enrich_word_relationships_background, word.id)
     
     return word
 
@@ -1751,11 +2027,6 @@ async def enhance_word_content(
         else:
             print(f"[EnhanceWord]   Preserving existing Cantonese word: {word.word_cantonese}")
         
-        if not word.jyutping:
-            word.jyutping = enhanced.jyutping
-        else:
-            print(f"[EnhanceWord]   Preserving existing jyutping: {word.jyutping}")
-        
         if not word.definition_cantonese:
             word.definition_cantonese = enhanced.definition_cantonese
         else:
@@ -1924,9 +2195,6 @@ async def batch_enhance_words(
                 print(f"[BatchEnhance]   Added Cantonese: {enhanced.word_cantonese}")
             else:
                 print(f"[BatchEnhance]   Preserving existing Cantonese: {word.word_cantonese}")
-            
-            if not word.jyutping:
-                word.jyutping = enhanced.jyutping
             
             if not word.definition_cantonese:
                 word.definition_cantonese = enhanced.definition_cantonese

@@ -60,6 +60,9 @@ class UserResponse(UserBase):
     created_at: datetime
     consent_given: bool = False
     consent_given_at: Optional[datetime] = None
+    consent_camera: bool = True
+    consent_microphone: bool = True
+    consent_analytics: bool = True
     
     class Config:
         from_attributes = True
