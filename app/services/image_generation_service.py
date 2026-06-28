@@ -7,6 +7,7 @@ Translation from Cantonese to English uses Ollama (local, free) with Google Tran
 import asyncio
 import re
 import hashlib
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -259,15 +260,45 @@ _FACE_CATEGORIES = {
     "people", "person", "family", "characters",
 }
 
+# Resolve a category UUID -> name once, cached, so the live endpoint (which
+# sends category as a UUID) gets the same has_face decision as the
+# pre-generation script (which sends the category name).
+_CATEGORY_NAME_CACHE: dict[str, str] = {}
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _resolve_category_name(category: str) -> str:
+    """If `category` is a UUID, look up its human name; otherwise return as-is."""
+    cat = (category or "").strip()
+    if not cat or not _UUID_RE.match(cat):
+        return cat
+    if cat in _CATEGORY_NAME_CACHE:
+        return _CATEGORY_NAME_CACHE[cat]
+    try:
+        from sqlalchemy import create_engine, text
+        sync_url = settings.DATABASE_URL.replace("+asyncpg", "")
+        engine = create_engine(sync_url)
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT name FROM categories WHERE id = :id"), {"id": cat}
+            ).first()
+        name = row[0] if row else ""
+        _CATEGORY_NAME_CACHE[cat] = name
+        return name
+    except Exception as exc:
+        print(f"[ImageGen] category name lookup failed for {cat}: {exc}")
+        return cat
+
 
 def _naturally_has_face(english_word: str, category: str = "") -> bool:
     """Return True if the subject naturally has a face (animal, person).
 
     Decision is driven by the DB category so we don't maintain a manual
-    word list.  The english_word argument is kept for potential future use
-    (e.g. words with no category).
+    word list.  Accepts either a category name or a category UUID (the live
+    endpoint passes a UUID; the pre-generation script passes the name).
     """
-    return category.strip().lower() in _FACE_CATEGORIES
+    name = _resolve_category_name(category)
+    return name.strip().lower() in _FACE_CATEGORIES
 
 
 def build_cartoon_prompt(noun_phrase: str, has_face: bool = False) -> str:
@@ -318,6 +349,166 @@ def build_negative_prompt(has_face: bool = False) -> str:
         "googly eyes, eye, eyeball, emoji face, emoticon, character face, "
         + base
     )
+
+# ── FLUX.2 Klein 9B watercolor prompt (exact template) ─────────────────────────
+
+# Words whose plain English form the image model misreads (word-sense
+# collisions). Map them to an unambiguous descriptive phrase so FLUX draws the
+# intended object. e.g. "toast" -> drinking toast/cheers instead of bread.
+_WORD_DISAMBIGUATION: dict[str, str] = {
+    "toast": "a slice of toasted bread",
+    "scooter": "a child's kick scooter with a tall handlebar and a standing footboard, push scooter, not a motorcycle",
+    "pot": "a metal cooking pot with two handles, a saucepan for cooking on a stove",
+    "paper": "a single blank white sheet of paper",
+    "glue": "a bottle of white school glue with a cap",
+    "marker": "a colorful felt-tip marker pen with its cap, a coloring pen",
+    "tape": "a roll of clear adhesive sticky tape",
+}
+
+
+def _disambiguate_word(word: str) -> str:
+    return _WORD_DISAMBIGUATION.get(word.strip().lower(), word)
+
+
+def build_flux_prompt(english_word: str, has_face: bool = False) -> str:
+    """Watercolor flashcard prompt template, {word} -> English word.
+
+    has_face=True (animals, people): the subject keeps its natural face, eyes
+    and body, shown front-facing so children can recognise it.
+    has_face=False (inanimate objects): no face/eyes/limbs/anthropomorphic
+    features.
+    """
+    word = _disambiguate_word((english_word or "object").strip().lower())
+    if has_face:
+        return (
+            f"a high-quality clean soft watercolor illustration of a single {word} "
+            f"for children's Cantonese vocabulary flashcard, "
+            f"facing forward showing its natural face and friendly eyes, "
+            f"full body, calm and gentle expression, "
+            f"soft warm pastel tones, gentle ink outlines, smooth shading, centered composition, "
+            f"plain cream paper background with subtle texture and soft shadow, "
+            f"child-friendly, educational, no text, no labels"
+        )
+    return (
+        f"a high-quality clean soft watercolor illustration of a single {word} "
+        f"for children's Cantonese vocabulary flashcard, simple plain inanimate object, "
+        f"no face no eyes no mouth no limbs no anthropomorphic features, "
+        f"soft warm pastel tones, gentle ink outlines, smooth shading, centered composition, "
+        f"plain cream paper background with subtle texture and soft shadow, "
+        f"child-friendly, educational, no text, no labels"
+    )
+
+
+# Shared negative terms for every flashcard, regardless of subject.
+_FLUX_NEG_BASE = (
+    "photo, photograph, realistic, 3D render, clay, pixel art, "
+    "multiple objects, busy background, cluttered background, decorative background, "
+    "foliage, leaves, plants, flowers, branches, splashes, paint splatter, "
+    "scenery, pattern, border, frame, dark background, "
+    "text, letters, labels, watermark, blurry, low quality, oversaturated"
+)
+
+# Inanimate objects must additionally suppress any face/anthropomorphism.
+FLUX_NEGATIVE_PROMPT = (
+    "face, eyes, mouth, smile, kawaii face, cartoon face, anthropomorphic, "
+    "limbs, arms, legs, hands, " + _FLUX_NEG_BASE
+)
+
+# Animals/people keep their face — only suppress human-like anthropomorphism
+# (standing upright, clothes, human hands) and back/rear views.
+FLUX_NEGATIVE_PROMPT_FACE = (
+    "anthropomorphic, humanoid, standing upright like a human, wearing clothes, "
+    "human hands, back view, rear view, headless, faceless, " + _FLUX_NEG_BASE
+)
+
+
+def build_flux_negative_prompt(has_face: bool = False) -> str:
+    return FLUX_NEGATIVE_PROMPT_FACE if has_face else FLUX_NEGATIVE_PROMPT
+
+
+# ── Cloudflare Workers AI — FLUX.2 Klein 9B ─────────────────────────────────────
+
+FLUX_MODEL_ID = "@cf/black-forest-labs/flux-2-klein-9b"
+# FLUX.2 models require multipart form data (not JSON).
+FLUX_MAX_RETRIES = 3
+FLUX_RETRY_WAIT_SECS = 5
+
+async def _generate_flux(english_word: str, category: str = "", retries: int = FLUX_MAX_RETRIES) -> Optional[bytes]:
+    """Generate a watercolor flashcard image via Cloudflare Workers AI FLUX.2 Klein 9B."""
+    account_id = settings.CLOUDFLARE_ACCOUNT_ID or settings.CF_ACCOUNT_ID
+    api_token = settings.CLOUDFLARE_AI_API_TOKEN
+    if not account_id or not api_token:
+        print("[ImageGen] CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_AI_API_TOKEN not set")
+        return None
+
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{FLUX_MODEL_ID}"
+    headers = {"Authorization": f"Bearer {api_token}"}
+    has_face = _naturally_has_face(english_word, category)
+    prompt = build_flux_prompt(english_word, has_face=has_face)
+    print(f"[ImageGen] FLUX prompt (has_face={has_face}): '{prompt[:80]}...'")
+    form_data = {
+        "prompt": prompt,
+        "negative_prompt": build_flux_negative_prompt(has_face=has_face),
+        "width": "768",
+        "height": "768",
+        "guidance": "7.5",
+        "num_steps": "4",
+    }
+
+    for attempt in range(1 + retries):
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                resp = await client.post(url, data=form_data, headers=headers)
+                if resp.status_code == 200:
+                    content_type = resp.headers.get("content-type", "")
+                    if "image/" in content_type:
+                        image_bytes = resp.content
+                    else:
+                        # JSON response with base64 image
+                        try:
+                            data = resp.json()
+                            b64 = data.get("result", {}).get("image", "")
+                            if not b64:
+                                print("[ImageGen] FLUX 200 but no result.image in JSON")
+                                return None
+                            image_bytes = base64.b64decode(b64)
+                        except Exception as exc:
+                            print(f"[ImageGen] FLUX JSON parse error: {exc}")
+                            return None
+                    if len(image_bytes) > 2000:
+                        print("[ImageGen] FLUX image generated successfully")
+                        return image_bytes
+                    print(f"[ImageGen] FLUX image too small ({len(image_bytes)} bytes)")
+                    return None
+                elif resp.status_code in (429, 500, 502, 503):
+                    if attempt < retries:
+                        print(f"[ImageGen] FLUX transient {resp.status_code}, waiting {FLUX_RETRY_WAIT_SECS}s (retry {attempt+1}/{retries})...")
+                        await asyncio.sleep(FLUX_RETRY_WAIT_SECS)
+                        continue
+                    print(f"[ImageGen] FLUX {resp.status_code}, retries exhausted: {resp.text[:200]}")
+                    return None
+                else:
+                    print(f"[ImageGen] FLUX error {resp.status_code}: {resp.text[:200]}")
+                    return None
+        except Exception as exc:
+            if attempt < retries:
+                print(f"[ImageGen] FLUX error: {exc} — retry {attempt+1}/{retries}")
+                await asyncio.sleep(FLUX_RETRY_WAIT_SECS)
+                continue
+            print(f"[ImageGen] FLUX error (exhausted): {exc}")
+            return None
+    return None
+
+
+def detect_image_content_type(data: bytes) -> str:
+    """Detect content type from image magic bytes (FLUX may return JPEG or PNG)."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
 
 # ── Silicon Flow API ──────────────────────────────────────────────────────────
 
@@ -413,11 +604,11 @@ async def generate_word_image(
     english_word = await translate_to_english(word, word_cantonese)
     print(f"[ImageGen] Generating for '{word_cantonese}' → '{english_word}'")
 
-    # 4. Kolors
-    image_bytes = await _generate_kolors(english_word, category=category)
+    # 4. FLUX.2 Klein 9B (Cloudflare Workers AI)
+    image_bytes = await _generate_flux(english_word, category=category)
 
     if image_bytes:
-        content_type = "image/jpeg"
+        content_type = detect_image_content_type(image_bytes)
         _save_cache(cache_key, image_bytes, content_type)
         _save_to_mongo(cache_key, word, word_cantonese, image_bytes, content_type)
         return image_bytes, content_type
