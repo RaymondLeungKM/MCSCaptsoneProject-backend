@@ -125,9 +125,9 @@ async def _generate_story_with_internal_generator(
         error_msg = str(error)
 
         if "No words learned today" in error_msg:
-            detail = "No words learned today to include in story. Please complete some learning activities first."
+            detail = "今日仲未學到生字，未可以整故事。請先完成一啲學習活動。"
         elif "Failed to parse AI response" in error_msg:
-            detail = f"The AI generated an invalid story format. Error: {error_msg}"
+            detail = "AI 整出嚟嘅故事格式唔啱，請再試多次。"
         else:
             detail = error_msg
 
@@ -138,7 +138,7 @@ async def _generate_story_with_internal_generator(
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate story: {error}",
+            detail=f"整故事時出錯：{error}",
         ) from error
 
     return StoryGenerationResponse(
@@ -169,7 +169,7 @@ async def get_daily_words(
     if not child:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Child not found"
+            detail="搵唔到小朋友嘅資料"
         )
     
     # Get daily words
@@ -195,7 +195,7 @@ async def track_daily_word(
     if not child:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Child not found"
+            detail="搵唔到小朋友嘅資料"
         )
     
     # Check if already tracked today
@@ -250,7 +250,7 @@ async def generate_bedtime_story(
     if not child:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Child not found"
+            detail="搵唔到小朋友嘅資料"
         )
     
     try:
@@ -274,10 +274,10 @@ async def generate_bedtime_story(
         
         # Provide more user-friendly error messages
         if "No words learned today" in error_msg:
-            detail = "No words learned today to include in story. Please complete some learning activities first."
+            detail = "今日仲未學到生字，未可以整故事。請先完成一啲學習活動。"
         elif "Failed to parse AI response" in error_msg:
             # Include more details for debugging
-            detail = f"The AI generated an invalid story format. Error: {error_msg}"
+            detail = "AI 整出嚟嘅故事格式唔啱，請再試多次。"
         else:
             detail = error_msg
         
@@ -291,7 +291,7 @@ async def generate_bedtime_story(
         traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate story: {str(e)}"
+            detail=f"整故事時出錯：{str(e)}"
         )
 
 
@@ -314,14 +314,14 @@ async def invoke_external_story_program(
     if not child:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Child not found",
+            detail="搵唔到小朋友嘅資料",
         )
 
     words_used = await story_generator.get_daily_words(db, request.child_id, request.date)
     if not words_used:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No words learned today to include in story. Please complete some learning activities first.",
+            detail="今日仲未學到生字，未可以整故事。請先完成一啲學習活動。",
         )
 
     generation_started = time.perf_counter()
@@ -413,7 +413,7 @@ async def invoke_external_story_program(
     except Exception as error:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to invoke external story program: {error}",
+            detail=f"啟動故事程式時出錯：{error}",
         ) from error
 
 
@@ -436,7 +436,7 @@ async def get_child_stories(
     if not child:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Child not found"
+            detail="搵唔到小朋友嘅資料"
         )
     
     # Get stories
@@ -471,7 +471,7 @@ async def get_story(
     if not child:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Child not found"
+            detail="搵唔到小朋友嘅資料"
         )
     
     # Get story
@@ -487,7 +487,7 @@ async def get_story(
     if not story:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Story not found"
+            detail="搵唔到呢個故事"
         )
     
     # Increment read count
@@ -517,7 +517,7 @@ async def toggle_favorite(
     if not child:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Child not found"
+            detail="搵唔到小朋友嘅資料"
         )
     
     # Get story
@@ -533,7 +533,7 @@ async def toggle_favorite(
     if not story:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Story not found"
+            detail="搵唔到呢個故事"
         )
     
     # Toggle favorite

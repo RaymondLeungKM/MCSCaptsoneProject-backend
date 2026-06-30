@@ -756,6 +756,11 @@ async def get_words(
     """Get list of words with optional filters"""
     query = select(Word).options(selectinload(Word.category_rel)).where(Word.is_active == True)
 
+    # Only return words that belong to an ACTIVE category, so hidden categories
+    # (e.g. deactivated Colors/Family/Places, or the junk 'general') never leak
+    # into the learning page or the games.
+    query = query.join(Category, Word.category == Category.id).where(Category.is_active == True)
+
     # By default, keep system words; when child_id provided, optionally include child's external words too.
     if child_id and include_external:
         from sqlalchemy import or_
