@@ -84,6 +84,52 @@ def _save_to_mongo(cache_key: str, word: str, word_cantonese: str,
     except Exception as exc:
         print(f"[ImageGen] MongoDB write error: {exc}")
 
+
+# ── Postgres cache (shared word_images table) ────────────────────────────────
+# Mirrors the Mongo cache so every backend instance pointing at the shared DB
+# sees newly-generated images immediately — no Mongo / no per-host disk needed.
+
+def _get_from_pg(cache_key: str) -> Optional[tuple[bytes, str]]:
+    """Fetch image bytes from Postgres `word_images`. Synchronous + best-effort."""
+    try:
+        import urllib.parse as _up
+        from sqlalchemy import create_engine, text
+        sync_url = settings.DATABASE_URL.replace("+asyncpg", "")
+        engine = create_engine(sync_url, pool_pre_ping=True)
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT image_data, content_type FROM word_images WHERE cache_key = :k"),
+                {"k": cache_key},
+            ).first()
+        if row and row[0]:
+            return bytes(row[0]), (row[1] or "image/jpeg")
+    except Exception as exc:
+        print(f"[ImageGen] Postgres read error: {exc}")
+    return None
+
+
+def _save_to_pg(cache_key: str, word: str, word_cantonese: str,
+                data: bytes, content_type: str) -> None:
+    """Upsert image bytes into Postgres `word_images`. Best-effort, never raises."""
+    try:
+        from sqlalchemy import create_engine, text
+        sync_url = settings.DATABASE_URL.replace("+asyncpg", "")
+        engine = create_engine(sync_url, pool_pre_ping=True)
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO word_images(cache_key, word, word_cantonese, content_type, image_data) "
+                "VALUES (:k, :w, :wc, :ct, :d) "
+                "ON CONFLICT (cache_key) DO UPDATE SET "
+                "  word=EXCLUDED.word, word_cantonese=EXCLUDED.word_cantonese, "
+                "  content_type=EXCLUDED.content_type, image_data=EXCLUDED.image_data, "
+                "  updated_at=now()"
+            ), {"k": cache_key, "w": word, "wc": word_cantonese,
+                "ct": content_type, "d": data})
+    except Exception as exc:
+        # Table may not exist on older deployments; that's OK — Mongo / disk
+        # still cover the case. Logged for visibility, never raised.
+        print(f"[ImageGen] Postgres write error: {exc}")
+
 # ── Cantonese → English translation ─────────────────────────────────────────
 
 _ENGLISH_RE = re.compile(r'^[A-Za-z0-9 \-_]+$')
@@ -580,37 +626,56 @@ async def generate_word_image(
     Returns (image_bytes, content_type).
     image_bytes is None if all providers fail — caller should use emoji fallback.
 
-    Lookup order: MongoDB → disk cache → on-demand generation (stored to both).
+    Lookup order: Postgres word_images → MongoDB → disk cache → on-demand
+    generation. Anything generated or recovered is written back to all three
+    so subsequent reads from any backend instance hit the shared Postgres
+    table first.
     """
     cache_key = _cache_key(word, word_cantonese)
+    label = word_cantonese or word
+    print(f"[ImageGen] request word={word!r} canto={word_cantonese!r} category={category!r} cache_key={cache_key}")
 
-    # 1. MongoDB (pre-generated images — instant)
+    # 1. Postgres `word_images` (shared cache across all backend instances).
+    pg_result = _get_from_pg(cache_key)
+    if pg_result:
+        print(f"[ImageGen] SOURCE=postgres HIT '{label}' bytes={len(pg_result[0])} type={pg_result[1]}")
+        return pg_result
+
+    # 2. MongoDB (legacy / local cache).
     mongo_result = _get_from_mongo(cache_key)
     if mongo_result:
-        print(f"[ImageGen] MongoDB hit for '{word_cantonese or word}'")
+        print(f"[ImageGen] SOURCE=mongodb HIT '{label}' bytes={len(mongo_result[0])} type={mongo_result[1]} (backfilling to postgres)")
+        # Backfill into shared Postgres so other instances can see it too.
+        _save_to_pg(cache_key, word, word_cantonese, mongo_result[0], mongo_result[1])
         return mongo_result
 
-    # 2. Disk cache (legacy / fallback)
+    # 3. Disk cache (legacy / local fallback).
     cached = _cached_image_path(cache_key)
     if cached:
         data = cached.read_bytes()
         suffix = cached.suffix.lstrip(".")
         content_type = f"image/{suffix}"
-        # Backfill to MongoDB so future lookups are faster
+        print(f"[ImageGen] SOURCE=disk HIT '{label}' path={cached} bytes={len(data)} (backfilling to postgres+mongo)")
+        # Backfill to shared Postgres + Mongo so future lookups are faster
+        # and other instances can find the image.
+        _save_to_pg(cache_key, word, word_cantonese, data, content_type)
         _save_to_mongo(cache_key, word, word_cantonese, data, content_type)
         return data, content_type
 
-    # 3. Translate
+    # 4. Translate
     english_word = await translate_to_english(word, word_cantonese)
-    print(f"[ImageGen] Generating for '{word_cantonese}' → '{english_word}'")
+    print(f"[ImageGen] CACHE MISS '{label}' → generating via FLUX for english={english_word!r}")
 
-    # 4. FLUX.2 Klein 9B (Cloudflare Workers AI)
+    # 5. FLUX.2 Klein 9B (Cloudflare Workers AI)
     image_bytes = await _generate_flux(english_word, category=category)
 
     if image_bytes:
         content_type = detect_image_content_type(image_bytes)
+        print(f"[ImageGen] SOURCE=flux GENERATED '{label}' bytes={len(image_bytes)} type={content_type} (saving to disk+postgres+mongo)")
         _save_cache(cache_key, image_bytes, content_type)
+        _save_to_pg(cache_key, word, word_cantonese, image_bytes, content_type)
         _save_to_mongo(cache_key, word, word_cantonese, image_bytes, content_type)
         return image_bytes, content_type
 
+    print(f"[ImageGen] SOURCE=none FAILED '{label}' — all providers failed, frontend will use emoji fallback")
     return None, ""
