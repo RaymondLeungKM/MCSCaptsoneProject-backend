@@ -11,12 +11,72 @@ from datetime import date
 
 from app.db.session import get_db
 from app.schemas.user import ChildCreate, ChildUpdate, ChildResponse, ChildProfileResponse
-from app.models.user import User, Child
+from app.models.user import User, Child, ChildInterest
+from app.models.vocabulary import Category
 from app.core.security import get_current_active_user
 from app.core.child_age import calculate_child_age, infer_birth_year_from_age
 from app.services.child_metrics import sync_child_metrics
 
 router = APIRouter()
+
+
+def _normalize_interest_key(value: str) -> str:
+    return value.strip().lower()
+
+
+async def _resolve_interest_category_ids(
+    db: AsyncSession,
+    interests: List[str],
+) -> List[str]:
+    normalized_inputs = [_normalize_interest_key(item) for item in interests if item and item.strip()]
+    if not normalized_inputs:
+        return []
+
+    unique_inputs = list(dict.fromkeys(normalized_inputs))
+    result = await db.execute(select(Category))
+    categories = result.scalars().all()
+
+    category_by_id = {
+        _normalize_interest_key(category.id): category.id for category in categories
+    }
+    category_by_name = {
+        _normalize_interest_key(category.name): category.id
+        for category in categories
+        if category.name
+    }
+
+    resolved: List[str] = []
+    for item in unique_inputs:
+        category_id = category_by_id.get(item) or category_by_name.get(item)
+        if category_id and category_id not in resolved:
+            resolved.append(category_id)
+
+    return resolved
+
+
+async def _replace_child_interests(
+    db: AsyncSession,
+    child: Child,
+    interests: List[str],
+) -> None:
+    resolved_category_ids = await _resolve_interest_category_ids(db, interests)
+
+    child.interests.clear()
+    for category_id in resolved_category_ids:
+        child.interests.append(ChildInterest(category_id=category_id))
+
+
+async def _load_child_with_interests(
+    db: AsyncSession,
+    child_id: str,
+    parent_id: str,
+) -> Child | None:
+    result = await db.execute(
+        select(Child)
+        .options(selectinload(Child.interests).selectinload(ChildInterest.category))
+        .where(Child.id == child_id, Child.parent_id == parent_id)
+    )
+    return result.scalar_one_or_none()
 
 
 def _apply_effective_age(child: Child, *, as_of: date | None = None) -> None:
@@ -55,13 +115,25 @@ async def create_child(
         attention_span=child_data.attention_span,
         preferred_time_of_day=child_data.preferred_time_of_day,
     )
-    
+
     db.add(child)
+    await db.flush()
+
+    if child_data.interests is not None:
+        await _replace_child_interests(db, child, child_data.interests)
+
     await db.commit()
-    await db.refresh(child, ["interests"])
-    _apply_effective_age(child)
-    
-    return child
+    child_with_interests = await _load_child_with_interests(db, child.id, current_user.id)
+
+    if child_with_interests is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Child not found"
+        )
+
+    _apply_effective_age(child_with_interests)
+
+    return child_with_interests
 
 
 @router.get("/", response_model=List[ChildResponse])
@@ -72,7 +144,7 @@ async def get_children(
     """Get all children for current user"""
     result = await db.execute(
         select(Child)
-        .options(selectinload(Child.interests))
+        .options(selectinload(Child.interests).selectinload(ChildInterest.category))
         .where(Child.parent_id == current_user.id)
     )
     children = result.scalars().all()
@@ -102,7 +174,7 @@ async def get_child(
     """Get specific child profile with extended stats"""
     result = await db.execute(
         select(Child)
-        .options(selectinload(Child.interests))
+        .options(selectinload(Child.interests).selectinload(ChildInterest.category))
         .where(Child.id == child_id, Child.parent_id == current_user.id)
     )
     child = result.scalar_one_or_none()
@@ -133,7 +205,7 @@ async def update_child(
     """Update child profile"""
     result = await db.execute(
         select(Child)
-        .options(selectinload(Child.interests))
+        .options(selectinload(Child.interests).selectinload(ChildInterest.category))
         .where(Child.id == child_id, Child.parent_id == current_user.id)
     )
     child = result.scalar_one_or_none()
@@ -146,6 +218,7 @@ async def update_child(
     
     # Update fields
     update_data = child_data.dict(exclude_unset=True)
+    interests = update_data.pop("interests", None)
 
     if "age" in update_data and "birth_year" not in update_data:
         update_data["birth_year"], inferred_birth_month = infer_birth_year_from_age(
@@ -156,12 +229,22 @@ async def update_child(
 
     for field, value in update_data.items():
         setattr(child, field, value)
+
+    if interests is not None:
+        await _replace_child_interests(db, child, interests)
     
     await db.commit()
-    await db.refresh(child, ["interests"])
-    _apply_effective_age(child)
-    
-    return child
+    child_with_interests = await _load_child_with_interests(db, child.id, current_user.id)
+
+    if child_with_interests is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Child not found"
+        )
+
+    _apply_effective_age(child_with_interests)
+
+    return child_with_interests
 
 
 @router.delete("/{child_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -6,7 +6,7 @@ learning-style assessment, and learning-speed profiling.
 from fastapi import APIRouter, Depends, HTTPException, status, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, selectinload
 from typing import List
 
 from app.db.session import get_db
@@ -19,7 +19,7 @@ from app.schemas.word_personalization import (
     ReviewQueueResponse, ReviewResultRequest, ReviewResultResponse,
     LearningStyleAssessment, LearningStyleResponse,
 )
-from app.models.user import User, Child
+from app.models.user import User, Child, ChildInterest
 from app.models.vocabulary import Word, WordProgress
 from app.models.word_personalization import WordRelationship, RelationshipType
 from app.core.security import get_current_active_user, get_current_admin_user
@@ -44,6 +44,34 @@ def _is_pending_ai_relationship(source: str | None) -> bool:
 
 def _normalize_learning_style(value: str | None) -> str:
     return value or "mixed"
+
+
+def _normalize_interest_key(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def _extract_child_interest_keys(child: Child) -> set[str]:
+    keys: set[str] = set()
+
+    for interest in child.interests:
+        category_id = _normalize_interest_key(interest.category_id)
+        if category_id:
+            keys.add(category_id)
+
+        category = getattr(interest, "category", None)
+        category_name = _normalize_interest_key(
+            getattr(category, "name", None) if category is not None else None
+        )
+        if category_name:
+            keys.add(category_name)
+
+        category_name_cantonese = _normalize_interest_key(
+            getattr(category, "name_cantonese", None) if category is not None else None
+        )
+        if category_name_cantonese:
+            keys.add(category_name_cantonese)
+
+    return keys
 
 
 def _style_activity_templates(style: str) -> List[str]:
@@ -208,7 +236,12 @@ def _build_next_activity_reason(child: Child) -> str:
     return "根據目前的混合學習偏好，先從互動練習開始，再切換故事或創作會更合適。"
 
 
-def calculate_word_priority(word: Word, progress: WordProgress, child: Child) -> int:
+def calculate_word_priority(
+    word: Word,
+    progress: WordProgress,
+    child: Child,
+    interest_keys: set[str],
+) -> int:
     """Calculate priority score for a word"""
     priority = 0
     
@@ -224,8 +257,10 @@ def calculate_word_priority(word: Word, progress: WordProgress, child: Child) ->
     if not progress or not progress.mastered:
         priority += 7
     
-    # Factor 3: Interest alignment (simplified - would need to check child's interests)
-    priority += 3
+    # Factor 3: Interest alignment
+    word_category_key = _normalize_interest_key(word.category)
+    if interest_keys and word_category_key in interest_keys:
+        priority += 8
     
     # Factor 4: Low success rate
     if progress and progress.success_rate < 0.7:
@@ -243,7 +278,9 @@ async def get_recommendations(
     """Get personalized learning recommendations for a child"""
     # Verify child belongs to user
     result = await db.execute(
-        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+        select(Child)
+        .options(selectinload(Child.interests).selectinload(ChildInterest.category))
+        .where(Child.id == child_id, Child.parent_id == current_user.id)
     )
     child = result.scalar_one_or_none()
     
@@ -262,12 +299,13 @@ async def get_recommendations(
         select(WordProgress).where(WordProgress.child_id == child_id)
     )
     progress_dict = {p.word_id: p for p in result.scalars().all()}
+    interest_keys = _extract_child_interest_keys(child)
     
     # Score and rank words
     scored_words = []
     for word in all_words:
         progress = progress_dict.get(word.id)
-        score = calculate_word_priority(word, progress, child)
+        score = calculate_word_priority(word, progress, child, interest_keys)
         scored_words.append((word, score))
     
     # Sort by score (highest first)
@@ -327,7 +365,9 @@ async def get_word_of_the_day(
     """Get the recommended word of the day for a child"""
     # Verify child belongs to user
     result = await db.execute(
-        select(Child).where(Child.id == child_id, Child.parent_id == current_user.id)
+        select(Child)
+        .options(selectinload(Child.interests).selectinload(ChildInterest.category))
+        .where(Child.id == child_id, Child.parent_id == current_user.id)
     )
     child = result.scalar_one_or_none()
     
@@ -346,6 +386,7 @@ async def get_word_of_the_day(
         select(WordProgress).where(WordProgress.child_id == child_id)
     )
     progress_dict = {p.word_id: p for p in result.scalars().all()}
+    interest_keys = _extract_child_interest_keys(child)
     
     # Find highest priority word
     best_word = None
@@ -353,7 +394,7 @@ async def get_word_of_the_day(
     
     for word in all_words:
         progress = progress_dict.get(word.id)
-        score = calculate_word_priority(word, progress, child)
+        score = calculate_word_priority(word, progress, child, interest_keys)
         if score > best_score:
             best_score = score
             best_word = word

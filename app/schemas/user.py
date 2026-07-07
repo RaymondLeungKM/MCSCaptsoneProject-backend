@@ -1,7 +1,7 @@
 """
 Pydantic schemas for User/Child
 """
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional, List
 from datetime import datetime
 from enum import Enum
@@ -97,6 +97,7 @@ class ChildUpdate(BaseModel):
     language_preference: Optional[LanguagePreference] = None
     attention_span: Optional[int] = None
     preferred_time_of_day: Optional[TimeOfDay] = None
+    interests: Optional[List[str]] = None
     community_sharing_enabled: Optional[bool] = None
 
 
@@ -112,6 +113,36 @@ class ChildResponse(ChildBase):
     last_active: Optional[datetime] = None
     interests: List[str] = []
     community_sharing_enabled: bool = False
+
+    @field_validator("interests", mode="before")
+    @classmethod
+    def normalize_interests(cls, value):
+        if not value:
+            return []
+
+        normalized: List[str] = []
+        for item in value:
+            if isinstance(item, str):
+                candidate = item.strip()
+                if candidate and candidate not in normalized:
+                    normalized.append(candidate)
+                continue
+
+            category = getattr(item, "category", None)
+            category_name = getattr(category, "name", None) if category is not None else None
+            if isinstance(category_name, str):
+                candidate = category_name.strip()
+                if candidate and candidate not in normalized:
+                    normalized.append(candidate)
+                    continue
+
+            category_id = getattr(item, "category_id", None)
+            if isinstance(category_id, str):
+                candidate = category_id.strip()
+                if candidate and candidate not in normalized:
+                    normalized.append(candidate)
+
+        return normalized
     
     class Config:
         from_attributes = True
