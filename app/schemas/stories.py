@@ -140,11 +140,13 @@ class StoryGenerationRequest(BaseModel):
 
 class StoryGenerationResponse(BaseModel):
     """Response after generating a story"""
-    story: GeneratedStoryResponse
+    story: Optional[GeneratedStoryResponse] = None
     words_used: List[DailyWordSummary]
     generation_time_seconds: float
     success: bool
     message: Optional[str] = None
+    pending: bool = False
+    pending_since: Optional[datetime] = None
 
 
 class ExternalStoryInvokeRequest(BaseModel):

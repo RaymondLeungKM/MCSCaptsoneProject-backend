@@ -5,14 +5,16 @@ import logging
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 from typing import List
 from datetime import datetime, date
 
 from app.db.session import get_db
+from app.db.session import AsyncSessionLocal
 from app.core.security import get_current_user
 from app.models.user import User, Child
 from app.models.daily_words import DailyWordTracking, GeneratedStory
@@ -148,6 +150,146 @@ async def _generate_story_with_internal_generator(
         success=True,
         message=message,
     )
+
+
+async def _persist_external_story_result(
+    db: AsyncSession,
+    request: ExternalStoryInvokeRequest,
+    child_name: str,
+    words_used: List[DailyWordSummary],
+    generation_started: float,
+    result,
+) -> GeneratedStory:
+    persisted_at = datetime.utcnow()
+    title, title_english = _build_external_title(child_name, request.theme)
+    story = GeneratedStory(
+        id=str(uuid.uuid4()),
+        child_id=request.child_id,
+        title=title,
+        title_english=title_english,
+        theme=request.theme,
+        generation_date=persisted_at,
+        generated_at=persisted_at,
+        generated_by="external_story_program",
+        content_cantonese=result.story_text,
+        content_english=None,
+        jyutping=None,
+        vocab_used=", ".join([_word_label(word) for word in words_used]),
+        story_text=result.story_text,
+        story_text_ssml=story_generator._build_story_ssml(result.story_text),
+        story_generate_provdier="OpenRouter",
+        story_generate_model=result.llm_model,
+        featured_words=[_word_label(word) for word in words_used],
+        word_usage=_build_external_word_usage(words_used),
+        audio_url=result.audio_url,
+        audio_duration_seconds=None,
+        audio_filename=result.audio_filename,
+        audio_generate_provider=result.tts_provider,
+        audio_generate_voice_name=None,
+        reading_time_minutes=request.reading_time_minutes,
+        word_count=len(result.story_text),
+        difficulty_level="easy",
+        cultural_references=None,
+        read_count=0,
+        is_favorite=False,
+        parent_approved=True,
+        ai_model=result.llm_model,
+        generation_prompt=(
+            f"External story program invoked for child={request.child_id}, "
+            f"theme={request.theme}, vocab={result.vocab_used}"
+        ),
+        generation_time_seconds=time.perf_counter() - generation_started,
+    )
+
+    db.add(story)
+    await db.commit()
+    await db.refresh(story)
+    return story
+
+
+async def _invoke_external_story_and_persist(
+    request: ExternalStoryInvokeRequest,
+    db: AsyncSession,
+    words_used: List[DailyWordSummary],
+    child_name: str,
+) -> StoryGenerationResponse:
+    generation_started = time.perf_counter()
+
+    try:
+        gen_date = (request.date or datetime.utcnow()).strftime("%Y-%m-%d")
+        external_result = await run_in_threadpool(
+            external_story_program_service.invoke,
+            request.child_id,
+            gen_date,
+            request.theme,
+        )
+
+        story = await _persist_external_story_result(
+            db=db,
+            request=request,
+            child_name=child_name,
+            words_used=words_used,
+            generation_started=generation_started,
+            result=external_result,
+        )
+        story_response = GeneratedStoryResponse.model_validate(story)
+
+        return StoryGenerationResponse(
+            story=story_response,
+            words_used=words_used,
+            generation_time_seconds=story.generation_time_seconds or 0.0,
+            success=True,
+            message="Story generated successfully",
+        )
+    except ExternalStoryProgramError as error:
+        return await _generate_story_with_internal_generator(
+            request,
+            db,
+            words_used,
+            message=(
+                "Story generated successfully using the built-in generator because "
+                f"the external story program failed: {error}"
+            ),
+        )
+
+
+async def _generate_external_story_in_background(
+    request_data: dict,
+) -> None:
+    request = ExternalStoryInvokeRequest.model_validate(request_data)
+
+    async with AsyncSessionLocal() as db:
+        try:
+            child_query = select(Child).where(Child.id == request.child_id)
+            child_result = await db.execute(child_query)
+            child = child_result.scalar_one_or_none()
+            if not child:
+                logger.warning(
+                    "Skipping background bedtime story generation: child %s not found",
+                    request.child_id,
+                )
+                return
+
+            words_used = await story_generator.get_daily_words(db, request.child_id, request.date)
+            if not words_used:
+                logger.warning(
+                    "Skipping background bedtime story generation: no daily words for child %s",
+                    request.child_id,
+                )
+                return
+
+            await _invoke_external_story_and_persist(
+                request=request,
+                db=db,
+                words_used=words_used,
+                child_name=child.name,
+            )
+        except Exception:
+            await db.rollback()
+            logger.exception(
+                "Background bedtime story generation failed for child %s",
+                request.child_id,
+            )
 
 
 @router.get("/daily-words/{child_id}", response_model=List[DailyWordSummary])
@@ -298,6 +440,7 @@ async def generate_bedtime_story(
 @router.post("/external/invoke", response_model=StoryGenerationResponse)
 async def invoke_external_story_program(
     request: ExternalStoryInvokeRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -324,8 +467,6 @@ async def invoke_external_story_program(
             detail="今日仲未學到生字，未可以整故事。請先完成一啲學習活動。",
         )
 
-    generation_started = time.perf_counter()
-
     external_program_error = external_story_program_service.availability_error()
     if external_program_error:
         return await _generate_story_with_internal_generator(
@@ -338,83 +479,24 @@ async def invoke_external_story_program(
             ),
         )
 
-    try:
-        gen_date = (request.date or datetime.utcnow()).strftime("%Y-%m-%d")
-        result = await run_in_threadpool(
-            external_story_program_service.invoke,
-            request.child_id,
-            gen_date,
-            normalized_theme,
-        )
+    background_tasks.add_task(
+        _generate_external_story_in_background,
+        normalized_request.model_dump(mode="json"),
+    )
 
-        persisted_at = datetime.utcnow()
-        title, title_english = _build_external_title(child.name, normalized_theme)
-        story = GeneratedStory(
-            id=str(uuid.uuid4()),
-            child_id=request.child_id,
-            title=title,
-            title_english=title_english,
-            theme=normalized_theme,
-            generation_date=persisted_at,
-            generated_at=persisted_at,
-            generated_by="external_story_program",
-            content_cantonese=result.story_text,
-            content_english=None,
-            jyutping=None,
-            vocab_used=", ".join([_word_label(word) for word in words_used]),
-            story_text=result.story_text,
-            story_text_ssml=story_generator._build_story_ssml(result.story_text),
-            story_generate_provdier="OpenRouter",
-            story_generate_model=result.llm_model,
-            featured_words=[_word_label(word) for word in words_used],
-            word_usage=_build_external_word_usage(words_used),
-            audio_url=result.audio_url,
-            audio_duration_seconds=None,
-            audio_filename=result.audio_filename,
-            audio_generate_provider=result.tts_provider,
-            audio_generate_voice_name=None,
-            reading_time_minutes=request.reading_time_minutes,
-            word_count=len(result.story_text),
-            difficulty_level="easy",
-            cultural_references=None,
-            read_count=0,
-            is_favorite=False,
-            parent_approved=True,
-            ai_model=result.llm_model,
-            generation_prompt=(
-                f"External story program invoked for child={request.child_id}, "
-                f"theme={normalized_theme}, vocab={result.vocab_used}"
-            ),
-            generation_time_seconds=time.perf_counter() - generation_started,
-        )
-
-        db.add(story)
-        await db.commit()
-        await db.refresh(story)
-        story_response = GeneratedStoryResponse.model_validate(story)
-
-        return StoryGenerationResponse(
-            story=story_response,
-            words_used=words_used,
-            generation_time_seconds=story.generation_time_seconds or 0.0,
-            success=True,
-            message="Story generated successfully",
-        )
-    except ExternalStoryProgramError as error:
-        return await _generate_story_with_internal_generator(
-            normalized_request,
-            db,
-            words_used,
-            message=(
-                "Story generated successfully using the built-in generator because "
-                f"the external story program failed: {error}"
-            ),
-        )
-    except Exception as error:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"啟動故事程式時出錯：{error}",
-        ) from error
+    pending_response = StoryGenerationResponse(
+        story=None,
+        words_used=words_used,
+        generation_time_seconds=0.0,
+        success=False,
+        message="Story generation started. Poll the story list for the completed result.",
+        pending=True,
+        pending_since=datetime.utcnow(),
+    )
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content=pending_response.model_dump(mode="json"),
+    )
 
 
 @router.get("/list/{child_id}", response_model=List[GeneratedStoryResponse])
