@@ -63,7 +63,7 @@ async def login(
     if not user or not verify_password(credentials.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
+            detail="Incorrect login email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
@@ -92,7 +92,7 @@ async def login_with_form(
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
+            detail="Incorrect login email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
