@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from mutagen.mp3 import MP3
 
@@ -141,11 +141,72 @@ def build_story_page_audio_segments(
     return segments
 
 
+def coerce_story_page_audio_segments(
+    raw_segments: Any,
+    duration_seconds: Optional[int],
+) -> List[StoryPageAudioSegment]:
+    if not isinstance(raw_segments, list):
+        return []
+
+    resolved_duration = float(duration_seconds) if duration_seconds and duration_seconds > 0 else None
+    segments: list[StoryPageAudioSegment] = []
+
+    for raw_segment in raw_segments:
+        try:
+            segment = StoryPageAudioSegment.model_validate(raw_segment)
+        except Exception:
+            continue
+
+        start_time = max(0.0, float(segment.start_time_seconds))
+        end_time = max(start_time, float(segment.end_time_seconds))
+        if resolved_duration is not None:
+            start_time = min(start_time, resolved_duration)
+            end_time = min(end_time, resolved_duration)
+            start_ratio = round(start_time / resolved_duration, 6)
+            end_ratio = round(end_time / resolved_duration, 6)
+        else:
+            start_ratio = max(0.0, min(1.0, float(segment.start_ratio)))
+            end_ratio = max(start_ratio, min(1.0, float(segment.end_ratio)))
+
+        segments.append(
+            StoryPageAudioSegment(
+                page_index=int(segment.page_index),
+                start_ratio=start_ratio,
+                end_ratio=end_ratio,
+                start_time_seconds=round(start_time, 3),
+                end_time_seconds=round(end_time, 3),
+                text_length=max(0, int(segment.text_length)),
+            )
+        )
+
+    segments.sort(key=lambda segment: segment.page_index)
+    if segments and resolved_duration is not None:
+        last_segment = segments[-1]
+        segments[-1] = StoryPageAudioSegment(
+            page_index=last_segment.page_index,
+            start_ratio=last_segment.start_ratio,
+            end_ratio=1.0,
+            start_time_seconds=last_segment.start_time_seconds,
+            end_time_seconds=round(resolved_duration, 3),
+            text_length=last_segment.text_length,
+        )
+
+    return segments
+
+
 def build_story_payload(story: GeneratedStory) -> GeneratedStoryResponse:
     resolved_duration = resolve_story_audio_duration_seconds(story)
-    payload = GeneratedStoryResponse.model_validate(story).model_dump()
+    payload = {
+        field_name: getattr(story, field_name)
+        for field_name in GeneratedStoryResponse.model_fields
+        if field_name != "page_audio_segments"
+    }
     payload["audio_duration_seconds"] = resolved_duration
-    payload["page_audio_segments"] = build_story_page_audio_segments(
+    stored_segments = coerce_story_page_audio_segments(
+        getattr(story, "page_audio_segments", None),
+        resolved_duration,
+    )
+    payload["page_audio_segments"] = stored_segments or build_story_page_audio_segments(
         story.content_cantonese or story.story_text or "",
         resolved_duration,
     )

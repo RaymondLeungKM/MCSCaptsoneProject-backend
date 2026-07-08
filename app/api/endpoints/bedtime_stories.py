@@ -194,6 +194,7 @@ async def _persist_external_story_result(
             )
         ),
         audio_filename=result.audio_filename,
+        page_audio_segments=result.page_audio_segments or None,
         audio_generate_provider=result.tts_provider,
         audio_generate_voice_name=None,
         reading_time_minutes=request.reading_time_minutes,

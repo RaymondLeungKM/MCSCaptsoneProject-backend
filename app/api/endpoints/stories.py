@@ -55,6 +55,7 @@ def _apply_generated_audio_fields(story: GeneratedStory, generated_audio_result)
     story.story_text_ssml = generated_audio_result.story_text_ssml or _default_story_ssml(story.story_text)
     story.audio_url = generated_audio_result.audio_url
     story.audio_filename = generated_audio_result.audio_filename
+    story.page_audio_segments = generated_audio_result.page_audio_segments or None
     story.audio_generate_provider = generated_audio_result.tts_provider
     story.audio_generate_voice_name = generated_audio_result.voice_name
 
@@ -121,6 +122,11 @@ async def create_admin_story(
         audio_url=story_data.audio_url,
         audio_duration_seconds=story_data.audio_duration_seconds,
         audio_filename=story_data.audio_filename or "curated-story.mp3",
+        page_audio_segments=(
+            [segment.model_dump() for segment in story_data.page_audio_segments]
+            if story_data.page_audio_segments is not None
+            else None
+        ),
         audio_generate_provider=story_data.audio_generate_provider,
         audio_generate_voice_name=story_data.audio_generate_voice_name,
         reading_time_minutes=story_data.reading_time_minutes,
@@ -151,7 +157,7 @@ async def create_admin_story(
     db.add(story)
     await db.commit()
     await db.refresh(story)
-    return _build_story_payload(story)
+    return build_story_payload(story)
 
 
 @router.patch("/admin/{story_id}", response_model=GeneratedStoryResponse)
@@ -182,6 +188,11 @@ async def update_admin_story(
     story.audio_url = story_data.audio_url
     story.audio_duration_seconds = story_data.audio_duration_seconds
     story.audio_filename = story_data.audio_filename or story.audio_filename
+    story.page_audio_segments = (
+        [segment.model_dump() for segment in story_data.page_audio_segments]
+        if story_data.page_audio_segments is not None
+        else None
+    )
     story.audio_generate_provider = story_data.audio_generate_provider
     story.audio_generate_voice_name = story_data.audio_generate_voice_name
     story.reading_time_minutes = story_data.reading_time_minutes
@@ -207,7 +218,7 @@ async def update_admin_story(
 
     await db.commit()
     await db.refresh(story)
-    return _build_story_payload(story)
+    return build_story_payload(story)
 
 
 @router.delete("/admin/{story_id}", status_code=status.HTTP_204_NO_CONTENT)

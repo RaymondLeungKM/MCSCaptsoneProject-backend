@@ -140,6 +140,7 @@ async def generate_story_audio(
         story.audio_url = generated["audio_url"]
         story.audio_duration_seconds = generated["audio_duration_seconds"]
         story.audio_filename = generated["audio_filename"]
+        story.page_audio_segments = None
         story.audio_generate_provider = generated["audio_generate_provider"]
         story.audio_generate_voice_name = generated["audio_generate_voice_name"]
         await db.commit()
