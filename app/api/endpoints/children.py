@@ -3,7 +3,7 @@ Children profile endpoints
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
 from typing import List
 import uuid
@@ -61,9 +61,15 @@ async def _replace_child_interests(
 ) -> None:
     resolved_category_ids = await _resolve_interest_category_ids(db, interests)
 
-    child.interests.clear()
-    for category_id in resolved_category_ids:
-        child.interests.append(ChildInterest(category_id=category_id))
+    await db.execute(delete(ChildInterest).where(ChildInterest.child_id == child.id))
+
+    if resolved_category_ids:
+        db.add_all(
+            [
+                ChildInterest(child_id=child.id, category_id=category_id)
+                for category_id in resolved_category_ids
+            ]
+        )
 
 
 async def _load_child_with_interests(
