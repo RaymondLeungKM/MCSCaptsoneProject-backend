@@ -55,6 +55,10 @@ def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
     return max(minimum, min(maximum, value))
 
 
+def _has_recorded_word_exposure(progress: WordProgress) -> bool:
+    return (progress.exposure_count or 0) >= 1
+
+
 def _derive_engagement_level(
     *,
     duration_minutes: int,
@@ -380,12 +384,16 @@ async def get_progress_stats(
         select(WordProgress).where(WordProgress.child_id == child_id)
     )
     all_progress = result.scalars().all()
-    
-    mastered_words = sum(1 for p in all_progress if p.mastered)
-    total_words = len(all_progress)
+
+    encountered_progress = [
+        progress for progress in all_progress if _has_recorded_word_exposure(progress)
+    ]
+
+    mastered_words = sum(1 for p in encountered_progress if p.mastered)
+    total_words = len(encountered_progress)
     
     # Calculate active vs passive vocabulary from explicit output signals.
-    progress_word_ids = {p.word_id for p in all_progress}
+    progress_word_ids = {p.word_id for p in encountered_progress}
 
     active_word_ids: set[str] = set()
 
@@ -425,7 +433,7 @@ async def get_progress_stats(
     passive_vocab = total_words - active_vocab
 
     average_exposures_per_word = sum(
-        p.exposure_count or 0 for p in all_progress
+        p.exposure_count or 0 for p in encountered_progress
     ) / max(total_words, 1)
 
     today = date.today()
@@ -464,7 +472,7 @@ async def get_progress_stats(
 
     modality_coverage_total = 0.0
     modality_tracked_words = 0
-    for progress in all_progress:
+    for progress in encountered_progress:
         modalities_used = 0
         if (progress.visual_exposures or 0) > 0:
             modalities_used += 1
