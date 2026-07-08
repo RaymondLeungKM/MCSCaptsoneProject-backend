@@ -35,6 +35,7 @@ from app.services.external_story_program_service import (
     ExternalStoryProgramError,
     external_story_program_service,
 )
+from app.services.story_audio_metadata import build_story_payload, resolve_story_audio_duration_seconds
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -144,7 +145,7 @@ async def _generate_story_with_internal_generator(
         ) from error
 
     return StoryGenerationResponse(
-        story=GeneratedStoryResponse.model_validate(story),
+        story=build_story_payload(story),
         words_used=words_used,
         generation_time_seconds=generation_time,
         success=True,
@@ -182,7 +183,16 @@ async def _persist_external_story_result(
         featured_words=[_word_label(word) for word in words_used],
         word_usage=_build_external_word_usage(words_used),
         audio_url=result.audio_url,
-        audio_duration_seconds=None,
+        audio_duration_seconds=resolve_story_audio_duration_seconds(
+            GeneratedStory(
+                audio_url=result.audio_url,
+                audio_filename=result.audio_filename,
+                audio_duration_seconds=None,
+                reading_time_minutes=request.reading_time_minutes,
+                content_cantonese=result.story_text,
+                story_text=result.story_text,
+            )
+        ),
         audio_filename=result.audio_filename,
         audio_generate_provider=result.tts_provider,
         audio_generate_voice_name=None,
@@ -232,7 +242,7 @@ async def _invoke_external_story_and_persist(
             generation_started=generation_started,
             result=external_result,
         )
-        story_response = GeneratedStoryResponse.model_validate(story)
+        story_response = build_story_payload(story)
 
         return StoryGenerationResponse(
             story=story_response,
@@ -400,7 +410,7 @@ async def generate_bedtime_story(
         story, words_used, generation_time = await story_generator.generate_story(db, request)
         
         # Convert to response
-        story_response = GeneratedStoryResponse.model_validate(story)
+        story_response = build_story_payload(story)
         
         return StoryGenerationResponse(
             story=story_response,
@@ -531,7 +541,7 @@ async def get_child_stories(
     result = await db.execute(stories_query)
     stories = result.scalars().all()
     
-    return [GeneratedStoryResponse.model_validate(s) for s in stories]
+    return [build_story_payload(story) for story in stories]
 
 
 @router.get("/{child_id}/{story_id}", response_model=GeneratedStoryResponse)
@@ -577,7 +587,7 @@ async def get_story(
     await db.commit()
     await db.refresh(story)
     
-    return GeneratedStoryResponse.model_validate(story)
+    return build_story_payload(story)
 
 
 @router.patch("/{child_id}/{story_id}/favorite")

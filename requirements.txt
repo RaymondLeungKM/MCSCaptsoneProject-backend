@@ -28,3 +28,4 @@ aiofiles==23.2.1
 gTTS==2.5.4
 pymongo==4.8.0
 groq>=0.7.0
+mutagen==1.47.0

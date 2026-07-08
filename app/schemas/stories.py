@@ -85,6 +85,15 @@ class GeneratedStoryCreate(BaseModel):
     sort_order: int = 0
 
 
+class StoryPageAudioSegment(BaseModel):
+    page_index: int
+    start_ratio: float
+    end_ratio: float
+    start_time_seconds: float
+    end_time_seconds: float
+    text_length: int
+
+
 class GeneratedStoryResponse(BaseModel):
     id: str
     child_id: Optional[str]
@@ -122,6 +131,7 @@ class GeneratedStoryResponse(BaseModel):
     ai_model: Optional[str]
     created_at: datetime
     updated_at: Optional[datetime]
+    page_audio_segments: List[StoryPageAudioSegment] = Field(default_factory=list)
 
     class Config:
         from_attributes = True

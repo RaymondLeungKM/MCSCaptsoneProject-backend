@@ -17,15 +17,10 @@ from app.services.external_story_program_service import (
     ExternalStoryProgramError,
     external_story_program_service,
 )
+from app.services.story_audio_metadata import build_story_payload
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-
-def _build_story_payload(story: GeneratedStory) -> GeneratedStoryResponse:
-    return GeneratedStoryResponse.model_validate(story)
-
-
 async def _get_story_or_404(db: AsyncSession, story_id: str) -> GeneratedStory:
     result = await db.execute(select(GeneratedStory).where(GeneratedStory.id == story_id))
     story = result.scalar_one_or_none()
@@ -78,7 +73,7 @@ async def get_stories(
         .order_by(GeneratedStory.sort_order, GeneratedStory.created_at)
     )
     stories = result.scalars().all()
-    return stories
+    return [build_story_payload(story) for story in stories]
 
 
 @router.get("/admin/all", response_model=List[GeneratedStoryResponse])
@@ -93,7 +88,7 @@ async def get_admin_stories(
         .order_by(GeneratedStory.sort_order, GeneratedStory.created_at)
     )
     stories = result.scalars().all()
-    return stories
+    return [build_story_payload(story) for story in stories]
 
 
 @router.post("/admin", response_model=GeneratedStoryResponse, status_code=status.HTTP_201_CREATED)
@@ -235,4 +230,4 @@ async def get_story(
 ):
     """Get specific curated story."""
     story = await _get_story_or_404(db, story_id)
-    return story
+    return build_story_payload(story)
