@@ -117,6 +117,7 @@ backend/
 
 - `POST /stories/generate` - Generate AI story
 - `GET /stories/{id}` - Get story details
+- `GET /stories/child-ui/curated-section` - Get child UI curated stories hero+carousel layout
 - `POST /sentences/generate` - Generate example sentences
 
 ### Analytics

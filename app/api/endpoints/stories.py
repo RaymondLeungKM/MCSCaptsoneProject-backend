@@ -2,14 +2,20 @@
 Story content endpoints
 """
 import logging
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
 from typing import List
 import uuid
 
 from app.db.session import get_db
-from app.schemas.stories import GeneratedStoryCreate, GeneratedStoryResponse
+from app.schemas.stories import (
+    CuratedStoriesChildSectionResponse,
+    CuratedStoryCard,
+    GeneratedStoryCreate,
+    GeneratedStoryResponse,
+)
 from app.models.daily_words import GeneratedStory
 from app.models.user import User
 from app.core.security import get_current_admin_user
@@ -21,6 +27,8 @@ from app.services.story_audio_metadata import build_story_payload
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
 async def _get_story_or_404(db: AsyncSession, story_id: str) -> GeneratedStory:
     result = await db.execute(select(GeneratedStory).where(GeneratedStory.id == story_id))
     story = result.scalar_one_or_none()
@@ -60,6 +68,55 @@ def _apply_generated_audio_fields(story: GeneratedStory, generated_audio_result)
     story.audio_generate_voice_name = generated_audio_result.voice_name
 
 
+THEME_COVER_ICON_KEYS = {
+    "bedtime": "moon",
+    "family": "home",
+    "friendship": "handshake",
+    "animals": "animals",
+    "nature": "nature",
+    "adventure": "adventure",
+}
+
+
+def _normalize_theme_token(theme: str | None) -> str:
+    normalized = (theme or "").strip().lower()
+    if not normalized:
+        return "bedtime"
+    if normalized in {"睡前", "晚安", "月光"}:
+        return "bedtime"
+    if normalized in {"家庭", "溫馨"}:
+        return "family"
+    if normalized in {"友誼", "星空"}:
+        return "friendship"
+    if normalized in {"動物"}:
+        return "animals"
+    if normalized in {"大自然"}:
+        return "nature"
+    if normalized in {"冒險"}:
+        return "adventure"
+    return normalized
+
+
+def _build_curated_story_card(story: GeneratedStory) -> CuratedStoryCard:
+    now_utc = datetime.now(timezone.utc)
+    generated_at = story.generated_at or story.created_at or now_utc
+    if generated_at.tzinfo is None:
+        generated_at = generated_at.replace(tzinfo=timezone.utc)
+
+    theme_token = _normalize_theme_token(story.theme)
+    return CuratedStoryCard(
+        id=story.id,
+        title=story.title,
+        theme=story.theme,
+        cover_icon_key=THEME_COVER_ICON_KEYS.get(theme_token, "book"),
+        reading_time_minutes=max(int(story.reading_time_minutes or 5), 1),
+        audio_duration_seconds=story.audio_duration_seconds,
+        audio_url=story.audio_url,
+        generated_at=generated_at,
+        is_new=(now_utc - generated_at) <= timedelta(days=3),
+    )
+
+
 @router.get("/", response_model=List[GeneratedStoryResponse])
 async def get_stories(
     db: AsyncSession = Depends(get_db)
@@ -75,6 +132,75 @@ async def get_stories(
     )
     stories = result.scalars().all()
     return [build_story_payload(story) for story in stories]
+
+
+@router.get(
+    "/child-ui/curated-section",
+    response_model=CuratedStoriesChildSectionResponse,
+)
+async def get_child_ui_curated_stories_section(
+    preview_cards: int = 4,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get curated stories preview in a hero + compact carousel layout for child UI."""
+    safe_preview_cards = min(max(preview_cards, 2), 6)
+    max_mini_cards_visible = max(safe_preview_cards - 1, 1)
+
+    count_result = await db.execute(
+        select(func.count(GeneratedStory.id)).where(
+            GeneratedStory.is_active == True,
+            GeneratedStory.story_type == "curated",
+        )
+    )
+    total_stories = int(count_result.scalar_one() or 0)
+
+    result = await db.execute(
+        select(GeneratedStory)
+        .where(
+            GeneratedStory.is_active == True,
+            GeneratedStory.story_type == "curated",
+        )
+        .order_by(GeneratedStory.sort_order, GeneratedStory.created_at.desc())
+        .limit(safe_preview_cards)
+    )
+    stories = result.scalars().all()
+
+    if not stories:
+        return CuratedStoriesChildSectionResponse(
+            subtitle="暫時未有精選故事",
+            header_action_target="/stories",
+            hero_story=None,
+            carousel_stories=[],
+            total_stories=0,
+            visible_stories=0,
+            has_more=False,
+            remaining_stories=0,
+        )
+
+    cards = [_build_curated_story_card(story) for story in stories]
+    cards[0].is_featured = True
+    hero_story = cards[0]
+    carousel_stories = cards[1:]
+
+    visible_stories = len(cards)
+    remaining_stories = max(total_stories - visible_stories, 0)
+    subtitle = (
+        f"今晚推薦 {visible_stories} 則"
+        if visible_stories > 1
+        else "精選故事"
+    )
+    return CuratedStoriesChildSectionResponse(
+        subtitle=subtitle,
+        layout={
+            "max_mini_cards_visible": max_mini_cards_visible,
+        },
+        hero_story=hero_story,
+        carousel_stories=carousel_stories,
+        total_stories=total_stories,
+        visible_stories=visible_stories,
+        has_more=remaining_stories > 0,
+        remaining_stories=remaining_stories,
+    )
 
 
 @router.get("/admin/all", response_model=List[GeneratedStoryResponse])
