@@ -43,6 +43,7 @@ python init_db.py
 ```bash
 python seed_database.py           # Comprehensive vocabulary with 100+ words
 python seed_public_challenges.py  # Add 10 public community challenges for admin UI
+python seed_curated_bedtime_stories.py  # Add 10 curated bedtime stories with external AWS Polly audio
 ```
 
 6. **Run development server**
