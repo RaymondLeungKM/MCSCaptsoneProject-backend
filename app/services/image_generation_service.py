@@ -409,6 +409,9 @@ _WORD_DISAMBIGUATION: dict[str, str] = {
     "glue": "a bottle of white school glue with a cap",
     "marker": "a colorful felt-tip marker pen with its cap, a coloring pen",
     "tape": "a roll of clear adhesive sticky tape",
+    "rice": "a bowl of cooked white rice, steamed rice served in a round bowl",
+    "broom": "a cleaning broom with a long handle and bristles for sweeping the floor",
+    "bag": "a child's school backpack with straps",
 }
 
 
