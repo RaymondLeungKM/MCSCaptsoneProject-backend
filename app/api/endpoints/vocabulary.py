@@ -7,7 +7,7 @@ from sqlalchemy import select, func, and_, or_
 from sqlalchemy.orm import selectinload
 from typing import List, Optional, Dict
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import aiofiles
 import os
@@ -46,6 +46,8 @@ from app.models.word_personalization import RelationshipType
 router = APIRouter()
 
 ACTIVE_VOCAB_REQUEST_MIN_EXPOSURES = 6
+MAX_WORD_EXPOSURE_STARS = 6
+HKT = timezone(timedelta(hours=8), name="HKT")
 
 UNSAFE_CHILD_VOCAB_TOKENS = {
     "knife",
@@ -83,6 +85,37 @@ def _normalize_vocab_token(value: Optional[str]) -> str:
     return "".join(
         ch for ch in value.strip().lower() if ch.isalnum() or "\u4e00" <= ch <= "\u9fff"
     )
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _is_same_hkt_day(left: datetime, right: datetime) -> bool:
+    return _ensure_utc(left).astimezone(HKT).date() == _ensure_utc(right).astimezone(HKT).date()
+
+
+def _apply_daily_star_increment_limit(
+    progress: WordProgress,
+    *,
+    event_at: Optional[datetime] = None,
+) -> bool:
+    event_time = _ensure_utc(event_at) if event_at else datetime.now(timezone.utc)
+    current_exposure = min(int(progress.exposure_count or 0), MAX_WORD_EXPOSURE_STARS)
+    progress.exposure_count = current_exposure
+
+    if current_exposure >= MAX_WORD_EXPOSURE_STARS:
+        return False
+
+    last_practiced = progress.last_practiced
+    if last_practiced and _is_same_hkt_day(last_practiced, event_time):
+        return False
+
+    progress.exposure_count = min(current_exposure + 1, MAX_WORD_EXPOSURE_STARS)
+    progress.last_practiced = event_time
+    return True
 
 
 def _is_child_safe_word_fields(
@@ -1325,6 +1358,20 @@ async def update_word_progress(
             detail="Use the active vocabulary approval flow to change mastery status"
         )
 
+    requested_exposure = update_data.pop("exposure_count", None)
+
+    # Never allow stored exposure to exceed the star ceiling.
+    progress.exposure_count = min(int(progress.exposure_count or 0), MAX_WORD_EXPOSURE_STARS)
+
+    if requested_exposure is not None:
+        try:
+            requested_exposure_int = int(requested_exposure)
+        except (TypeError, ValueError):
+            requested_exposure_int = int(progress.exposure_count or 0)
+
+        if requested_exposure_int > int(progress.exposure_count or 0):
+            _apply_daily_star_increment_limit(progress)
+
     for field, value in update_data.items():
         setattr(progress, field, value)
     
@@ -1627,8 +1674,10 @@ async def record_external_word_learning(
         db.add(progress)
     
     # Increment exposure count
-    progress.exposure_count += 1
-    progress.last_practiced = timestamp_dt
+    incremented_exposure = _apply_daily_star_increment_limit(
+        progress,
+        event_at=timestamp_dt,
+    )
     
     # Track learning modality based on source
     if source == 'object_detection':
@@ -1643,7 +1692,7 @@ async def record_external_word_learning(
     
     # Update child's aggregate stats (only for first exposure)
     leveled_up = False
-    if is_new_word or progress.exposure_count == 1:
+    if incremented_exposure and progress.exposure_count == 1:
         child.words_learned = (child.words_learned or 0) + 1
         child.today_progress = (child.today_progress or 0) + 1
         child.xp = (child.xp or 0) + 10  # Award XP for learning new word
@@ -1748,7 +1797,7 @@ async def record_external_word_learning(
     word_category = result.scalar_one_or_none()
     category_name = word_category.name if word_category else None
     
-    print(f"[External Word Learning] SUCCESS: {word_obj.word} learned by child {child.id}, XP awarded: {10 if (is_new_word or progress.exposure_count == 1) else 0}, Word created: {word_created}")
+    print(f"[External Word Learning] SUCCESS: {word_obj.word} learned by child {child.id}, XP awarded: {10 if (incremented_exposure and progress.exposure_count == 1) else 0}, Word created: {word_created}")
     
     # Prepare word response data for frontend
     word_data = {
