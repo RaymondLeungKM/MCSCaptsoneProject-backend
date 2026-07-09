@@ -7,11 +7,15 @@ from app.api.endpoints.missions import (
     _current_hkt_date,
     _dedupe_missions_by_id,
     _exclude_generated_cluster_missions,
+    _filter_daily_rotation_candidates,
     _is_generated_cluster_mission,
     _rank_candidate_missions,
+    _resolve_assignment_repeat_cooldown_days,
     _serialize_assigned_mission,
+    _was_assigned_recently,
     _was_completed_recently,
 )
+from app.schemas.content import MissionResponse
 from app.models.content import (
     MissionAssignmentStatus,
     MissionAssignmentSource,
@@ -20,7 +24,13 @@ from app.models.content import (
 )
 
 
-def make_mission(mission_id: str, *, sort_order: int, created_at: datetime):
+def make_mission(
+    mission_id: str,
+    *,
+    sort_order: int,
+    created_at: datetime,
+    assignment_repeat_cooldown_days: int | None = None,
+):
     return SimpleNamespace(
         id=mission_id,
         slug=mission_id,
@@ -35,6 +45,7 @@ def make_mission(mission_id: str, *, sort_order: int, created_at: datetime):
         difficulty=None,
         surface="both",
         sort_order=sort_order,
+        assignment_repeat_cooldown_days=assignment_repeat_cooldown_days,
         selection_tags=[],
         catalog_metadata=None,
         published_at=None,
@@ -158,6 +169,144 @@ class MissionAssignmentRotationTests(unittest.TestCase):
                 assignment_date=date(2026, 6, 5),
             )
         )
+
+    def test_recent_assignment_requires_a_gap_before_daily_repeat(self):
+        self.assertTrue(
+            _was_assigned_recently(
+                date(2026, 5, 28),
+                assignment_date=date(2026, 5, 29),
+                repeat_cooldown_days=2,
+            )
+        )
+        self.assertFalse(
+            _was_assigned_recently(
+                date(2026, 5, 27),
+                assignment_date=date(2026, 5, 29),
+                repeat_cooldown_days=2,
+            )
+        )
+
+    def test_filter_daily_rotation_candidates_skips_recently_assigned_catalog_missions(self):
+        assignment_date = date(2026, 5, 29)
+        recent = make_mission(
+            "recent",
+            sort_order=0,
+            created_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            assignment_repeat_cooldown_days=2,
+        )
+        returning = make_mission(
+            "returning",
+            sort_order=1,
+            created_at=datetime(2026, 5, 2, tzinfo=timezone.utc),
+            assignment_repeat_cooldown_days=2,
+        )
+        fresh = make_mission(
+            "fresh",
+            sort_order=2,
+            created_at=datetime(2026, 5, 3, tzinfo=timezone.utc),
+        )
+
+        filtered = _filter_daily_rotation_candidates(
+            [recent, returning, fresh],
+            assignment_history={
+                "recent": (assignment_date - timedelta(days=1), None),
+                "returning": (assignment_date - timedelta(days=2), None),
+            },
+            assignment_date=assignment_date,
+        )
+
+        self.assertEqual(
+            [mission.id for mission in filtered],
+            ["returning", "fresh"],
+        )
+
+    def test_default_assignment_repeat_cooldown_supports_weekly_rotation(self):
+        mission = make_mission(
+            "default-cooldown",
+            sort_order=0,
+            created_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(_resolve_assignment_repeat_cooldown_days(mission), 7)
+        self.assertTrue(
+            _was_assigned_recently(
+                date(2026, 5, 23),
+                assignment_date=date(2026, 5, 29),
+            )
+        )
+        self.assertFalse(
+            _was_assigned_recently(
+                date(2026, 5, 22),
+                assignment_date=date(2026, 5, 29),
+            )
+        )
+
+    def test_filter_daily_rotation_candidates_uses_admin_configured_cooldown(self):
+        assignment_date = date(2026, 5, 29)
+        strict = make_mission(
+            "strict",
+            sort_order=0,
+            created_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            assignment_repeat_cooldown_days=5,
+        )
+        relaxed = make_mission(
+            "relaxed",
+            sort_order=1,
+            created_at=datetime(2026, 5, 2, tzinfo=timezone.utc),
+            assignment_repeat_cooldown_days=3,
+        )
+
+        filtered = _filter_daily_rotation_candidates(
+            [strict, relaxed],
+            assignment_history={
+                "strict": (assignment_date - timedelta(days=3), None),
+                "relaxed": (assignment_date - timedelta(days=3), None),
+            },
+            assignment_date=assignment_date,
+        )
+
+        self.assertEqual([mission.id for mission in filtered], ["relaxed"])
+
+    def test_resolve_assignment_repeat_cooldown_uses_catalog_metadata_fallback(self):
+        mission = SimpleNamespace(
+            assignment_repeat_cooldown_days=None,
+            catalog_metadata={"assignment_repeat_cooldown_days": 4},
+        )
+
+        self.assertEqual(_resolve_assignment_repeat_cooldown_days(mission), 4)
+
+    def test_mission_response_normalizes_nullable_list_fields(self):
+        mission = SimpleNamespace(
+            id="mission-1",
+            slug="mission-1",
+            title="Mission 1",
+            description="desc",
+            context=MissionContext.GENERAL,
+            is_offline=False,
+            status="published",
+            locale="zh-HK",
+            age_min=None,
+            age_max=None,
+            difficulty=None,
+            surface="both",
+            sort_order=0,
+            assignment_repeat_cooldown_days=None,
+            selection_tags=None,
+            catalog_metadata=None,
+            published_at=None,
+            archived_at=None,
+            target_words=None,
+            conversation_prompts=None,
+            is_active=True,
+            created_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            updated_at=None,
+        )
+
+        response = MissionResponse.model_validate(mission)
+
+        self.assertEqual(response.selection_tags, [])
+        self.assertEqual(response.target_words, [])
+        self.assertEqual(response.conversation_prompts, [])
 
     def test_build_mission_summary_payload_tracks_streak_points_and_history(self):
         local_today = date(2026, 5, 30)

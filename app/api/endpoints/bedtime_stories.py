@@ -161,6 +161,18 @@ async def _persist_external_story_result(
     generation_started: float,
     result,
 ) -> GeneratedStory:
+    if result.generated_story_id:
+        existing_story_query = select(GeneratedStory).where(
+            and_(
+                GeneratedStory.id == result.generated_story_id,
+                GeneratedStory.child_id == request.child_id,
+            )
+        )
+        existing_story_result = await db.execute(existing_story_query)
+        existing_story = existing_story_result.scalar_one_or_none()
+        if existing_story is not None:
+            return existing_story
+
     persisted_at = datetime.utcnow()
     title, title_english = _build_external_title(child_name, request.theme)
     story = GeneratedStory(

@@ -169,6 +169,23 @@ class Mission(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
+    @property
+    def assignment_repeat_cooldown_days(self) -> int | None:
+        metadata = self.catalog_metadata or {}
+        value = metadata.get("assignment_repeat_cooldown_days")
+        if value is None:
+            return None
+        return int(value)
+
+    @assignment_repeat_cooldown_days.setter
+    def assignment_repeat_cooldown_days(self, value: int | None) -> None:
+        metadata = dict(self.catalog_metadata or {})
+        if value is None:
+            metadata.pop("assignment_repeat_cooldown_days", None)
+        else:
+            metadata["assignment_repeat_cooldown_days"] = int(value)
+        self.catalog_metadata = metadata or None
+
 
 class MissionAssignment(Base):
     """Mission assigned to a child on a given date"""

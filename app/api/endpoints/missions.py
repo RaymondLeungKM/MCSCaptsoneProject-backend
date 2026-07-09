@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 import uuid
 
 from app.db.session import get_db
+from app.core.config import settings
 from app.schemas.content import (
     AssignedMissionResponse,
     MissionCreate,
@@ -46,6 +47,9 @@ router = APIRouter()
 MAX_DAILY_ASSIGNMENTS = 3
 MAX_OFFLINE_ASSIGNMENTS = 6
 MISSION_COMPLETION_COOLDOWN_DAYS = 7
+DEFAULT_MISSION_ASSIGNMENT_REPEAT_COOLDOWN_DAYS = (
+    settings.DEFAULT_MISSION_ASSIGNMENT_REPEAT_COOLDOWN_DAYS
+)
 MISSION_DAILY_POINTS = 10
 MISSION_OFFLINE_POINTS = 15
 MISSION_WEEKLY_GOAL = 5
@@ -190,6 +194,7 @@ async def create_admin_mission(
         target_words=mission_data.target_words,
         conversation_prompts=mission_data.conversation_prompts,
     )
+    mission.assignment_repeat_cooldown_days = mission_data.assignment_repeat_cooldown_days
     _apply_mission_lifecycle_defaults(mission)
 
     db.add(mission)
@@ -519,6 +524,50 @@ def _was_completed_recently(
     ).days < MISSION_COMPLETION_COOLDOWN_DAYS
 
 
+def _was_assigned_recently(
+    last_assignment_date: date | None,
+    *,
+    assignment_date: date,
+    repeat_cooldown_days: int = DEFAULT_MISSION_ASSIGNMENT_REPEAT_COOLDOWN_DAYS,
+) -> bool:
+    if last_assignment_date is None:
+        return False
+
+    return (
+        assignment_date - last_assignment_date
+    ).days < repeat_cooldown_days
+
+
+def _resolve_assignment_repeat_cooldown_days(mission: Mission | None) -> int:
+    if mission:
+        mission_cooldown = getattr(mission, "assignment_repeat_cooldown_days", None)
+        if mission_cooldown is not None:
+            return int(mission_cooldown)
+
+        mission_metadata = getattr(mission, "catalog_metadata", None) or {}
+        metadata_cooldown = mission_metadata.get("assignment_repeat_cooldown_days")
+        if metadata_cooldown is not None:
+            return int(metadata_cooldown)
+    return DEFAULT_MISSION_ASSIGNMENT_REPEAT_COOLDOWN_DAYS
+
+
+def _filter_daily_rotation_candidates(
+    missions: list[Mission],
+    *,
+    assignment_history: dict[str, tuple[date | None, datetime | None]],
+    assignment_date: date,
+) -> list[Mission]:
+    return [
+        mission
+        for mission in missions
+        if not _was_assigned_recently(
+            assignment_history.get(mission.id, (None, None))[0],
+            assignment_date=assignment_date,
+            repeat_cooldown_days=_resolve_assignment_repeat_cooldown_days(mission),
+        )
+    ]
+
+
 async def _get_assignment_history(
     *,
     child_id: str,
@@ -620,9 +669,18 @@ async def _generate_assignments_for_date(
         assignment_history=assignment_history,
         assignment_date=assignment_date,
     )
+    eligible_missions = (
+        _filter_daily_rotation_candidates(
+            ranked_missions,
+            assignment_history=assignment_history,
+            assignment_date=assignment_date,
+        )
+        if not is_offline
+        else ranked_missions
+    )
     assignment_limit = MAX_OFFLINE_ASSIGNMENTS if is_offline else MAX_DAILY_ASSIGNMENTS
     selected_missions = _select_missions_for_assignment(
-        ranked_missions,
+        eligible_missions,
         limit=assignment_limit,
     )
 
@@ -696,7 +754,7 @@ async def _generate_assignments_for_date(
                 db.add(cluster_mission)
 
             remainder = _select_missions_for_assignment(
-                ranked_missions,
+                eligible_missions,
                 limit=max(assignment_limit - 1, 0),
             )
             selected_missions = _dedupe_missions_by_id(
@@ -747,6 +805,18 @@ async def _generate_assignments_for_date(
                 "last_completed_at": (
                     last_completed_at.isoformat()
                     if last_completed_at
+                    else None
+                ),
+                "last_assignment_date_was_recent": _was_assigned_recently(
+                    last_assignment_date,
+                    assignment_date=assignment_date,
+                    repeat_cooldown_days=_resolve_assignment_repeat_cooldown_days(
+                        mission
+                    ),
+                ),
+                "assignment_repeat_cooldown_days": (
+                    _resolve_assignment_repeat_cooldown_days(mission)
+                    if not is_offline
                     else None
                 ),
                 "completion_cooldown_days": MISSION_COMPLETION_COOLDOWN_DAYS,

@@ -32,6 +32,7 @@ class ExternalStoryInvocationResult:
     page_audio_segments: list[dict]
     external_audio_path: str
     external_story_id: Optional[str]
+    generated_story_id: Optional[str]
     llm_model: Optional[str]
     tts_provider: Optional[str]
     voice_name: Optional[str]
@@ -46,6 +47,9 @@ class ExternalStoryProgramService:
     AUDIO_PATH_PATTERN = re.compile(r"Success!\s*Audio saved to:\s*(.+)")
     PAGE_AUDIO_SEGMENTS_PATTERN = re.compile(r"Page audio segments JSON:\s*(\[[^\n]+\])")
     STORY_ID_PATTERN = re.compile(r"Story record saved to database \(ID:\s*([^)]+)\)")
+    GENERATED_STORY_ID_PATTERN = re.compile(r"Generated app story saved to database \(ID:\s*([^)]+)\)")
+    GENERATED_STORY_AUDIO_URL_PATTERN = re.compile(r"Generated app story audio URL:\s*(.+)")
+    GENERATED_STORY_AUDIO_FILENAME_PATTERN = re.compile(r"Generated app story audio filename:\s*(.+)")
     MODEL_PATTERN = re.compile(r"Using model:\s*(.+)")
     TTS_PROVIDER_PATTERN = re.compile(r"Using (Google Cloud TTS|AWS Polly|Azure TTS)\.\.\.")
     VOICE_NAME_PATTERN = re.compile(r"Voice used:\s*(.+)")
@@ -251,6 +255,15 @@ class ExternalStoryProgramService:
         # but the external program printed a DB record id, fetch the story
         # from the database instead.
         external_story_id = self._extract_optional(self.STORY_ID_PATTERN, stdout)
+        generated_story_id = self._extract_optional(self.GENERATED_STORY_ID_PATTERN, stdout)
+        generated_story_audio_url = self._extract_optional(
+            self.GENERATED_STORY_AUDIO_URL_PATTERN,
+            stdout,
+        )
+        generated_story_audio_filename = self._extract_optional(
+            self.GENERATED_STORY_AUDIO_FILENAME_PATTERN,
+            stdout,
+        )
         vocab_from_db = None
         llm_model_from_db = None
         try:
@@ -330,7 +343,13 @@ class ExternalStoryProgramService:
         if not external_audio_path:
             raise ExternalStoryProgramError("External audio file path not found in stdout or database record.")
 
-        copied_filename, _ = self._copy_external_audio(external_audio_path, "external_story")
+        if generated_story_audio_filename:
+            audio_filename = generated_story_audio_filename
+            audio_url = generated_story_audio_url or f"/uploads/audio/{generated_story_audio_filename}"
+        else:
+            copied_filename, _ = self._copy_external_audio(external_audio_path, "external_story")
+            audio_filename = copied_filename
+            audio_url = f"/uploads/audio/{copied_filename}"
 
         # Extract vocab_used from the stdout or DB result if available
         try:
@@ -342,11 +361,12 @@ class ExternalStoryProgramService:
             story_text=story_text,
             story_text_ssml=story_text_ssml,
             vocab_used=vocab_used,
-            audio_url=f"/uploads/audio/{copied_filename}",
-            audio_filename=copied_filename,
+            audio_url=audio_url,
+            audio_filename=audio_filename,
             page_audio_segments=page_audio_segments,
             external_audio_path=str(external_audio_path),
             external_story_id=external_story_id,
+            generated_story_id=generated_story_id,
             llm_model=llm_model,
             tts_provider=tts_provider,
             voice_name=voice_name,
@@ -391,6 +411,7 @@ class ExternalStoryProgramService:
             page_audio_segments=page_audio_segments,
             external_audio_path=str(external_audio_path),
             external_story_id=None,
+            generated_story_id=None,
             llm_model=llm_model,
             tts_provider=tts_provider,
             voice_name=voice_name,

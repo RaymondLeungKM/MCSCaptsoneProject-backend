@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     
     # API
     API_V1_PREFIX: str = "/api/v1"
+    DEFAULT_MISSION_ASSIGNMENT_REPEAT_COOLDOWN_DAYS: int = 7
     
     # CORS
     CORS_ORIGINS: List[str] = [

@@ -1,7 +1,7 @@
 """
 Pydantic schemas for Content (Stories, Games, Missions)
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Dict, Any
 from datetime import date, datetime
 from enum import Enum
@@ -191,6 +191,11 @@ class MissionBase(BaseModel):
     difficulty: Optional[str] = None
     surface: MissionSurface = MissionSurface.PARENT
     sort_order: int = 0
+    assignment_repeat_cooldown_days: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=30,
+    )
     selection_tags: List[str] = Field(default_factory=list)
     catalog_metadata: Optional[Dict[str, Any]] = None
     published_at: Optional[datetime] = None
@@ -215,6 +220,11 @@ class MissionUpdate(BaseModel):
     difficulty: Optional[str] = None
     surface: Optional[MissionSurface] = None
     sort_order: Optional[int] = None
+    assignment_repeat_cooldown_days: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=30,
+    )
     selection_tags: Optional[List[str]] = None
     catalog_metadata: Optional[Dict[str, Any]] = None
     published_at: Optional[datetime] = None
@@ -231,6 +241,11 @@ class MissionResponse(MissionBase):
     is_active: bool
     created_at: datetime
     updated_at: Optional[datetime] = None
+
+    @field_validator("selection_tags", "target_words", "conversation_prompts", mode="before")
+    @classmethod
+    def _normalize_nullable_list_fields(cls, value):
+        return [] if value is None else value
     
     class Config:
         from_attributes = True
