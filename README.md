@@ -42,6 +42,7 @@ python init_db.py
 
 ```bash
 python seed_database.py           # Comprehensive vocabulary with 100+ words
+python seed_public_challenges.py  # Add 10 public community challenges for admin UI
 ```
 
 6. **Run development server**
