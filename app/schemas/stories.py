@@ -51,6 +51,15 @@ class DailyWordSummary(BaseModel):
     story_priority: int
 
 
+class StoryPageAudioSegment(BaseModel):
+    page_index: int
+    start_ratio: float
+    end_ratio: float
+    start_time_seconds: float
+    end_time_seconds: float
+    text_length: int
+
+
 class GeneratedStoryCreate(BaseModel):
     child_id: Optional[str] = None
     title: str
@@ -72,6 +81,7 @@ class GeneratedStoryCreate(BaseModel):
     audio_url: Optional[str] = None
     audio_duration_seconds: Optional[int] = None
     audio_filename: Optional[str] = None
+    page_audio_segments: Optional[List[StoryPageAudioSegment]] = None
     audio_generate_provider: Optional[str] = None
     audio_generate_voice_name: Optional[str] = None
     reading_time_minutes: int = 5
@@ -83,15 +93,6 @@ class GeneratedStoryCreate(BaseModel):
     generation_time_seconds: Optional[float] = None
     is_active: bool = True
     sort_order: int = 0
-
-
-class StoryPageAudioSegment(BaseModel):
-    page_index: int
-    start_ratio: float
-    end_ratio: float
-    start_time_seconds: float
-    end_time_seconds: float
-    text_length: int
 
 
 class GeneratedStoryResponse(BaseModel):

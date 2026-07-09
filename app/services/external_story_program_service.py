@@ -3,6 +3,7 @@ Adapter service for invoking the external story-generation-program.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -28,6 +29,7 @@ class ExternalStoryInvocationResult:
     vocab_used: str
     audio_url: str
     audio_filename: str
+    page_audio_segments: list[dict]
     external_audio_path: str
     external_story_id: Optional[str]
     llm_model: Optional[str]
@@ -42,6 +44,7 @@ class ExternalStoryProgramService:
     STORY_BLOCK_PATTERN = re.compile(r"Generated Story:\s*(.*?)\n={10,}", re.DOTALL)
     SSML_BLOCK_PATTERN = re.compile(r"Generated SSML:\s*(.*?)\n={10,}", re.DOTALL)
     AUDIO_PATH_PATTERN = re.compile(r"Success!\s*Audio saved to:\s*(.+)")
+    PAGE_AUDIO_SEGMENTS_PATTERN = re.compile(r"Page audio segments JSON:\s*(\[[^\n]+\])")
     STORY_ID_PATTERN = re.compile(r"Story record saved to database \(ID:\s*([^)]+)\)")
     MODEL_PATTERN = re.compile(r"Using model:\s*(.+)")
     TTS_PROVIDER_PATTERN = re.compile(r"Using (Google Cloud TTS|AWS Polly|Azure TTS)\.\.\.")
@@ -156,6 +159,19 @@ class ExternalStoryProgramService:
             return None
         value = match.group(1).strip()
         return value or None
+
+    @classmethod
+    def _extract_page_audio_segments(cls, stdout: str) -> list[dict]:
+        match = cls.PAGE_AUDIO_SEGMENTS_PATTERN.search(stdout)
+        if not match:
+            return []
+
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return []
+
+        return payload if isinstance(payload, list) else []
 
     @staticmethod
     def _provider_alias(provider_label: Optional[str]) -> Optional[str]:
@@ -309,6 +325,7 @@ class ExternalStoryProgramService:
         tts_provider_label = self._extract_optional(self.TTS_PROVIDER_PATTERN, stdout)
         tts_provider = self._provider_alias(tts_provider_label)
         voice_name = self._extract_optional(self.VOICE_NAME_PATTERN, stdout)
+        page_audio_segments = self._extract_page_audio_segments(stdout)
 
         if not external_audio_path:
             raise ExternalStoryProgramError("External audio file path not found in stdout or database record.")
@@ -327,6 +344,7 @@ class ExternalStoryProgramService:
             vocab_used=vocab_used,
             audio_url=f"/uploads/audio/{copied_filename}",
             audio_filename=copied_filename,
+            page_audio_segments=page_audio_segments,
             external_audio_path=str(external_audio_path),
             external_story_id=external_story_id,
             llm_model=llm_model,
@@ -361,6 +379,7 @@ class ExternalStoryProgramService:
         tts_provider_label = self._extract_optional(self.TTS_PROVIDER_PATTERN, stdout)
         tts_provider = self._provider_alias(tts_provider_label)
         voice_name = self._extract_optional(self.VOICE_NAME_PATTERN, stdout)
+        page_audio_segments = self._extract_page_audio_segments(stdout)
         copied_filename, _ = self._copy_external_audio(external_audio_path, "curated_story")
 
         return ExternalStoryInvocationResult(
@@ -369,6 +388,7 @@ class ExternalStoryProgramService:
             vocab_used="",
             audio_url=f"/uploads/audio/{copied_filename}",
             audio_filename=copied_filename,
+            page_audio_segments=page_audio_segments,
             external_audio_path=str(external_audio_path),
             external_story_id=None,
             llm_model=llm_model,

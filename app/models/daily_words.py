@@ -72,6 +72,7 @@ class GeneratedStory(Base):
     audio_url = Column(String)  # TTS narration
     audio_duration_seconds = Column(Integer)
     audio_filename = Column(String, nullable=False)
+    page_audio_segments = Column(JSONB)
     audio_generate_provider = Column(String)
     audio_generate_voice_name = Column(String)
     
