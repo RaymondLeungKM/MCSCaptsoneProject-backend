@@ -94,7 +94,6 @@ class Child(Base):
     interests = relationship("ChildInterest", back_populates="child", cascade="all, delete-orphan")
     learning_sessions = relationship("LearningSession", back_populates="child", cascade="all, delete-orphan")
     word_progress = relationship("WordProgress", back_populates="child", cascade="all, delete-orphan")
-    daily_stats = relationship("DailyLearningStats", back_populates="child", cascade="all, delete-orphan")
     insights = relationship("LearningInsight", back_populates="child", cascade="all, delete-orphan")
     weekly_reports = relationship("WeeklyReport", back_populates="child", cascade="all, delete-orphan")
     parental_control = relationship("ParentalControl", back_populates="child", cascade="all, delete-orphan", uselist=False)

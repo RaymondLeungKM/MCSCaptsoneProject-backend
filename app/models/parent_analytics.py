@@ -8,56 +8,6 @@ from sqlalchemy.orm import relationship
 from app.db.base import Base
 
 
-class DailyLearningStats(Base):
-    """
-    Daily learning statistics aggregation
-    Tracks daily learning activity for progress charts
-    """
-    __tablename__ = "daily_learning_stats"
-
-    id = Column(String, primary_key=True, index=True)
-    child_id = Column(String, ForeignKey("children.id", ondelete="CASCADE"), nullable=False, index=True)
-    date = Column(Date, nullable=False, index=True)
-    
-    # Learning metrics
-    words_learned = Column(Integer, default=0)
-    words_reviewed = Column(Integer, default=0)
-    new_words_mastered = Column(Integer, default=0)
-    
-    # Time tracking (minutes)
-    total_learning_time = Column(Integer, default=0)
-    active_learning_time = Column(Integer, default=0)
-    
-    # Session counts
-    session_count = Column(Integer, default=0)
-    
-    # Category breakdown (JSONB)
-    categories_studied = Column(JSON, default=dict)  # {category_id: word_count}
-    
-    # Game engagement
-    games_played = Column(Integer, default=0)
-    games_completed = Column(Integer, default=0)
-    
-    # Story engagement
-    stories_read = Column(Integer, default=0)
-    bedtime_stories_generated = Column(Integer, default=0)
-    
-    # XP earned
-    xp_earned = Column(Integer, default=0)
-    
-    # Accuracy metrics
-    average_accuracy = Column(Float, default=0.0)  # 0-100%
-    
-    created_at = Column(String, default=lambda: datetime.utcnow().isoformat())
-    updated_at = Column(String, default=lambda: datetime.utcnow().isoformat(), onupdate=lambda: datetime.utcnow().isoformat())
-
-    # Relationship
-    child = relationship("Child", back_populates="daily_stats")
-
-    def __repr__(self):
-        return f"<DailyLearningStats(child_id={self.child_id}, date={self.date}, words={self.words_learned})>"
-
-
 class LearningInsight(Base):
     """
     AI-generated learning insights and recommendations

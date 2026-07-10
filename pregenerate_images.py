@@ -36,8 +36,8 @@ from app.models.user import User, Child
 from app.models.vocabulary import Word, Category, WordProgress
 from sqlalchemy.orm import selectinload
 from app.models.content import Story, Game, Mission
-from app.models.analytics import LearningSession, DailyStats, Achievement
-from app.models.parent_analytics import DailyLearningStats, LearningInsight, WeeklyReport, ParentalControl
+from app.models.analytics import LearningSession, Achievement
+from app.models.parent_analytics import LearningInsight, WeeklyReport, ParentalControl
 from app.models.generated_sentences import GeneratedSentence
 from app.models.daily_words import DailyWordTracking
 from app.services.image_generation_service import (

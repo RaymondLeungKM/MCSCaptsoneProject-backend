@@ -19,13 +19,12 @@ from sqlalchemy import and_, func, select
 
 from app.db.session import AsyncSessionLocal
 # Import related models so SQLAlchemy can resolve string-based relationships.
-from app.models.analytics import Achievement, DailyStats, LearningSession  # noqa: F401
+from app.models.analytics import Achievement, LearningSession  # noqa: F401
 from app.models.community import CommunityPost, PostReaction  # noqa: F401
 from app.models.content import Game, Mission, Story  # noqa: F401
 from app.models.daily_words import DailyWordTracking, GeneratedStory
 from app.models.generated_sentences import GeneratedSentence  # noqa: F401
 from app.models.parent_analytics import (  # noqa: F401
-    DailyLearningStats,
     LearningInsight,
     ParentalControl,
     WeeklyReport,

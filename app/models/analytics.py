@@ -65,33 +65,6 @@ class LearningSession(Base):
     child = relationship("Child", back_populates="learning_sessions")
 
 
-class DailyStats(Base):
-    """Daily aggregated statistics per child"""
-    __tablename__ = "daily_stats"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    child_id = Column(String, ForeignKey("children.id"), nullable=False)
-    date = Column(DateTime(timezone=True), nullable=False, index=True)
-    
-    # Daily metrics
-    total_minutes = Column(Integer, default=0)
-    words_encountered = Column(Integer, default=0)
-    words_mastered = Column(Integer, default=0)
-    activities_completed = Column(Integer, default=0)
-    xp_earned = Column(Integer, default=0)
-    
-    # Engagement
-    session_count = Column(Integer, default=0)
-    average_engagement = Column(Float, default=0.0)
-    
-    # Progress towards daily goal
-    daily_goal_progress = Column(Integer, default=0)
-    goal_achieved = Column(Boolean, default=False)
-    
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-
-
 class Achievement(Base):
     """Achievement/badge definitions"""
     __tablename__ = "achievements"

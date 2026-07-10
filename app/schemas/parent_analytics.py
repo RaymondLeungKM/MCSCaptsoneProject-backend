@@ -7,30 +7,6 @@ from typing import List, Dict, Optional
 from datetime import date, datetime
 
 
-# Daily Learning Stats Schemas
-class DailyLearningStatsResponse(BaseModel):
-    """Daily learning statistics"""
-    id: str
-    child_id: str
-    date: date
-    words_learned: int = 0
-    words_reviewed: int = 0
-    new_words_mastered: int = 0
-    total_learning_time: int = 0  # minutes
-    active_learning_time: int = 0  # minutes
-    session_count: int = 0
-    categories_studied: Dict[str, int] = {}
-    games_played: int = 0
-    games_completed: int = 0
-    stories_read: int = 0
-    bedtime_stories_generated: int = 0
-    xp_earned: int = 0
-    average_accuracy: float = 0.0
-
-    class Config:
-        from_attributes = True
-
-
 # Learning Insight Schemas
 class LearningInsightResponse(BaseModel):
     """AI-generated learning insight"""

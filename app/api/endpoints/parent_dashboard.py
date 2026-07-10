@@ -12,7 +12,6 @@ import uuid
 from app.db.session import get_db
 from app.models.user import User, Child
 from app.models.parent_analytics import (
-    DailyLearningStats,
     LearningInsight,
     WeeklyReport,
     ParentalControl
@@ -22,7 +21,6 @@ from app.models.vocabulary import WordProgress, Word, Category
 from app.models.analytics import LearningSession
 from app.models.daily_words import DailyWordTracking
 from app.schemas.parent_analytics import (
-    DailyLearningStatsResponse,
     LearningInsightResponse,
     LearningInsightCreateRequest,
     LearningInsightUpdateRequest,
