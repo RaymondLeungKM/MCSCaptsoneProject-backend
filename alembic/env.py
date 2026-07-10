@@ -31,7 +31,12 @@ from app.models.community import (
     FriendChallenge,
     FriendChallengeParticipant,
 )
-from app.models.word_personalization import WordRelationship, SpacedRepetitionCard, WordEmbedding
+from app.models.word_personalization import (
+    ReviewQueueDecision,
+    SpacedRepetitionCard,
+    WordEmbedding,
+    WordRelationship,
+)
 
 # this is the Alembic Config object
 config = context.config

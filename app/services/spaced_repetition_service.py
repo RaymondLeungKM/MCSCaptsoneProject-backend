@@ -33,12 +33,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from math import exp
 from typing import List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.word_personalization import SpacedRepetitionCard, WordRelationship
+from app.models.word_personalization import (
+    ReviewQueueDecision,
+    SpacedRepetitionCard,
+    WordRelationship,
+)
+from app.core.config import settings
 from app.models.vocabulary import Word, WordProgress
 from app.schemas.word_personalization import (
     ReviewQueueFeatures,
@@ -76,6 +82,36 @@ class AnkiSRSettings:
 
 
 DEFAULT_ANKI_SETTINGS = AnkiSRSettings()
+
+
+@dataclass(frozen=True)
+class ReviewQueuePolicy:
+    """Explainable, versioned weights for the graph-informed queue reranker."""
+
+    version: str = "graph_reranker_v2"
+    candidate_pool_multiplier: int = 3
+    urgency_weight: float = 0.55
+    learner_need_weight: float = 0.25
+    graph_weight: float = 0.15
+    quick_win_weight: float = 0.05
+    diversity_lambda: float = 0.18
+    critical_urgency_threshold: float = 0.85
+    max_candidate_pool: int = 100
+    max_graph_candidates: int = 0
+
+
+DEFAULT_REVIEW_QUEUE_POLICY = ReviewQueuePolicy(
+    version=settings.REVIEW_QUEUE_POLICY_VERSION,
+    candidate_pool_multiplier=max(1, settings.REVIEW_QUEUE_CANDIDATE_POOL_MULTIPLIER),
+    urgency_weight=settings.REVIEW_QUEUE_URGENCY_WEIGHT,
+    learner_need_weight=settings.REVIEW_QUEUE_LEARNER_NEED_WEIGHT,
+    graph_weight=settings.REVIEW_QUEUE_GRAPH_WEIGHT,
+    quick_win_weight=settings.REVIEW_QUEUE_QUICK_WIN_WEIGHT,
+    diversity_lambda=max(0.0, settings.REVIEW_QUEUE_DIVERSITY_LAMBDA),
+    critical_urgency_threshold=min(1.0, max(0.0, settings.REVIEW_QUEUE_CRITICAL_URGENCY_THRESHOLD)),
+    max_candidate_pool=max(1, settings.REVIEW_QUEUE_MAX_CANDIDATE_POOL),
+    max_graph_candidates=max(0, settings.REVIEW_QUEUE_MAX_GRAPH_CANDIDATES),
+)
 
 
 def anki_sm2_next(
@@ -222,27 +258,41 @@ class _QueueCandidate:
     quick_win_score: float
     base_score: float
     category: str
+    urgency_score: float = 0.0
+    learner_need_score: float = 0.0
+    graph_connectivity_score: float = 0.0
+    candidate_pool_rank: int = 0
     diversity_penalty: float = 0.0
     final_score: float = 0.0
 
 
 def _compute_due_score(card: SpacedRepetitionCard, now: datetime) -> float:
+    """Legacy alias retained for API clients; v2 urgency is normalized to [0, 1]."""
+    return _compute_urgency_score(card, now)
+
+
+def _compute_urgency_score(card: SpacedRepetitionCard, now: datetime) -> float:
     if card.is_new:
         return 0.05
 
     overdue_seconds = max((now - card.next_review).total_seconds(), 0.0)
     overdue_days = overdue_seconds / 86400
-    overdue_component = min(1.2, overdue_days / 3.0)
-    repetition_component = min(0.3, card.repetitions * 0.04)
-
-    return round(min(1.5, overdue_component + repetition_component), 4)
+    return round(1.0 - exp(-overdue_days / 3.0), 4)
 
 
 def _compute_weak_link_ratio(progress: WordProgress | None) -> float:
+    """Legacy alias retained for API clients; v2 names this learner need."""
+    return _compute_learner_need_score(progress)
+
+
+def _compute_learner_need_score(progress: WordProgress | None) -> float:
     if not progress or progress.total_attempts <= 0:
         return 0.0
 
-    low_success = max(0.0, (0.8 - progress.success_rate) / 0.8)
+    # Beta(1, 1) smoothing prevents one early failure from dominating the queue.
+    successful_attempts = progress.success_rate * progress.total_attempts
+    smoothed_success = (successful_attempts + 1.0) / (progress.total_attempts + 2.0)
+    low_success = max(0.0, (0.8 - smoothed_success) / 0.8)
     exposure_pressure = min(1.0, progress.exposure_count / 10.0)
     not_mastered_bonus = 0.2 if not progress.mastered else 0.0
 
@@ -282,41 +332,35 @@ def _resolve_primary_reason(
     return "balance"
 
 
-def _composition_caps(max_cards: int) -> dict[str, int]:
-    return {
-        "due": max(1, int(max_cards * 0.6)),
-        "bridge": max(1, int(max_cards * 0.2)),
-        "quick_win": max(1, int(max_cards * 0.2)),
-        "weak_link": max(1, int(max_cards * 0.25)),
+def _resolve_primary_reason_v2(candidate: _QueueCandidate, policy: ReviewQueuePolicy) -> str:
+    contributions = {
+        "due": candidate.urgency_score * policy.urgency_weight,
+        "weak_link": candidate.learner_need_score * policy.learner_need_weight,
+        "bridge": candidate.graph_connectivity_score * policy.graph_weight,
+        "quick_win": candidate.quick_win_score * policy.quick_win_weight,
     }
+    return max(contributions, key=contributions.get) if max(contributions.values()) > 0 else "balance"
 
 
 def _select_ranked_candidates(
     candidates: list[_QueueCandidate],
     max_cards: int,
+    policy: ReviewQueuePolicy = DEFAULT_REVIEW_QUEUE_POLICY,
 ) -> list[_QueueCandidate]:
+    """Greedy MMR reranker with explicit protection for highly overdue cards."""
     selected: list[_QueueCandidate] = []
     remaining = list(candidates)
-    reason_counts: dict[str, int] = {}
-    caps = _composition_caps(max_cards)
 
     while remaining and len(selected) < max_cards:
         best_index = 0
         best_score = float("-inf")
 
         for index, candidate in enumerate(remaining):
-            penalty = 0.0
-            reason_cap = caps.get(candidate.reason)
-
-            if reason_cap is not None and reason_counts.get(candidate.reason, 0) >= reason_cap:
-                penalty += 0.28
-
-            if selected:
-                if selected[-1].category == candidate.category:
-                    penalty += 0.12
-                if len(selected) >= 2 and selected[-2].category == candidate.category:
-                    penalty += 0.23
-
+            redundancy = max(
+                (_candidate_similarity(candidate, selected_candidate) for selected_candidate in selected),
+                default=0.0,
+            )
+            penalty = 0.0 if candidate.urgency_score >= policy.critical_urgency_threshold else policy.diversity_lambda * redundancy
             adjusted_score = candidate.base_score - penalty
             tie_breaker = (candidate.base_score, -candidate.card.next_review.timestamp(), candidate.card.word_id)
             if (adjusted_score, tie_breaker) > (
@@ -335,9 +379,15 @@ def _select_ranked_candidates(
         picked.diversity_penalty = round(max(0.0, picked.base_score - best_score), 4)
         picked.final_score = round(best_score, 4)
         selected.append(picked)
-        reason_counts[picked.reason] = reason_counts.get(picked.reason, 0) + 1
 
     return selected
+
+
+def _candidate_similarity(left: _QueueCandidate, right: _QueueCandidate) -> float:
+    """A simple, explainable redundancy proxy for MMR reranking."""
+    if left.category == right.category and left.category != "unknown":
+        return 1.0
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +399,7 @@ async def get_review_queue(
     child_id: str,
     max_cards: int = 20,
     max_new: int = 5,
+    policy: ReviewQueuePolicy = DEFAULT_REVIEW_QUEUE_POLICY,
 ) -> ReviewQueueResponse:
     """
     Return cards that are due for review (``next_review <= now``).
@@ -357,13 +408,29 @@ async def get_review_queue(
     """
     now = datetime.now(timezone.utc)
 
-    # Due cards
+    max_cards = max(1, max_cards)
+    max_new = max(0, max_new)
+    due_pool_limit = min(
+        max_cards * policy.candidate_pool_multiplier,
+        policy.max_candidate_pool,
+    )
+
+    total_due_result = await db.execute(
+        select(func.count()).select_from(SpacedRepetitionCard).where(
+            SpacedRepetitionCard.child_id == child_id,
+            SpacedRepetitionCard.next_review <= now,
+            SpacedRepetitionCard.is_new == False,
+        )
+    )
+    total_due = total_due_result.scalar_one()
+
+    # Retrieve a broader urgency-ranked set before graph-informed reranking.
     due_result = await db.execute(
         select(SpacedRepetitionCard).where(
             SpacedRepetitionCard.child_id == child_id,
             SpacedRepetitionCard.next_review <= now,
             SpacedRepetitionCard.is_new == False,
-        ).order_by(SpacedRepetitionCard.next_review).limit(max_cards)
+        ).order_by(SpacedRepetitionCard.next_review, SpacedRepetitionCard.word_id).limit(due_pool_limit)
     )
     due_cards = due_result.scalars().all()
 
@@ -381,10 +448,11 @@ async def get_review_queue(
     # New cards – words the child has been exposed to but not yet in SR
     from app.models.vocabulary import WordProgress
     exposure_result = await db.execute(
-        select(WordProgress.word_id).where(
+        select(WordProgress.word_id).join(Word, Word.id == WordProgress.word_id).where(
             WordProgress.child_id == child_id,
             WordProgress.exposure_count > 0,
-        )
+            Word.is_active == True,
+        ).order_by(WordProgress.created_at.desc(), WordProgress.word_id)
     )
     exposed_word_ids = [row[0] for row in exposure_result.all()]
 
@@ -408,13 +476,56 @@ async def get_review_queue(
         new_cards.append(card)
     await db.commit()
 
-    remaining_card_slots = max(max_cards - len(due_cards), 0)
-    pending_new_cards = (existing_new_cards + new_cards)[:remaining_card_slots]
+    pending_new_cards = (existing_new_cards + new_cards)[:max_new]
     all_cards = list(due_cards) + pending_new_cards
     all_word_ids = [c.word_id for c in all_cards]
 
+    # Early review of graph neighbours is opt-in and disabled by default.
+    if policy.max_graph_candidates and exposed_word_ids:
+        graph_candidate_ids_result = await db.execute(
+            select(WordRelationship.related_word_id)
+            .where(
+                WordRelationship.word_id.in_(exposed_word_ids),
+                WordRelationship.strength >= 0.45,
+            )
+            .order_by(WordRelationship.strength.desc(), WordRelationship.related_word_id)
+            .limit(policy.max_graph_candidates * 3)
+        )
+        graph_candidate_ids = [
+            row[0]
+            for row in graph_candidate_ids_result.all()
+            if row[0] not in set(all_word_ids)
+        ][:policy.max_graph_candidates]
+
+        if graph_candidate_ids:
+            graph_cards_result = await db.execute(
+                select(SpacedRepetitionCard)
+                .join(Word, Word.id == SpacedRepetitionCard.word_id)
+                .where(
+                    SpacedRepetitionCard.child_id == child_id,
+                    SpacedRepetitionCard.word_id.in_(graph_candidate_ids),
+                    SpacedRepetitionCard.is_new == False,
+                    SpacedRepetitionCard.next_review > now,
+                    Word.is_active == True,
+                )
+            )
+            graph_cards_by_word_id = {
+                card.word_id: card for card in graph_cards_result.scalars().all()
+            }
+            all_cards.extend(
+                graph_cards_by_word_id[word_id]
+                for word_id in graph_candidate_ids
+                if word_id in graph_cards_by_word_id
+            )
+            all_word_ids = [card.word_id for card in all_cards]
+
     if not all_cards:
-        return ReviewQueueResponse(cards=[], total_due=0, new_cards_today=0)
+        return ReviewQueueResponse(
+            cards=[],
+            total_due=total_due,
+            new_cards_today=0,
+            policy_version=policy.version,
+        )
 
     # Fetch words in one query
     words_result = await db.execute(
@@ -451,27 +562,26 @@ async def get_review_queue(
     candidates: list[_QueueCandidate] = []
     for card in all_cards:
         progress = progress_map.get(card.word_id)
-        weak_link_ratio = _compute_weak_link_ratio(progress)
+        learner_need_score = _compute_learner_need_score(progress)
         graph_score = compute_graph_queue_score(
             card.word_id,
             outgoing_map=outgoing_map,
             incoming_degree=incoming_degree,
             known_word_ids=known_word_ids,
-            weak_link_ratio=weak_link_ratio,
+            weak_link_ratio=learner_need_score,
         )
-        due_score = _compute_due_score(card, now)
+        urgency_score = _compute_urgency_score(card, now)
         quick_win_score = _compute_quick_win_score(card, progress)
-        base_score = round(
-            due_score * 0.52
-            + graph_score.graph_score * 0.33
-            + quick_win_score * 0.15,
+        graph_connectivity_score = round(
+            graph_score.bridge_score * 0.65 + graph_score.centrality_score * 0.35,
             4,
         )
-        reason = _resolve_primary_reason(
-            due_score=due_score,
-            bridge_score=graph_score.bridge_score,
-            weak_link_ratio=weak_link_ratio,
-            quick_win_score=quick_win_score,
+        base_score = round(
+            urgency_score * policy.urgency_weight
+            + learner_need_score * policy.learner_need_weight
+            + graph_connectivity_score * policy.graph_weight
+            + quick_win_score * policy.quick_win_weight,
+            4,
         )
 
         word = word_map.get(card.word_id)
@@ -481,8 +591,11 @@ async def get_review_queue(
             _QueueCandidate(
                 card=card,
                 word=word,
-                reason=reason,
-                due_score=due_score,
+                reason="balance",
+                urgency_score=urgency_score,
+                learner_need_score=learner_need_score,
+                graph_connectivity_score=graph_connectivity_score,
+                due_score=urgency_score,
                 graph_score=graph_score.graph_score,
                 bridge_score=graph_score.bridge_score,
                 centrality_score=graph_score.centrality_score,
@@ -501,8 +614,36 @@ async def get_review_queue(
             candidate.card.word_id,
         )
     )
+    for candidate_pool_rank, candidate in enumerate(candidates, start=1):
+        candidate.candidate_pool_rank = candidate_pool_rank
+        candidate.reason = _resolve_primary_reason_v2(candidate, policy)
 
-    selected_candidates = _select_ranked_candidates(candidates, max_cards)
+    selected_candidates = _select_ranked_candidates(candidates, max_cards, policy)
+    selected_ranks = {candidate.card.word_id: rank for rank, candidate in enumerate(selected_candidates, start=1)}
+
+    for candidate in candidates:
+        db.add(
+            ReviewQueueDecision(
+                child_id=child_id,
+                word_id=candidate.card.word_id,
+                policy_version=policy.version,
+                candidate_pool_rank=candidate.candidate_pool_rank,
+                final_queue_rank=selected_ranks.get(candidate.card.word_id),
+                selected=candidate.card.word_id in selected_ranks,
+                queue_reason=candidate.reason,
+                feature_snapshot={
+                    "urgency_score": candidate.urgency_score,
+                    "learner_need_score": candidate.learner_need_score,
+                    "graph_connectivity_score": candidate.graph_connectivity_score,
+                    "quick_win_score": candidate.quick_win_score,
+                    "relevance_score": candidate.base_score,
+                    "redundancy_penalty": candidate.diversity_penalty,
+                    "final_score": candidate.final_score,
+                    "category": candidate.category,
+                },
+            )
+        )
+    await db.commit()
 
     enriched = [
         _enrich(
@@ -510,6 +651,10 @@ async def get_review_queue(
             candidate.word,
             queue_reason=candidate.reason,
             queue_features=ReviewQueueFeatures(
+                urgency_score=candidate.urgency_score,
+                learner_need_score=candidate.learner_need_score,
+                graph_connectivity_score=candidate.graph_connectivity_score,
+                quick_win_score=candidate.quick_win_score,
                 due_score=candidate.due_score,
                 graph_score=candidate.graph_score,
                 bridge_score=candidate.bridge_score,
@@ -517,15 +662,19 @@ async def get_review_queue(
                 weak_link_boost=candidate.weak_link_boost,
                 diversity_penalty=candidate.diversity_penalty,
                 final_score=candidate.final_score,
+                candidate_pool_rank=candidate.candidate_pool_rank,
+                final_queue_rank=final_queue_rank,
+                policy_version=policy.version,
             ),
         )
-        for candidate in selected_candidates
+        for final_queue_rank, candidate in enumerate(selected_candidates, start=1)
     ]
 
     return ReviewQueueResponse(
         cards=enriched,
-        total_due=len(due_cards),
+        total_due=total_due,
         new_cards_today=len(new_cards),
+        policy_version=policy.version,
     )
 
 

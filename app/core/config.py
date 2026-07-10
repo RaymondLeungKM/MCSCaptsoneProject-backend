@@ -15,6 +15,18 @@ class Settings(BaseSettings):
     # API
     API_V1_PREFIX: str = "/api/v1"
     DEFAULT_MISSION_ASSIGNMENT_REPEAT_COOLDOWN_DAYS: int = 7
+
+    # Graph-informed spaced-repetition queue policy
+    REVIEW_QUEUE_POLICY_VERSION: str = "graph_reranker_v2"
+    REVIEW_QUEUE_CANDIDATE_POOL_MULTIPLIER: int = 3
+    REVIEW_QUEUE_MAX_CANDIDATE_POOL: int = 100
+    REVIEW_QUEUE_URGENCY_WEIGHT: float = 0.55
+    REVIEW_QUEUE_LEARNER_NEED_WEIGHT: float = 0.25
+    REVIEW_QUEUE_GRAPH_WEIGHT: float = 0.15
+    REVIEW_QUEUE_QUICK_WIN_WEIGHT: float = 0.05
+    REVIEW_QUEUE_DIVERSITY_LAMBDA: float = 0.18
+    REVIEW_QUEUE_CRITICAL_URGENCY_THRESHOLD: float = 0.85
+    REVIEW_QUEUE_MAX_GRAPH_CANDIDATES: int = 0
     
     # CORS
     CORS_ORIGINS: List[str] = [

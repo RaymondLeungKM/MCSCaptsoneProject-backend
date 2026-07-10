@@ -4,10 +4,13 @@ from types import SimpleNamespace
 
 from app.services.spaced_repetition_service import (
     _QueueCandidate,
+    _compute_learner_need_score,
     _compute_quick_win_score,
+    _compute_urgency_score,
     _compute_weak_link_ratio,
     _resolve_primary_reason,
     _select_ranked_candidates,
+    ReviewQueuePolicy,
 )
 
 
@@ -86,6 +89,22 @@ class ReviewQueuePolicyTests(unittest.TestCase):
 
         self.assertGreaterEqual(_compute_quick_win_score(card, progress), 0.8)
 
+    def test_urgency_and_learner_need_scores_are_bounded(self):
+        now = datetime.now(timezone.utc)
+        one_day_overdue = SimpleNamespace(is_new=False, next_review=now - timedelta(days=1))
+        very_overdue = SimpleNamespace(is_new=False, next_review=now - timedelta(days=30))
+        sparse_failure = SimpleNamespace(
+            total_attempts=1,
+            success_rate=0.0,
+            exposure_count=1,
+            mastered=False,
+        )
+
+        self.assertGreater(_compute_urgency_score(very_overdue, now), _compute_urgency_score(one_day_overdue, now))
+        self.assertLessEqual(_compute_urgency_score(very_overdue, now), 1.0)
+        self.assertGreater(_compute_learner_need_score(sparse_failure), 0.0)
+        self.assertLess(_compute_learner_need_score(sparse_failure), 1.0)
+
     def test_selection_balances_categories_and_reason_caps(self):
         candidates = [
             _QueueCandidate(
@@ -149,6 +168,32 @@ class ReviewQueuePolicyTests(unittest.TestCase):
         self.assertEqual(ranked[1].card.word_id, "w4")
         self.assertEqual(ranked[2].card.word_id, "w2")
         self.assertNotEqual(ranked[1].category, ranked[0].category)
+
+    def test_critical_urgency_is_not_demoted_by_diversity(self):
+        candidates = [
+            _QueueCandidate(
+                card=make_card("urgent-1"), word=None, reason="due",
+                due_score=0.95, graph_score=0.0, bridge_score=0.0,
+                centrality_score=0.0, weak_link_boost=0.0, quick_win_score=0.0,
+                base_score=0.95, category="animals", urgency_score=0.9,
+            ),
+            _QueueCandidate(
+                card=make_card("urgent-2"), word=None, reason="due",
+                due_score=0.9, graph_score=0.0, bridge_score=0.0,
+                centrality_score=0.0, weak_link_boost=0.0, quick_win_score=0.0,
+                base_score=0.9, category="animals", urgency_score=0.9,
+            ),
+            _QueueCandidate(
+                card=make_card("varied"), word=None, reason="balance",
+                due_score=0.1, graph_score=0.0, bridge_score=0.0,
+                centrality_score=0.0, weak_link_boost=0.0, quick_win_score=0.0,
+                base_score=0.85, category="food", urgency_score=0.1,
+            ),
+        ]
+
+        ranked = _select_ranked_candidates(candidates, max_cards=3, policy=ReviewQueuePolicy())
+
+        self.assertEqual([candidate.card.word_id for candidate in ranked[:2]], ["urgent-1", "urgent-2"])
 
 
 if __name__ == "__main__":

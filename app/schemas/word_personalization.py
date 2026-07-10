@@ -96,6 +96,10 @@ class GraphRecommendationResponse(BaseModel):
 
 
 class ReviewQueueFeatures(BaseModel):
+    urgency_score: float = 0.0
+    learner_need_score: float = 0.0
+    graph_connectivity_score: float = 0.0
+    quick_win_score: float = 0.0
     due_score: float = 0.0
     graph_score: float = 0.0
     bridge_score: float = 0.0
@@ -103,6 +107,9 @@ class ReviewQueueFeatures(BaseModel):
     weak_link_boost: float = 0.0
     diversity_penalty: float = 0.0
     final_score: float = 0.0
+    candidate_pool_rank: int = 0
+    final_queue_rank: Optional[int] = None
+    policy_version: str = "graph_reranker_v2"
 
 
 class SpacedRepetitionCardResponse(BaseModel):
@@ -134,6 +141,7 @@ class ReviewQueueResponse(BaseModel):
     cards: List[SpacedRepetitionCardResponse]
     total_due: int
     new_cards_today: int
+    policy_version: str = "graph_reranker_v2"
 
 
 class ReviewResultRequest(BaseModel):

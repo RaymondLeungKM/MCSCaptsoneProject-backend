@@ -10,7 +10,7 @@ from sqlalchemy import (
     Column, String, Integer, Float, Boolean, DateTime, Text,
     ForeignKey, Enum as SQLEnum, UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -80,6 +80,26 @@ class SpacedRepetitionCard(Base):
 
     child = relationship("Child", backref="sr_cards")
     word = relationship("Word", backref="sr_cards")
+
+
+class ReviewQueueDecision(Base):
+    """Candidate-level queue decision log for offline policy evaluation."""
+
+    __tablename__ = "review_queue_decisions"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    child_id = Column(String, ForeignKey("children.id", ondelete="CASCADE"), nullable=False, index=True)
+    word_id = Column(String, ForeignKey("words.id", ondelete="CASCADE"), nullable=False, index=True)
+    policy_version = Column(String, nullable=False, index=True)
+    generated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    candidate_pool_rank = Column(Integer, nullable=False)
+    final_queue_rank = Column(Integer, nullable=True)
+    selected = Column(Boolean, nullable=False, default=False)
+    queue_reason = Column(String, nullable=False, default="balance")
+    feature_snapshot = Column(JSONB, nullable=False, default=dict)
+
+    child = relationship("Child")
+    word = relationship("Word")
 
 
 class WordEmbedding(Base):
