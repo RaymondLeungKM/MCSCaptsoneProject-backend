@@ -7,9 +7,13 @@ Main application entry point
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI
+import mimetypes
+import re
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.openapi.utils import get_openapi
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -131,6 +135,99 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve audio with HTTP Range support so the player can seek to a page segment
+# on the first (uncached) playback. Starlette's StaticFiles in this version does
+# not honour Range requests, which forces the browser to download the whole file
+# before it can seek, causing playback to start from 0:00 on a cold load.
+_AUDIO_DIR = Path("uploads/audio").resolve()
+_FILE_CHUNK_SIZE = 64 * 1024
+
+
+def _serve_file_with_range(
+    file_path: Path,
+    request: Request,
+    content_type: str,
+) -> Response:
+    file_size = file_path.stat().st_size
+    base_headers = {
+        "accept-ranges": "bytes",
+        "content-type": content_type,
+    }
+
+    range_header = request.headers.get("range")
+    range_match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip()) if range_header else None
+
+    if range_match:
+        start_token, end_token = range_match.group(1), range_match.group(2)
+
+        if start_token == "":
+            suffix_length = int(end_token) if end_token else 0
+            start = max(file_size - suffix_length, 0)
+            end = file_size - 1
+        else:
+            start = int(start_token)
+            end = int(end_token) if end_token else file_size - 1
+
+        end = min(end, file_size - 1)
+
+        if start > end or start >= file_size:
+            return Response(
+                status_code=416,
+                headers={
+                    "accept-ranges": "bytes",
+                    "content-range": f"bytes */{file_size}",
+                },
+            )
+
+        chunk_length = end - start + 1
+
+        def iter_range():
+            with open(file_path, "rb") as audio_file:
+                audio_file.seek(start)
+                remaining = chunk_length
+                while remaining > 0:
+                    data = audio_file.read(min(_FILE_CHUNK_SIZE, remaining))
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+
+        return StreamingResponse(
+            iter_range(),
+            status_code=206,
+            headers={
+                **base_headers,
+                "content-range": f"bytes {start}-{end}/{file_size}",
+                "content-length": str(chunk_length),
+            },
+        )
+
+    def iter_full():
+        with open(file_path, "rb") as audio_file:
+            while True:
+                data = audio_file.read(_FILE_CHUNK_SIZE)
+                if not data:
+                    break
+                yield data
+
+    return StreamingResponse(
+        iter_full(),
+        status_code=200,
+        headers={**base_headers, "content-length": str(file_size)},
+    )
+
+
+@app.get("/uploads/audio/{filename}")
+def serve_audio_file(filename: str, request: Request) -> Response:
+    """Serve generated audio with Range support (defends against path traversal)."""
+    candidate = (_AUDIO_DIR / filename).resolve()
+    if not str(candidate).startswith(str(_AUDIO_DIR) + "/") or not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Audio not found")
+
+    content_type = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
+    return _serve_file_with_range(candidate, request, content_type)
+
 
 # Mount static files for uploaded images
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
