@@ -10,7 +10,6 @@ from app.api.endpoints import (
     vocabulary,
     categories,
     bedtime_stories,
-    stories,
     games,
     missions,
     progress,
@@ -35,7 +34,6 @@ api_router.include_router(children.router, prefix="/children", tags=["Children"]
 api_router.include_router(vocabulary.router, prefix="/vocabulary", tags=["Vocabulary"])
 api_router.include_router(categories.router, prefix="/categories", tags=["Categories"])
 api_router.include_router(bedtime_stories.router, prefix="/bedtime-stories", tags=["Bedtime Stories"])
-api_router.include_router(stories.router, prefix="/stories", tags=["Stories"])
 api_router.include_router(games.router, prefix="/games", tags=["Games"])
 api_router.include_router(missions.router, prefix="/missions", tags=["Missions"])
 api_router.include_router(progress.router, prefix="/progress", tags=["Progress"])

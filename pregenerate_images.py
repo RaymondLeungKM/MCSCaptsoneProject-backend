@@ -35,7 +35,7 @@ from app.db.session import AsyncSessionLocal
 from app.models.user import User, Child
 from app.models.vocabulary import Word, Category, WordProgress
 from sqlalchemy.orm import selectinload
-from app.models.content import Story, Game, Mission
+from app.models.content import Game, Mission
 from app.models.analytics import LearningSession, Achievement
 from app.models.parent_analytics import LearningInsight, WeeklyReport, ParentalControl
 from app.models.generated_sentences import GeneratedSentence

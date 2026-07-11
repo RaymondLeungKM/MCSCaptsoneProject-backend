@@ -137,44 +137,6 @@ class GeneratedStoryResponse(BaseModel):
     class Config:
         from_attributes = True
 
-
-class CuratedStoryLayoutHint(BaseModel):
-    section_layout: str = "hero_with_carousel"
-    style_reference: str = "my_storybook"
-    hero_aspect_ratio: str = "16:9"
-    show_header_action: bool = True
-    mini_card_variant: str = "compact"
-    max_mini_cards_visible: int = 3
-
-
-class CuratedStoryCard(BaseModel):
-    id: str
-    title: str
-    theme: Optional[str] = None
-    cover_icon_key: str = "book"
-    reading_time_minutes: int
-    audio_duration_seconds: Optional[int] = None
-    audio_url: Optional[str] = None
-    generated_at: datetime
-    is_new: bool = False
-    is_featured: bool = False
-
-
-class CuratedStoriesChildSectionResponse(BaseModel):
-    section_id: str = "curated-stories"
-    title: str = "精選故事"
-    subtitle: Optional[str] = "今晚推薦"
-    header_action_label: str = "查看全部"
-    header_action_target: str = "/stories"
-    layout: CuratedStoryLayoutHint = Field(default_factory=CuratedStoryLayoutHint)
-    hero_story: Optional[CuratedStoryCard] = None
-    carousel_stories: List[CuratedStoryCard] = Field(default_factory=list)
-    total_stories: int = 0
-    visible_stories: int = 0
-    has_more: bool = False
-    remaining_stories: int = 0
-
-
 class StoryGenerationRequest(BaseModel):
     """Request to generate a bedtime story"""
     child_id: str

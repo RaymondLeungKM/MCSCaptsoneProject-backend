@@ -32,7 +32,7 @@ from app.models.community import (
     ModerationStatus,
     PostReaction,
 )
-from app.models.content import Game, Mission, Story  # noqa: F401
+from app.models.content import Game, Mission  # noqa: F401
 from app.models.daily_words import DailyWordTracking  # noqa: F401
 from app.models.generated_sentences import GeneratedSentence  # noqa: F401
 from app.models.parent_analytics import (  # noqa: F401

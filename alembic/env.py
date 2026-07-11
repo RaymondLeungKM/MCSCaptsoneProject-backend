@@ -15,7 +15,7 @@ from app.db.base import Base
 # Import all models so Alembic can detect them
 from app.models.user import User, Child, ChildInterest
 from app.models.vocabulary import Category, Word, WordProgress
-from app.models.content import Story, StoryProgress, Game, Mission, MissionProgress
+from app.models.content import Game, Mission, MissionProgress
 from app.models.analytics import LearningSession, Achievement, ChildAchievement, GameSession
 from app.models.daily_words import DailyWordTracking, GeneratedStory
 from app.models.parent_analytics import LearningInsight, WeeklyReport, ParentalControl

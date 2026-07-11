@@ -23,7 +23,6 @@ from app.models.community import (
     CommunityPost,
     FriendChallenge,
 )
-from app.models.content import StoryProgress
 from app.models.user import Child, User
 from app.models.vocabulary import Word
 from app.schemas.admin_analytics import (
@@ -769,34 +768,6 @@ async def get_engagement_trends(
     story_read_count = 0
     story_completed_count = 0
     story_completion_rate = 0.0
-    if await _table_exists(db, "story_progress"):
-        story_filters = [
-            StoryProgress.last_read.is_not(None),
-            StoryProgress.last_read >= range_start,
-            StoryProgress.last_read < range_end,
-        ]
-        if age_band:
-            if eligible_child_ids:
-                story_filters.append(StoryProgress.child_id.in_(eligible_child_ids))
-            else:
-                story_filters.append(StoryProgress.child_id == "__none__")
-
-        story_reads_result = await db.execute(
-            select(
-                func.count(StoryProgress.id).label("read_count"),
-                func.sum(
-                    case((StoryProgress.completed.is_(True), 1), else_=0)
-                ).label("completed_count"),
-            ).where(*story_filters)
-        )
-        story_reads_row = story_reads_result.one()
-        story_read_count = int(story_reads_row.read_count or 0)
-        story_completed_count = int(story_reads_row.completed_count or 0)
-        story_completion_rate = (
-            round(story_completed_count / story_read_count, 4)
-            if story_read_count > 0
-            else 0.0
-        )
 
     shared_photo_post_count = 0
     average_reactions_per_shared_photo = 0.0
