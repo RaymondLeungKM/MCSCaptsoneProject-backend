@@ -39,6 +39,7 @@ from app.schemas.parent_analytics import (
     ParentBenchmarksResponse,
 )
 from app.core.security import get_current_user
+from app.core.local_time import ClientLocalDay, get_active_client_local_day
 from app.services.child_metrics import sync_child_metrics
 from app.services.analytics_foundation import resolve_age_band
 from app.services.privacy_gate import (
@@ -50,17 +51,19 @@ from app.services.privacy_gate import (
 router = APIRouter(prefix="/parent-dashboard", tags=["parent-dashboard"])
 
 MAX_SESSION_MINUTES = 90
-HKT = timezone(timedelta(hours=8), name="HKT")
 
 
 def _local_today() -> date:
-    return datetime.now(HKT).date()
+    return get_active_client_local_day().date
 
 
 def _local_day_bounds(local_day: date) -> tuple[datetime, datetime]:
-    local_start = datetime.combine(local_day, time.min, tzinfo=HKT)
-    local_end = local_start + timedelta(days=1)
-    return local_start.astimezone(timezone.utc), local_end.astimezone(timezone.utc)
+    client_local_day = get_active_client_local_day()
+    return ClientLocalDay(
+        local_day, client_local_day.timezone_offset_minutes
+    ).start_utc, ClientLocalDay(
+        local_day + timedelta(days=1), client_local_day.timezone_offset_minutes
+    ).start_utc
 
 
 def _local_date_window(start_day: date, end_day: date) -> tuple[datetime, datetime]:
@@ -282,7 +285,7 @@ def _replace_learning_insight_content(
 
 def _normalize_tracking_day(value):
     if isinstance(value, datetime):
-        return _ensure_utc(value).astimezone(HKT).date()
+        return get_active_client_local_day().date_for_timestamp(_ensure_utc(value))
     if isinstance(value, str):
         try:
             return date.fromisoformat(value)
@@ -496,14 +499,14 @@ def _split_session_intervals_by_day(
     cursor = session_start
 
     while cursor < session_end:
-        local_cursor = cursor.astimezone(HKT)
-        next_local_day_start = datetime.combine(
-            local_cursor.date() + timedelta(days=1),
-            time.min,
-            tzinfo=HKT,
-        ).astimezone(timezone.utc)
+        client_local_day = get_active_client_local_day()
+        local_cursor_day = client_local_day.date_for_timestamp(cursor)
+        next_local_day_start = ClientLocalDay(
+            local_cursor_day + timedelta(days=1),
+            client_local_day.timezone_offset_minutes,
+        ).start_utc
         segment_end = min(session_end, next_local_day_start)
-        intervals_by_day.setdefault(local_cursor.date(), []).append(
+        intervals_by_day.setdefault(local_cursor_day, []).append(
             (cursor, segment_end)
         )
         cursor = segment_end

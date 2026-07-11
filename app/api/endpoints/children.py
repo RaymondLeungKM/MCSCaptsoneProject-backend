@@ -1,7 +1,7 @@
 """
 Children profile endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
@@ -15,6 +15,7 @@ from app.models.user import User, Child, ChildInterest
 from app.models.vocabulary import Category
 from app.core.security import get_current_active_user
 from app.core.child_age import calculate_child_age, infer_birth_year_from_age
+from app.core.local_time import get_client_local_day
 from app.services.child_metrics import sync_child_metrics
 
 router = APIRouter()
@@ -144,6 +145,7 @@ async def create_child(
 
 @router.get("/", response_model=List[ChildResponse])
 async def get_children(
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -155,7 +157,7 @@ async def get_children(
     )
     children = result.scalars().all()
 
-    today = date.today()
+    today = get_client_local_day(request).date
     has_changes = False
 
     for child in children:
@@ -174,6 +176,7 @@ async def get_children(
 @router.get("/{child_id}", response_model=ChildProfileResponse)
 async def get_child(
     child_id: str,
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -191,7 +194,7 @@ async def get_child(
             detail="Child not found"
         )
     
-    today = date.today()
+    today = get_client_local_day(request).date
 
     if await sync_child_metrics(db, child, as_of=today):
         await db.commit()

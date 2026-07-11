@@ -3,6 +3,7 @@ from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 from app.api.endpoints.analytics import _normalize_activity_day
+from app.core.local_time import ClientLocalDay
 from app.api.endpoints.parent_dashboard import (
     _build_category_mastery_progress,
     _normalize_tracking_day,
@@ -25,11 +26,14 @@ def make_session(
 
 
 class ParentAnalyticsAggregationTests(unittest.TestCase):
-    def test_normalizes_hkt_day_boundaries(self):
+    def test_normalizes_client_local_day_boundaries(self):
         timestamp = datetime(2026, 5, 29, 16, 58, 36, tzinfo=timezone.utc)
+        client_local_day = ClientLocalDay(date(2026, 5, 30), -8 * 60)
 
-        self.assertEqual(_normalize_tracking_day(timestamp), date(2026, 5, 30))
-        self.assertEqual(_normalize_activity_day(timestamp), date(2026, 5, 30))
+        self.assertEqual(_normalize_tracking_day(timestamp), date(2026, 5, 29))
+        self.assertEqual(
+            _normalize_activity_day(timestamp, client_local_day), date(2026, 5, 30)
+        )
 
     def test_session_summary_merges_adjacent_fragments_before_counting(self):
         sessions = [
@@ -50,14 +54,14 @@ class ParentAnalyticsAggregationTests(unittest.TestCase):
         summary = _summarize_sessions_by_day(
             sessions,
             start_day=date(2026, 5, 27),
-            end_day=date(2026, 5, 30),
+            end_day=date(2026, 5, 29),
             now_utc=datetime(2026, 5, 30, 0, 0, tzinfo=timezone.utc),
         )
 
         self.assertEqual(summary[date(2026, 5, 27)]["session_count"], 1)
         self.assertAlmostEqual(summary[date(2026, 5, 27)]["total_seconds"], 49.0)
-        self.assertEqual(summary[date(2026, 5, 30)]["session_count"], 1)
-        self.assertAlmostEqual(summary[date(2026, 5, 30)]["total_seconds"], 24.0)
+        self.assertEqual(summary[date(2026, 5, 29)]["session_count"], 1)
+        self.assertAlmostEqual(summary[date(2026, 5, 29)]["total_seconds"], 24.0)
 
     def test_rounds_minutes_after_merging(self):
         self.assertEqual(_rounded_minutes_from_total_seconds(95.0), 2)

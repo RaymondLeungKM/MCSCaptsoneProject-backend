@@ -5,7 +5,7 @@ from datetime import date, datetime, time, timedelta, timezone
 import uuid
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +22,7 @@ from app.models.daily_words import DailyWordTracking
 from app.models.parent_analytics import ParentalControl
 from app.models.user import User, Child
 from app.models.vocabulary import Category, Word, WordProgress
+from app.core.local_time import get_client_local_day
 from app.core.security import get_current_active_user
 from app.services.child_metrics import sync_child_metrics
 from app.services.analytics_foundation import (
@@ -360,6 +361,7 @@ async def end_learning_session(
 @router.get("/{child_id}/stats", response_model=ProgressStatsResponse)
 async def get_progress_stats(
     child_id: str,
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -376,7 +378,8 @@ async def get_progress_stats(
             detail="Child not found"
         )
 
-    if await sync_child_metrics(db, child, as_of=date.today()):
+    client_local_day = get_client_local_day(request)
+    if await sync_child_metrics(db, child, as_of=client_local_day.date):
         await db.commit()
     
     # Get word progress stats
@@ -436,37 +439,35 @@ async def get_progress_stats(
         p.exposure_count or 0 for p in encountered_progress
     ) / max(total_words, 1)
 
-    today = date.today()
+    today = client_local_day.date
     week_start = today - timedelta(days=today.weekday())
     week_dates = [week_start + timedelta(days=offset) for offset in range(7)]
     weekly_counts = {day: 0 for day in week_dates}
 
+    week_start_at, week_end_at = client_local_day.utc_bounds(
+        week_start, week_start + timedelta(days=6)
+    )
     weekly_tracking_result = await db.execute(
-        select(
-            func.date(DailyWordTracking.date).label("tracked_day"),
-            func.count(func.distinct(DailyWordTracking.word_id)).label("tracked_words"),
-        )
+        select(DailyWordTracking.date, DailyWordTracking.word_id)
         .where(
             and_(
                 DailyWordTracking.child_id == child_id,
-                DailyWordTracking.date >= datetime.combine(week_start, time.min),
-                DailyWordTracking.date < datetime.combine(
-                    week_start + timedelta(days=7),
-                    time.min,
-                ),
+                DailyWordTracking.date >= week_start_at,
+                DailyWordTracking.date < week_end_at,
             )
         )
-        .group_by(func.date(DailyWordTracking.date))
     )
 
-    for tracked_day, tracked_words in weekly_tracking_result.all():
-        if isinstance(tracked_day, str):
-            resolved_day = date.fromisoformat(tracked_day)
-        else:
-            resolved_day = tracked_day
+    weekly_word_ids: dict[date, set[str]] = {}
+    for tracked_at, word_id in weekly_tracking_result.all():
+        if not tracked_at or not word_id:
+            continue
+        tracked_day = client_local_day.date_for_timestamp(tracked_at)
+        if tracked_day in weekly_counts:
+            weekly_word_ids.setdefault(tracked_day, set()).add(word_id)
 
-        if resolved_day in weekly_counts:
-            weekly_counts[resolved_day] = tracked_words or 0
+    for tracked_day, word_ids in weekly_word_ids.items():
+        weekly_counts[tracked_day] = len(word_ids)
 
     weekly_progress = [weekly_counts[day] for day in week_dates]
 

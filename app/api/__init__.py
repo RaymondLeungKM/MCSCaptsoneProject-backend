@@ -1,7 +1,9 @@
 """
 API Router
 """
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+
+from app.core.local_time import bind_client_local_day
 
 from app.api.endpoints import (
     auth,
@@ -25,7 +27,7 @@ from app.api.endpoints import (
     admin_analytics,
 )
 
-api_router = APIRouter()
+api_router = APIRouter(dependencies=[Depends(bind_client_local_day)])
 
 # Include all endpoint routers
 api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])

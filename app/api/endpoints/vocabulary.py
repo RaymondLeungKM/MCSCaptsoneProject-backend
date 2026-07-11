@@ -1,7 +1,7 @@
 """
 Vocabulary word endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Query, File, UploadFile, Form, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, Query, File, UploadFile, Form, BackgroundTasks, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_
 from sqlalchemy.orm import selectinload
@@ -31,6 +31,7 @@ from app.models.vocabulary import Word, WordProgress, Category
 from app.models.daily_words import DailyWordTracking
 from app.models.generated_sentences import GeneratedSentence as GeneratedSentenceModel
 from app.models.user import User, Child
+from app.core.local_time import ClientLocalDay, get_client_local_day
 from app.core.security import get_current_active_user, get_current_admin_user
 from app.core.category_colors import get_category_color
 from app.core.config import settings
@@ -47,7 +48,6 @@ router = APIRouter()
 
 ACTIVE_VOCAB_REQUEST_MIN_EXPOSURES = 6
 MAX_WORD_EXPOSURE_STARS = 6
-HKT = timezone(timedelta(hours=8), name="HKT")
 
 UNSAFE_CHILD_VOCAB_TOKENS = {
     "knife",
@@ -93,14 +93,11 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def _is_same_hkt_day(left: datetime, right: datetime) -> bool:
-    return _ensure_utc(left).astimezone(HKT).date() == _ensure_utc(right).astimezone(HKT).date()
-
-
 def _apply_daily_star_increment_limit(
     progress: WordProgress,
     *,
     event_at: Optional[datetime] = None,
+    client_local_day: ClientLocalDay,
 ) -> bool:
     event_time = _ensure_utc(event_at) if event_at else datetime.now(timezone.utc)
     current_exposure = min(int(progress.exposure_count or 0), MAX_WORD_EXPOSURE_STARS)
@@ -110,7 +107,10 @@ def _apply_daily_star_increment_limit(
         return False
 
     last_practiced = progress.last_practiced
-    if last_practiced and _is_same_hkt_day(last_practiced, event_time):
+    if last_practiced and (
+        client_local_day.date_for_timestamp(last_practiced)
+        == client_local_day.date_for_timestamp(event_time)
+    ):
         return False
 
     progress.exposure_count = min(current_exposure + 1, MAX_WORD_EXPOSURE_STARS)
@@ -1317,6 +1317,7 @@ async def update_word_progress(
     word_id: str,
     child_id: str,
     progress_data: WordProgressUpdate,
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -1370,7 +1371,10 @@ async def update_word_progress(
             requested_exposure_int = int(progress.exposure_count or 0)
 
         if requested_exposure_int > int(progress.exposure_count or 0):
-            _apply_daily_star_increment_limit(progress)
+            _apply_daily_star_increment_limit(
+                progress,
+                client_local_day=get_client_local_day(request),
+            )
 
     for field, value in update_data.items():
         setattr(progress, field, value)
@@ -1448,6 +1452,7 @@ async def record_external_word_learning(
     background_tasks: BackgroundTasks,
     word: str = Form(..., description="The word that was learned"),
     child_id: str = Form(..., description="ID of the child who learned the word"),
+    request: Request = None,
     source: str = Form(..., description="Source of learning (e.g., object_detection, physical_activity)"),
     timestamp: str = Form(..., description="ISO 8601 timestamp when word was learned"),
     word_id: Optional[str] = Form(None, description="Optional word ID if known"),
@@ -1677,6 +1682,7 @@ async def record_external_word_learning(
     incremented_exposure = _apply_daily_star_increment_limit(
         progress,
         event_at=timestamp_dt,
+        client_local_day=get_client_local_day(request),
     )
     
     # Track learning modality based on source

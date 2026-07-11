@@ -4,7 +4,7 @@ Analytics endpoints
 from datetime import date, datetime, time, timedelta, timezone
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,33 +13,19 @@ from app.schemas.analytics import DailyStatsResponse, ChildAchievementResponse
 from app.models.analytics import ChildAchievement, Achievement, LearningSession
 from app.models.daily_words import DailyWordTracking
 from app.models.user import User, Child
+from app.core.local_time import ClientLocalDay, get_client_local_day
 from app.core.security import get_current_active_user
 
 router = APIRouter()
 
 MAX_SESSION_MINUTES = 90
-HKT = timezone(timedelta(hours=8), name="HKT")
 
 
-def _local_today() -> date:
-    return datetime.now(HKT).date()
-
-
-def _local_day_bounds(local_day: date) -> tuple[datetime, datetime]:
-    local_start = datetime.combine(local_day, time.min, tzinfo=HKT)
-    local_end = local_start + timedelta(days=1)
-    return local_start.astimezone(timezone.utc), local_end.astimezone(timezone.utc)
-
-
-def _local_date_window(start_day: date, end_day: date) -> tuple[datetime, datetime]:
-    start_at, _ = _local_day_bounds(start_day)
-    end_at, _ = _local_day_bounds(end_day + timedelta(days=1))
-    return start_at, end_at
-
-
-def _normalize_activity_day(raw_value: object) -> date | None:
+def _normalize_activity_day(
+    raw_value: object, client_local_day: ClientLocalDay
+) -> date | None:
     if isinstance(raw_value, datetime):
-        return _ensure_utc(raw_value).astimezone(HKT).date()
+        return client_local_day.date_for_timestamp(_ensure_utc(raw_value))
 
     if isinstance(raw_value, date):
         return raw_value
@@ -50,7 +36,8 @@ def _normalize_activity_day(raw_value: object) -> date | None:
         except ValueError:
             try:
                 return _normalize_activity_day(
-                    datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+                    datetime.fromisoformat(raw_value.replace("Z", "+00:00")),
+                    client_local_day,
                 )
             except ValueError:
                 return None
@@ -200,6 +187,7 @@ def _split_session_intervals_by_day(
     session: LearningSession,
     *,
     now_utc: datetime,
+    client_local_day: ClientLocalDay,
 ) -> dict[date, list[tuple[datetime, datetime]]]:
     resolved_window = _resolved_session_window(session, now_utc=now_utc)
     if resolved_window is None:
@@ -210,14 +198,13 @@ def _split_session_intervals_by_day(
     cursor = session_start
 
     while cursor < session_end:
-        local_cursor = cursor.astimezone(HKT)
-        next_local_day_start = datetime.combine(
-            local_cursor.date() + timedelta(days=1),
-            time.min,
-            tzinfo=HKT,
-        ).astimezone(timezone.utc)
+        local_cursor_day = client_local_day.date_for_timestamp(cursor)
+        next_local_day_start = ClientLocalDay(
+            local_cursor_day + timedelta(days=1),
+            client_local_day.timezone_offset_minutes,
+        ).start_utc
         segment_end = min(session_end, next_local_day_start)
-        intervals_by_day.setdefault(local_cursor.date(), []).append(
+        intervals_by_day.setdefault(local_cursor_day, []).append(
             (cursor, segment_end)
         )
         cursor = segment_end
@@ -229,6 +216,7 @@ def _split_session_intervals_by_day(
 async def get_daily_stats(
     child_id: str,
     days: int = 7,
+    request: Request = None,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -244,10 +232,11 @@ async def get_daily_stats(
             detail="Child not found"
         )
 
+    client_local_day = get_client_local_day(request)
     resolved_days = max(days, 1)
-    today = _local_today()
+    today = client_local_day.date
     start_day = today - timedelta(days=resolved_days - 1)
-    start_at, end_at = _local_date_window(start_day, today)
+    start_at, end_at = client_local_day.utc_bounds(start_day, today)
 
     tracking_result = await db.execute(
         select(DailyWordTracking).where(
@@ -290,7 +279,7 @@ async def get_daily_stats(
     session_windows: list[tuple[datetime, datetime]] = []
 
     for tracking in tracking_result.scalars().all():
-        tracked_day = _normalize_activity_day(tracking.date)
+        tracked_day = _normalize_activity_day(tracking.date, client_local_day)
         if tracked_day not in daily_buckets:
             continue
 
@@ -310,7 +299,7 @@ async def get_daily_stats(
 
         session_windows.append(resolved_window)
 
-        session_day = _normalize_activity_day(session.start_time)
+        session_day = _normalize_activity_day(session.start_time, client_local_day)
         if session_day in daily_buckets:
             bucket = daily_buckets[session_day]
             word_ids = bucket["word_ids"]
@@ -332,6 +321,7 @@ async def get_daily_stats(
         for tracked_day, intervals in _split_session_intervals_by_day(
             session,
             now_utc=now_utc,
+            client_local_day=client_local_day,
         ).items():
             if tracked_day not in daily_buckets:
                 continue
@@ -339,7 +329,7 @@ async def get_daily_stats(
             daily_buckets[tracked_day]["session_intervals"].extend(intervals)
 
     for session_start, _ in _merge_intervals(session_windows):
-        session_day = _normalize_activity_day(session_start)
+        session_day = _normalize_activity_day(session_start, client_local_day)
         if session_day not in daily_buckets:
             continue
 

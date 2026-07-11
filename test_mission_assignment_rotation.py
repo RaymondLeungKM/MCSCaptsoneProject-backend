@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 from app.api.endpoints.missions import (
     _build_mission_summary_payload,
-    _current_hkt_date,
     _dedupe_missions_by_id,
     _exclude_generated_cluster_missions,
     _filter_daily_rotation_candidates,
@@ -15,6 +14,7 @@ from app.api.endpoints.missions import (
     _was_assigned_recently,
     _was_completed_recently,
 )
+from app.core.local_time import ClientLocalDay
 from app.schemas.content import MissionResponse
 from app.models.content import (
     MissionAssignmentStatus,
@@ -88,9 +88,12 @@ def make_assignment(
 
 
 class MissionAssignmentRotationTests(unittest.TestCase):
-    def test_current_hkt_date_uses_hong_kong_day_boundary(self):
+    def test_client_local_day_uses_the_supplied_timezone_offset(self):
+        client_local_day = ClientLocalDay(date(2026, 5, 29), -8 * 60)
         self.assertEqual(
-            _current_hkt_date(datetime(2026, 5, 29, 16, 30, tzinfo=timezone.utc)),
+            client_local_day.date_for_timestamp(
+                datetime(2026, 5, 29, 16, 30, tzinfo=timezone.utc)
+            ),
             date(2026, 5, 30),
         )
 
@@ -162,11 +165,12 @@ class MissionAssignmentRotationTests(unittest.TestCase):
             ["eligible", "recently-completed"],
         )
 
-    def test_recent_completion_uses_hkt_local_date_for_cooldown(self):
+    def test_recent_completion_uses_client_local_date_for_cooldown(self):
         self.assertTrue(
             _was_completed_recently(
                 datetime(2026, 5, 29, 18, 0, tzinfo=timezone.utc),
                 assignment_date=date(2026, 6, 5),
+                client_local_day=ClientLocalDay(date(2026, 6, 5), -8 * 60),
             )
         )
 

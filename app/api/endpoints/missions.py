@@ -1,7 +1,7 @@
 """
 Mission endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 import sqlalchemy as sa
 from sqlalchemy import select
@@ -11,6 +11,7 @@ import uuid
 
 from app.db.session import get_db
 from app.core.config import settings
+from app.core.local_time import ClientLocalDay, get_client_local_day
 from app.schemas.content import (
     AssignedMissionResponse,
     MissionCreate,
@@ -53,7 +54,6 @@ DEFAULT_MISSION_ASSIGNMENT_REPEAT_COOLDOWN_DAYS = (
 MISSION_DAILY_POINTS = 10
 MISSION_OFFLINE_POINTS = 15
 MISSION_WEEKLY_GOAL = 5
-HKT = timezone(timedelta(hours=8), name="HKT")
 
 MISSION_LEVELS = [
     {"level": 1, "title": "陪跑新手", "min_points": 0},
@@ -68,11 +68,6 @@ def _ensure_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
-
-
-def _current_hkt_date(now_utc: datetime | None = None) -> date:
-    resolved_now = _ensure_utc(now_utc) if now_utc else datetime.now(timezone.utc)
-    return resolved_now.astimezone(HKT).date()
 
 
 def _enum_value(value):
@@ -514,11 +509,13 @@ def _was_completed_recently(
     completed_at: datetime | None,
     *,
     assignment_date: date,
+    client_local_day: ClientLocalDay | None = None,
 ) -> bool:
     if completed_at is None:
         return False
 
-    completed_local_date = _ensure_utc(completed_at).astimezone(HKT).date()
+    local_day = client_local_day or ClientLocalDay(date.today(), 0)
+    completed_local_date = local_day.date_for_timestamp(_ensure_utc(completed_at))
     return (
         assignment_date - completed_local_date
     ).days < MISSION_COMPLETION_COOLDOWN_DAYS
@@ -605,6 +602,7 @@ def _rank_candidate_missions(
     *,
     assignment_history: dict[str, tuple[date | None, datetime | None]],
     assignment_date: date,
+    client_local_day: ClientLocalDay | None = None,
 ) -> list[Mission]:
     def mission_sort_key(mission: Mission) -> tuple:
         last_assignment_date, last_completed_at = assignment_history.get(
@@ -614,6 +612,7 @@ def _rank_candidate_missions(
         recently_completed = _was_completed_recently(
             last_completed_at,
             assignment_date=assignment_date,
+            client_local_day=client_local_day,
         )
 
         return (
@@ -634,6 +633,7 @@ async def _generate_assignments_for_date(
     assignment_date: date,
     is_offline: bool,
     surfaces: list[MissionSurface],
+    client_local_day: ClientLocalDay,
     db: AsyncSession,
 ) -> None:
     child_age = calculate_child_age(
@@ -668,6 +668,7 @@ async def _generate_assignments_for_date(
         candidate_missions,
         assignment_history=assignment_history,
         assignment_date=assignment_date,
+        client_local_day=client_local_day,
     )
     eligible_missions = (
         _filter_daily_rotation_candidates(
@@ -823,6 +824,7 @@ async def _generate_assignments_for_date(
                 "deferred_recent_completion": _was_completed_recently(
                     last_completed_at,
                     assignment_date=assignment_date,
+                    client_local_day=client_local_day,
                 ),
                 "is_cluster": is_cluster,
                 "cluster_id": mission_metadata.get("cluster_id"),
@@ -871,6 +873,7 @@ async def _get_assigned_or_catalog_missions(
     assignment_date: date,
     is_offline: bool,
     surfaces: list[MissionSurface],
+    client_local_day: ClientLocalDay,
     db: AsyncSession,
 ) -> list[dict]:
     assigned_result = await db.execute(
@@ -895,6 +898,7 @@ async def _get_assigned_or_catalog_missions(
             assignment_date=assignment_date,
             is_offline=is_offline,
             surfaces=surfaces,
+            client_local_day=client_local_day,
             db=db,
         )
         assigned_result = await db.execute(
@@ -930,6 +934,7 @@ async def _get_assigned_or_catalog_missions(
 @router.get("/daily/{child_id}", response_model=List[AssignedMissionResponse])
 async def get_daily_missions(
     child_id: str,
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -938,9 +943,10 @@ async def get_daily_missions(
 
     return await _get_assigned_or_catalog_missions(
         child=child,
-        assignment_date=_current_hkt_date(),
+        assignment_date=get_client_local_day(request).date,
         is_offline=False,
         surfaces=[MissionSurface.CHILD, MissionSurface.BOTH],
+        client_local_day=get_client_local_day(request),
         db=db,
     )
 
@@ -948,6 +954,7 @@ async def get_daily_missions(
 @router.get("/offline/{child_id}", response_model=List[AssignedMissionResponse])
 async def get_offline_missions(
     child_id: str,
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -956,9 +963,10 @@ async def get_offline_missions(
 
     return await _get_assigned_or_catalog_missions(
         child=child,
-        assignment_date=_current_hkt_date(),
+        assignment_date=get_client_local_day(request).date,
         is_offline=True,
         surfaces=[MissionSurface.PARENT, MissionSurface.BOTH],
+        client_local_day=get_client_local_day(request),
         db=db,
     )
 
@@ -971,12 +979,13 @@ async def get_offline_missions(
 async def create_parent_micro_mission(
     child_id: str,
     payload: ParentMicroMissionCreate,
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a short parent-authored mission and assign it for today's child mode."""
     child = await _ensure_child_belongs_to_user(child_id, current_user, db)
-    assignment_date = _current_hkt_date()
+    assignment_date = get_client_local_day(request).date
 
     target_words = _normalize_string_list(
         payload.target_words,
@@ -1086,12 +1095,13 @@ async def create_parent_micro_mission(
 @router.get("/{child_id}/summary", response_model=MissionSummaryResponse)
 async def get_mission_summary(
     child_id: str,
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Get mission completion history and derived incentive summary for a child."""
     child = await _ensure_child_belongs_to_user(child_id, current_user, db)
-    local_today = _current_hkt_date()
+    local_today = get_client_local_day(request).date
 
     completed_result = await db.execute(
         select(MissionAssignment, Mission)
@@ -1121,6 +1131,7 @@ async def complete_mission(
     mission_id: str,
     child_id: str,
     progress_data: MissionProgressUpdate,
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -1156,7 +1167,7 @@ async def complete_mission(
     progress.parent_notes = progress_data.parent_notes
     progress.completed_date = now if progress_data.completed else None
 
-    assignment_date = _current_hkt_date(now)
+    assignment_date = get_client_local_day(request).date
     assignment_result = await db.execute(
         select(MissionAssignment).where(
             MissionAssignment.child_id == child_id,

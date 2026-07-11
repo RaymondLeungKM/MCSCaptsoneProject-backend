@@ -15,6 +15,7 @@ import uuid
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.local_time import get_active_client_local_day
 from app.models.analytics_foundation import (
     AnalyticsEventLog,
     ChildDayAnalytics,
@@ -22,9 +23,6 @@ from app.models.analytics_foundation import (
     MissionOutcomeAnalytics,
 )
 from app.models.user import Child
-
-
-HKT = timezone(timedelta(hours=8), name="HKT")
 
 
 class AnalyticsEventType(str, Enum):
@@ -103,10 +101,10 @@ def _normalize_event_type(value: AnalyticsEventType | str) -> str:
     return str(value)
 
 
-def _to_hkt_day(occurred_at: datetime) -> date:
+def _to_client_local_day(occurred_at: datetime) -> date:
     if occurred_at.tzinfo is None:
         occurred_at = occurred_at.replace(tzinfo=timezone.utc)
-    return occurred_at.astimezone(HKT).date()
+    return get_active_client_local_day().date_for_timestamp(occurred_at)
 
 
 async def _get_child_and_age_band(db: AsyncSession, child_id: str | None) -> tuple[Child | None, str]:
@@ -366,7 +364,7 @@ async def write_analytics_event(
             return None
 
     _, age_band = await _get_child_and_age_band(db, event.child_id)
-    activity_day = _to_hkt_day(occurred_at)
+    activity_day = _to_client_local_day(occurred_at)
 
     event_id = str(uuid.uuid4())
     log = AnalyticsEventLog(
