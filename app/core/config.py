@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # Graph-informed spaced-repetition queue policy
     REVIEW_QUEUE_POLICY_VERSION: str = "graph_reranker_v2"
     REVIEW_QUEUE_CANDIDATE_POOL_MULTIPLIER: int = 3
-    REVIEW_QUEUE_MAX_CANDIDATE_POOL: int = 100
+    REVIEW_QUEUE_MAX_CANDIDATE_POOL: int = 15
     REVIEW_QUEUE_URGENCY_WEIGHT: float = 0.55
     REVIEW_QUEUE_LEARNER_NEED_WEIGHT: float = 0.25
     REVIEW_QUEUE_GRAPH_WEIGHT: float = 0.15

@@ -22,6 +22,12 @@ def make_card(word_id: str) -> SimpleNamespace:
 
 
 class ReviewQueuePolicyTests(unittest.TestCase):
+    def test_candidate_pool_cap_matches_maximum_five_card_session(self):
+        policy = ReviewQueuePolicy()
+
+        self.assertEqual(policy.candidate_pool_multiplier, 3)
+        self.assertEqual(policy.max_candidate_pool, 15)
+
     def test_resolve_primary_reason_favors_weak_link_then_bridge_then_due(self):
         self.assertEqual(
             _resolve_primary_reason(

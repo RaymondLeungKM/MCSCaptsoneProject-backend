@@ -96,7 +96,7 @@ class ReviewQueuePolicy:
     quick_win_weight: float = 0.05
     diversity_lambda: float = 0.18
     critical_urgency_threshold: float = 0.85
-    max_candidate_pool: int = 100
+    max_candidate_pool: int = 15
     max_graph_candidates: int = 0
 
 
