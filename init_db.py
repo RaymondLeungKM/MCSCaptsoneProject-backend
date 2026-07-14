@@ -9,11 +9,10 @@ load_dotenv()
 db_url = os.getenv('DATABASE_URL')
 print(f"DATABASE_URL from env: {db_url}")
 
-if not db_url or 'vocab_user' not in db_url:
-    print("ERROR: DATABASE_URL not loaded correctly from .env file!")
-    print("Please check that .env file exists and contains:")
-    print("DATABASE_URL=postgresql+asyncpg://vocab_user:postgres2026@localhost/preschool_vocab_db")
-    print("ASYNC_DATABASE_URL=postgresql+asyncpg://vocab_user:postgres2026@localhost/preschool_vocab_db")
+if not db_url:
+    print("ERROR: DATABASE_URL not loaded from the environment or .env file!")
+    print("Please check that your .env file exists and contains:")
+    print("DATABASE_URL=postgresql+asyncpg://<username>:<password>@localhost/<db_name>")
     exit(1)
 
 from app.db.session import engine
@@ -26,7 +25,6 @@ from app.models import analytics  # noqa: F401
 from app.models import parent_analytics  # noqa: F401
 from app.models import generated_sentences  # noqa: F401
 from app.models import daily_words  # noqa: F401
-from app.models import word_personalization  # noqa: F401
 
 async def init_db():
     print("Creating database tables...")
