@@ -16,9 +16,9 @@ from app.schemas.content import (
     AssignedMissionResponse,
     MissionCreate,
     MissionCompletionHistoryItem,
+    MissionCompletionResponse,
+    MissionCompletionUpdate,
     ParentMicroMissionCreate,
-    MissionProgressResponse,
-    MissionProgressUpdate,
     MissionResponse,
     MissionSummaryResponse,
     MissionUpdate,
@@ -29,7 +29,6 @@ from app.models.content import (
     MissionAssignment,
     MissionAssignmentSource,
     MissionAssignmentStatus,
-    MissionProgress,
     MissionStatus,
     MissionSurface,
 )
@@ -240,22 +239,11 @@ async def _ensure_child_belongs_to_user(
     return child
 
 
-async def _get_progress_map(
-    child_id: str,
-    db: AsyncSession,
-) -> dict[str, MissionProgress]:
-    result = await db.execute(
-        select(MissionProgress).where(MissionProgress.child_id == child_id)
-    )
-    return {progress.mission_id: progress for progress in result.scalars().all()}
-
-
 def _serialize_assigned_mission(
     mission: Mission,
     child_id: str,
     assignment_date: date,
     assignment: MissionAssignment | None = None,
-    progress: MissionProgress | None = None,
 ) -> dict:
     if assignment:
         assignment_status = assignment.status
@@ -265,11 +253,6 @@ def _serialize_assigned_mission(
         assignment_status = MissionAssignmentStatus.ASSIGNED
         completed_at = None
         completion_notes = None
-
-        if progress and progress.completed:
-            assignment_status = MissionAssignmentStatus.COMPLETED
-            completed_at = progress.completed_date
-            completion_notes = progress.parent_notes
 
     assignment_payload = {
         "id": assignment.id if assignment else f"{mission.id}:{assignment_date.isoformat()}",
@@ -890,8 +873,6 @@ async def _get_assigned_or_catalog_missions(
         .order_by(MissionAssignment.priority.asc(), Mission.sort_order.asc())
     )
     assigned_rows = assigned_result.all()
-    progress_map = await _get_progress_map(child.id, db)
-
     if not assigned_rows:
         await _generate_assignments_for_date(
             child=child,
@@ -923,7 +904,6 @@ async def _get_assigned_or_catalog_missions(
                 child_id=child.id,
                 assignment_date=assignment_date,
                 assignment=assignment,
-                progress=progress_map.get(mission.id),
             )
             for assignment, mission in assigned_rows
         ]
@@ -1126,11 +1106,11 @@ async def get_mission_summary(
     )
 
 
-@router.post("/{mission_id}/complete/{child_id}", response_model=MissionProgressResponse)
+@router.post("/{mission_id}/complete/{child_id}", response_model=MissionCompletionResponse)
 async def complete_mission(
     mission_id: str,
     child_id: str,
-    progress_data: MissionProgressUpdate,
+    completion_data: MissionCompletionUpdate,
     request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
@@ -1146,27 +1126,7 @@ async def complete_mission(
             detail="Mission not found",
         )
 
-    # Get or create mission progress
-    result = await db.execute(
-        select(MissionProgress).where(
-            MissionProgress.child_id == child_id,
-            MissionProgress.mission_id == mission_id
-        )
-    )
-    progress = result.scalar_one_or_none()
-    
-    if not progress:
-        progress = MissionProgress(
-            child_id=child_id,
-            mission_id=mission_id
-        )
-        db.add(progress)
-
     now = datetime.now(timezone.utc)
-    progress.completed = progress_data.completed
-    progress.parent_notes = progress_data.parent_notes
-    progress.completed_date = now if progress_data.completed else None
-
     assignment_date = get_client_local_day(request).date
     assignment_result = await db.execute(
         select(MissionAssignment).where(
@@ -1190,25 +1150,25 @@ async def complete_mission(
 
     assignment.status = (
         MissionAssignmentStatus.COMPLETED
-        if progress_data.completed
+        if completion_data.completed
         else MissionAssignmentStatus.ASSIGNED
     )
-    assignment.completed_at = now if progress_data.completed else None
+    assignment.completed_at = now if completion_data.completed else None
     assignment.skipped_at = None
-    assignment.completion_notes = progress_data.parent_notes
+    assignment.completion_notes = completion_data.parent_notes
 
-    if progress_data.completed:
+    if completion_data.completed:
         assignment.started_at = assignment.started_at or now
     
     await db.commit()
-    await db.refresh(progress)
+    await db.refresh(assignment)
 
     event_type = (
         AnalyticsEventType.MISSION_COMPLETED
-        if progress_data.completed
+        if completion_data.completed
         else AnalyticsEventType.MISSION_ASSIGNED
     )
-    key_prefix = "mission-completed" if progress_data.completed else "mission-assigned"
+    key_prefix = "mission-completed" if completion_data.completed else "mission-assigned"
     await write_analytics_event(
         db,
         AnalyticsEventInput(
@@ -1231,4 +1191,9 @@ async def complete_mission(
         ),
     )
 
-    return progress
+    return MissionCompletionResponse(
+        mission_id=assignment.mission_id,
+        completed=assignment.is_completed,
+        completed_date=assignment.completed_at,
+        parent_notes=assignment.completion_notes,
+    )

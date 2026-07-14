@@ -1,11 +1,11 @@
 """
 Progress tracking endpoints
 """
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import uuid
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -190,19 +190,6 @@ def _sum_interval_minutes(intervals: List[tuple[datetime, datetime]]) -> int:
         _duration_minutes(start_time, end_time)
         for start_time, end_time in _merge_intervals(intervals)
     )
-
-
-def _build_local_day_window(
-    local_day: date | None,
-    timezone_offset_minutes: int,
-) -> tuple[date, datetime, datetime]:
-    resolved_day = local_day or datetime.now(timezone.utc).date()
-    local_start = datetime.combine(resolved_day, time.min)
-    utc_start = (local_start + timedelta(minutes=timezone_offset_minutes)).replace(
-        tzinfo=timezone.utc
-    )
-    utc_end = utc_start + timedelta(days=1)
-    return resolved_day, utc_start, utc_end
 
 
 @router.post("/session", response_model=LearningSessionResponse)
@@ -583,8 +570,7 @@ async def get_progress_stats(
 @router.get("/{child_id}/usage-status", response_model=LearningControlStatusResponse)
 async def get_learning_control_status(
     child_id: str,
-    local_date: date | None = Query(default=None),
-    timezone_offset_minutes: int = Query(default=0),
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -600,9 +586,11 @@ async def get_learning_control_status(
             detail="Child not found"
         )
 
-    resolved_day, day_start_utc, day_end_utc = _build_local_day_window(
-        local_day=local_date,
-        timezone_offset_minutes=timezone_offset_minutes,
+    client_local_day = get_client_local_day(request)
+    resolved_day = client_local_day.date
+    day_start_utc, day_end_utc = client_local_day.utc_bounds(
+        resolved_day,
+        resolved_day,
     )
     now_utc = datetime.now(timezone.utc)
 

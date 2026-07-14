@@ -186,18 +186,6 @@ class MissionAssignment(Base):
         ),
     )
 
-
-class MissionProgress(Base):
-    """Child's mission completion"""
-    __tablename__ = "mission_progress"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    child_id = Column(String, ForeignKey("children.id"), nullable=False)
-    mission_id = Column(String, ForeignKey("missions.id"), nullable=False)
-    
-    completed = Column(Boolean, default=False)
-    completed_date = Column(DateTime(timezone=True))
-    parent_notes = Column(Text)
-    
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    @property
+    def is_completed(self) -> bool:
+        return self.status == MissionAssignmentStatus.COMPLETED

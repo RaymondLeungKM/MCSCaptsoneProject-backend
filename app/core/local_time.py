@@ -1,37 +1,42 @@
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import Request
+
+
+HKT_TIMEZONE = ZoneInfo("Asia/Hong_Kong")
+HKT_TIMEZONE_OFFSET_MINUTES = -8 * 60
+
+
+def _hkt_today() -> date:
+    return datetime.now(HKT_TIMEZONE).date()
 
 
 @dataclass(frozen=True)
 class ClientLocalDay:
     date: date
-    timezone_offset_minutes: int
+    timezone_offset_minutes: int = HKT_TIMEZONE_OFFSET_MINUTES
 
     @property
     def start_utc(self) -> datetime:
-        local_start = datetime.combine(self.date, time.min)
-        return (local_start + timedelta(minutes=self.timezone_offset_minutes)).replace(
-            tzinfo=timezone.utc
-        )
+        local_start = datetime.combine(self.date, time.min, tzinfo=HKT_TIMEZONE)
+        return local_start.astimezone(timezone.utc)
 
     @property
     def end_utc(self) -> datetime:
         return self.start_utc + timedelta(days=1)
 
     def utc_bounds(self, start_date: date, end_date: date) -> tuple[datetime, datetime]:
-        start = ClientLocalDay(start_date, self.timezone_offset_minutes).start_utc
-        end = ClientLocalDay(
-            end_date + timedelta(days=1), self.timezone_offset_minutes
-        ).start_utc
+        start = ClientLocalDay(start_date).start_utc
+        end = ClientLocalDay(end_date + timedelta(days=1)).start_utc
         return start, end
 
     def date_for_timestamp(self, value: datetime) -> date:
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
-        return (value - timedelta(minutes=self.timezone_offset_minutes)).date()
+        return value.astimezone(HKT_TIMEZONE).date()
 
 
 _active_client_local_day: ContextVar[ClientLocalDay | None] = ContextVar(
@@ -39,25 +44,8 @@ _active_client_local_day: ContextVar[ClientLocalDay | None] = ContextVar(
 )
 
 
-def get_client_local_day(request: Request) -> ClientLocalDay:
-    raw_date = request.headers.get("x-client-local-date")
-    raw_offset = request.headers.get("x-client-timezone-offset-minutes")
-
-    try:
-        local_date = date.fromisoformat(raw_date) if raw_date else None
-    except ValueError:
-        local_date = None
-
-    try:
-        timezone_offset_minutes = int(raw_offset) if raw_offset is not None else 0
-    except ValueError:
-        timezone_offset_minutes = 0
-
-    timezone_offset_minutes = max(min(timezone_offset_minutes, 14 * 60), -12 * 60)
-    return ClientLocalDay(
-        date=local_date or datetime.now(timezone.utc).date(),
-        timezone_offset_minutes=timezone_offset_minutes,
-    )
+def get_client_local_day(_request: Request) -> ClientLocalDay:
+    return ClientLocalDay(date=_hkt_today())
 
 
 def bind_client_local_day(request: Request) -> ClientLocalDay:
@@ -67,7 +55,4 @@ def bind_client_local_day(request: Request) -> ClientLocalDay:
 
 
 def get_active_client_local_day() -> ClientLocalDay:
-    return _active_client_local_day.get() or ClientLocalDay(
-        date=datetime.now(timezone.utc).date(),
-        timezone_offset_minutes=0,
-    )
+    return _active_client_local_day.get() or ClientLocalDay(date=_hkt_today())

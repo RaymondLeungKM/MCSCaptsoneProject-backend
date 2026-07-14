@@ -177,7 +177,7 @@ class MissionResponse(MissionBase):
         from_attributes = True
 
 
-class MissionProgressResponse(BaseModel):
+class MissionCompletionResponse(BaseModel):
     mission_id: str
     completed: bool
     completed_date: Optional[datetime] = None
@@ -187,7 +187,7 @@ class MissionProgressResponse(BaseModel):
         from_attributes = True
 
 
-class MissionProgressUpdate(BaseModel):
+class MissionCompletionUpdate(BaseModel):
     completed: bool
     parent_notes: Optional[str] = None
 
