@@ -1178,7 +1178,7 @@ async def complete_mission(
             mission_id=mission_id,
             occurred_at=now,
             source="api.missions.complete_mission",
-            idempotency_key=f"{key_prefix}:{assignment.id}:{int(progress_data.completed)}",
+            idempotency_key=f"{key_prefix}:{assignment.id}:{int(completion_data.completed)}",
             payload={
                 "assignment_id": assignment.id,
                 "context": mission.context.value,
