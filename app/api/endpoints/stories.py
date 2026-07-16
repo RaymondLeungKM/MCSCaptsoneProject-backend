@@ -2,7 +2,7 @@
 Curated story management endpoints.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import time
 import uuid
@@ -24,6 +24,22 @@ from app.services.story_audio_metadata import build_story_payload, resolve_story
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _to_naive_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _to_aware_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _default_story_ssml(story_text: str) -> str:
@@ -59,9 +75,9 @@ def _apply_generated_story_enrichment(
 ) -> None:
     _apply_generated_audio_fields(story, generated_audio_result)
 
-    generated_at = generated_audio_result.generated_at or datetime.utcnow()
-    story.generated_at = generated_at
-    story.generation_date = generated_at
+    generated_at = generated_audio_result.generated_at or datetime.now(timezone.utc)
+    story.generated_at = _to_naive_utc(generated_at)
+    story.generation_date = _to_aware_utc(generated_at)
 
     story.story_generate_provdier = story.story_generate_provdier or "external_story_program"
     story.story_generate_model = generated_audio_result.llm_model or story.story_generate_model
@@ -139,8 +155,8 @@ def _normalize_curated_story_fields(story: GeneratedStory, *, external_flow_expe
 
     story.audio_duration_seconds = resolve_story_audio_duration_seconds(story)
 
-    if not story.generation_date:
-        story.generation_date = story.generated_at or datetime.utcnow()
+    story.generated_at = _to_naive_utc(story.generated_at) or datetime.utcnow()
+    story.generation_date = _to_aware_utc(story.generation_date) or datetime.now(timezone.utc)
 
 
 async def _get_story_or_404(db: AsyncSession, story_id: str) -> GeneratedStory:
@@ -205,7 +221,7 @@ async def create_admin_story(
         title=story_data.title,
         title_english=story_data.title_english,
         theme=story_data.theme,
-        generated_at=story_data.generated_at or datetime.utcnow(),
+        generated_at=_to_naive_utc(story_data.generated_at) or datetime.utcnow(),
         generated_by=story_data.generated_by or "admin",
         content_cantonese=story_data.content_cantonese,
         content_english=story_data.content_english,
@@ -283,6 +299,7 @@ async def update_admin_story(
     story.title_english = story_data.title_english or story.title_english
     story.theme = story_data.theme
     story.generated_at = story_data.generated_at or story.generated_at
+    story.generated_at = _to_naive_utc(story.generated_at)
     story.generated_by = story_data.generated_by or story.generated_by
     story.content_cantonese = story_data.content_cantonese
     story.content_english = story_data.content_english
