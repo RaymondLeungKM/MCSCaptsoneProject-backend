@@ -3,6 +3,7 @@ Curated story management endpoints.
 """
 
 from datetime import datetime
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -14,13 +15,40 @@ from app.db.session import get_db
 from app.models.daily_words import GeneratedStory
 from app.models.user import User
 from app.schemas.stories import GeneratedStoryCreate, GeneratedStoryResponse
+from app.services.external_story_program_service import (
+    ExternalStoryProgramError,
+    external_story_program_service,
+)
 from app.services.story_audio_metadata import build_story_payload
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _default_story_ssml(story_text: str) -> str:
     return f"<speak>{story_text}</speak>"
+
+
+def _should_autogenerate_story_audio(story_data: GeneratedStoryCreate, story_text: str) -> bool:
+    incoming_audio_filename = (story_data.audio_filename or "").strip().lower()
+    incoming_ssml = (story_data.story_text_ssml or "").strip()
+    expected_default_ssml = _default_story_ssml(story_text).strip()
+
+    return (
+        not incoming_audio_filename
+        or incoming_audio_filename == "curated-story.mp3"
+        or not incoming_ssml
+        or incoming_ssml == expected_default_ssml
+    )
+
+
+def _apply_generated_audio_fields(story: GeneratedStory, generated_audio_result) -> None:
+    story.story_text_ssml = generated_audio_result.story_text_ssml or _default_story_ssml(story.story_text)
+    story.audio_url = generated_audio_result.audio_url
+    story.audio_filename = generated_audio_result.audio_filename
+    story.page_audio_segments = generated_audio_result.page_audio_segments or None
+    story.audio_generate_provider = generated_audio_result.tts_provider
+    story.audio_generate_voice_name = generated_audio_result.voice_name
 
 
 async def _get_story_or_404(db: AsyncSession, story_id: str) -> GeneratedStory:
@@ -118,6 +146,17 @@ async def create_admin_story(
         sort_order=story_data.sort_order,
     )
 
+    if _should_autogenerate_story_audio(story_data, story_text):
+        try:
+            generated_audio_result = external_story_program_service.invoke_from_story_text(story_text)
+            _apply_generated_audio_fields(story, generated_audio_result)
+        except ExternalStoryProgramError as error:
+            logger.warning(
+                "Admin story save skipped external audio generation for story %s: %s",
+                story.id,
+                error,
+            )
+
     db.add(story)
     await db.commit()
     await db.refresh(story)
@@ -174,6 +213,17 @@ async def update_admin_story(
     story.generation_time_seconds = story_data.generation_time_seconds
     story.is_active = story_data.is_active
     story.sort_order = story_data.sort_order
+
+    if _should_autogenerate_story_audio(story_data, story_text):
+        try:
+            generated_audio_result = external_story_program_service.invoke_from_story_text(story_text)
+            _apply_generated_audio_fields(story, generated_audio_result)
+        except ExternalStoryProgramError as error:
+            logger.warning(
+                "Admin story update skipped external audio generation for story %s: %s",
+                story.id,
+                error,
+            )
 
     await db.commit()
     await db.refresh(story)
