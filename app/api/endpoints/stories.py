@@ -4,6 +4,7 @@ Curated story management endpoints.
 
 from datetime import datetime
 import logging
+import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -19,7 +20,7 @@ from app.services.external_story_program_service import (
     ExternalStoryProgramError,
     external_story_program_service,
 )
-from app.services.story_audio_metadata import build_story_payload
+from app.services.story_audio_metadata import build_story_payload, resolve_story_audio_duration_seconds
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -49,6 +50,97 @@ def _apply_generated_audio_fields(story: GeneratedStory, generated_audio_result)
     story.page_audio_segments = generated_audio_result.page_audio_segments or None
     story.audio_generate_provider = generated_audio_result.tts_provider
     story.audio_generate_voice_name = generated_audio_result.voice_name
+
+
+def _apply_generated_story_enrichment(
+    story: GeneratedStory,
+    generated_audio_result,
+    generation_time_seconds: float,
+) -> None:
+    _apply_generated_audio_fields(story, generated_audio_result)
+
+    generated_at = generated_audio_result.generated_at or datetime.utcnow()
+    story.generated_at = generated_at
+    story.generation_date = generated_at
+
+    story.story_generate_provdier = story.story_generate_provdier or "external_story_program"
+    story.story_generate_model = generated_audio_result.llm_model or story.story_generate_model
+    story.ai_model = generated_audio_result.llm_model or story.ai_model
+
+    normalized_text = (story.story_text or "").strip()
+    story.word_count = len(normalized_text) if normalized_text else story.word_count
+    story.generation_time_seconds = generation_time_seconds
+    story.generation_prompt = (
+        story.generation_prompt
+        or "External story program invoked from admin curated story save/update"
+    )
+
+    story.audio_duration_seconds = resolve_story_audio_duration_seconds(
+        GeneratedStory(
+            audio_url=story.audio_url,
+            audio_filename=story.audio_filename,
+            audio_duration_seconds=story.audio_duration_seconds,
+            reading_time_minutes=story.reading_time_minutes,
+            content_cantonese=story.content_cantonese,
+            story_text=story.story_text,
+        )
+    )
+
+    if story.read_count is None:
+        story.read_count = 0
+    if story.is_favorite is None:
+        story.is_favorite = False
+    if story.parent_approved is None:
+        story.parent_approved = True
+
+
+def _build_default_word_usage(featured_words: list[str] | None) -> dict[str, str] | None:
+    if not featured_words:
+        return None
+
+    normalized_words = [word.strip() for word in featured_words if isinstance(word, str) and word.strip()]
+    if not normalized_words:
+        return None
+
+    return {
+        word: "Used naturally in this curated story context."
+        for word in normalized_words
+    }
+
+
+def _normalize_curated_story_fields(story: GeneratedStory, *, external_flow_expected: bool) -> None:
+    normalized_text = (story.story_text or "").strip()
+    if normalized_text:
+        story.word_count = len(normalized_text)
+
+    if not story.title_english:
+        story.title_english = story.title
+
+    if not story.story_generate_provdier:
+        story.story_generate_provdier = "external_story_program" if external_flow_expected else "admin_curated"
+
+    if not story.story_generate_model:
+        story.story_generate_model = story.ai_model or story.story_generate_provdier
+
+    if not story.ai_model:
+        story.ai_model = story.story_generate_model or story.story_generate_provdier
+
+    if not story.generation_prompt:
+        trigger_source = "external_program" if external_flow_expected else "admin_manual"
+        story.generation_prompt = f"Curated story saved via admin API ({trigger_source})"
+
+    if not story.vocab_used:
+        featured_words = [word for word in (story.featured_words or []) if isinstance(word, str) and word.strip()]
+        if featured_words:
+            story.vocab_used = ", ".join(featured_words)
+
+    if not story.word_usage:
+        story.word_usage = _build_default_word_usage(story.featured_words)
+
+    story.audio_duration_seconds = resolve_story_audio_duration_seconds(story)
+
+    if not story.generation_date:
+        story.generation_date = story.generated_at or datetime.utcnow()
 
 
 async def _get_story_or_404(db: AsyncSession, story_id: str) -> GeneratedStory:
@@ -146,16 +238,24 @@ async def create_admin_story(
         sort_order=story_data.sort_order,
     )
 
-    if _should_autogenerate_story_audio(story_data, story_text):
+    should_autogenerate = _should_autogenerate_story_audio(story_data, story_text)
+    if should_autogenerate:
         try:
+            generation_started = time.perf_counter()
             generated_audio_result = external_story_program_service.invoke_from_story_text(story_text)
-            _apply_generated_audio_fields(story, generated_audio_result)
+            _apply_generated_story_enrichment(
+                story,
+                generated_audio_result,
+                generation_time_seconds=time.perf_counter() - generation_started,
+            )
         except ExternalStoryProgramError as error:
             logger.warning(
                 "Admin story save skipped external audio generation for story %s: %s",
                 story.id,
                 error,
             )
+
+    _normalize_curated_story_fields(story, external_flow_expected=should_autogenerate)
 
     db.add(story)
     await db.commit()
@@ -177,23 +277,23 @@ async def update_admin_story(
     story_text = (story_data.story_text or story_data.content_cantonese).strip()
     story_ssml = (story_data.story_text_ssml or _default_story_ssml(story_text)).strip()
 
-    story.child_id = story_data.child_id
+    story.child_id = story_data.child_id or story.child_id
     story.story_type = "curated"
     story.title = story_data.title
-    story.title_english = story_data.title_english
+    story.title_english = story_data.title_english or story.title_english
     story.theme = story_data.theme
     story.generated_at = story_data.generated_at or story.generated_at
     story.generated_by = story_data.generated_by or story.generated_by
     story.content_cantonese = story_data.content_cantonese
     story.content_english = story_data.content_english
     story.jyutping = story_data.jyutping
-    story.vocab_used = story_data.vocab_used
+    story.vocab_used = story_data.vocab_used or story.vocab_used
     story.story_text = story_text
     story.story_text_ssml = story_ssml
-    story.story_generate_provdier = story_data.story_generate_provdier
-    story.story_generate_model = story_data.story_generate_model
+    story.story_generate_provdier = story_data.story_generate_provdier or story.story_generate_provdier
+    story.story_generate_model = story_data.story_generate_model or story.story_generate_model
     story.featured_words = story_data.featured_words
-    story.word_usage = story_data.word_usage
+    story.word_usage = story_data.word_usage or story.word_usage
     story.audio_url = story_data.audio_url
     story.audio_duration_seconds = story_data.audio_duration_seconds
     story.audio_filename = story_data.audio_filename or story.audio_filename
@@ -208,22 +308,30 @@ async def update_admin_story(
     story.word_count = story_data.word_count
     story.difficulty_level = story_data.difficulty_level
     story.cultural_references = story_data.cultural_references
-    story.ai_model = story_data.ai_model
-    story.generation_prompt = story_data.generation_prompt
+    story.ai_model = story_data.ai_model or story.ai_model
+    story.generation_prompt = story_data.generation_prompt or story.generation_prompt
     story.generation_time_seconds = story_data.generation_time_seconds
     story.is_active = story_data.is_active
     story.sort_order = story_data.sort_order
 
-    if _should_autogenerate_story_audio(story_data, story_text):
+    should_autogenerate = _should_autogenerate_story_audio(story_data, story_text)
+    if should_autogenerate:
         try:
+            generation_started = time.perf_counter()
             generated_audio_result = external_story_program_service.invoke_from_story_text(story_text)
-            _apply_generated_audio_fields(story, generated_audio_result)
+            _apply_generated_story_enrichment(
+                story,
+                generated_audio_result,
+                generation_time_seconds=time.perf_counter() - generation_started,
+            )
         except ExternalStoryProgramError as error:
             logger.warning(
                 "Admin story update skipped external audio generation for story %s: %s",
                 story.id,
                 error,
             )
+
+    _normalize_curated_story_fields(story, external_flow_expected=should_autogenerate)
 
     await db.commit()
     await db.refresh(story)
