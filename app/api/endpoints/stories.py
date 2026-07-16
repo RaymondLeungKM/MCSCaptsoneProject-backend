@@ -4,6 +4,7 @@ Curated story management endpoints.
 
 from datetime import datetime, timezone
 import logging
+import re
 import time
 import uuid
 
@@ -11,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.security import get_current_admin_user
 from app.db.session import get_db
 from app.models.daily_words import GeneratedStory
@@ -46,6 +48,67 @@ def _default_story_ssml(story_text: str) -> str:
     return f"<speak>{story_text}</speak>"
 
 
+def _configured_story_provider() -> str:
+    return (settings.LLM_PROVIDER or "unknown").strip().lower()
+
+
+def _configured_story_model() -> str:
+    provider = _configured_story_provider()
+    if provider == "openrouter":
+        model = (settings.OPENROUTER_MODEL or "").strip()
+    elif provider == "ollama":
+        model = (settings.OLLAMA_MODEL or "").strip()
+    elif provider == "openai":
+        model = (getattr(settings, "OPENAI_MODEL", "") or "").strip()
+    elif provider == "anthropic":
+        model = (getattr(settings, "ANTHROPIC_MODEL", "") or "").strip()
+    else:
+        model = ""
+
+    return model or "unknown"
+
+
+def _split_keywords(raw_value: str | None) -> list[str]:
+    if not raw_value:
+        return []
+
+    return [
+        token.strip()
+        for token in re.split(r"[,，、;；\n]+", raw_value)
+        if token and token.strip()
+    ]
+
+
+def _extract_story_keywords(story: GeneratedStory) -> list[str]:
+    keywords: list[str] = []
+
+    for entry in story.featured_words or []:
+        if isinstance(entry, str):
+            keywords.extend(_split_keywords(entry))
+
+    keywords.extend(_split_keywords(story.vocab_used))
+
+    deduped: list[str] = []
+    for keyword in keywords:
+        if keyword not in deduped:
+            deduped.append(keyword)
+
+    return deduped
+
+
+def _build_generation_prompt(story: GeneratedStory) -> str:
+    gen_source = _to_aware_utc(story.generation_date) or _to_aware_utc(story.generated_at) or datetime.now(timezone.utc)
+    gen_date = gen_source.strftime("%Y-%m-%d")
+    story_cat = (story.theme or "curated").strip() or "curated"
+    vocab_words = _extract_story_keywords(story)
+    vocab_display = ", ".join(vocab_words) if vocab_words else "N/A"
+    child_display = story.child_id or "unknown"
+    return (
+        f"Admin curated story generation for child={child_display}, "
+        f"gen_date={gen_date}, story_cat={story_cat}, vocab={vocab_display}"
+    )
+
+
 def _should_autogenerate_story_audio(story_data: GeneratedStoryCreate, story_text: str) -> bool:
     incoming_audio_filename = (story_data.audio_filename or "").strip().lower()
     incoming_ssml = (story_data.story_text_ssml or "").strip()
@@ -79,17 +142,15 @@ def _apply_generated_story_enrichment(
     story.generated_at = _to_naive_utc(generated_at)
     story.generation_date = _to_aware_utc(generated_at)
 
-    story.story_generate_provdier = story.story_generate_provdier or "external_story_program"
-    story.story_generate_model = generated_audio_result.llm_model or story.story_generate_model
-    story.ai_model = generated_audio_result.llm_model or story.ai_model
+    resolved_model = (generated_audio_result.llm_model or "").strip() or _configured_story_model()
+    story.story_generate_provdier = _configured_story_provider()
+    story.story_generate_model = resolved_model
+    story.ai_model = resolved_model
 
     normalized_text = (story.story_text or "").strip()
     story.word_count = len(normalized_text) if normalized_text else story.word_count
     story.generation_time_seconds = generation_time_seconds
-    story.generation_prompt = (
-        story.generation_prompt
-        or "External story program invoked from admin curated story save/update"
-    )
+    story.generation_prompt = _build_generation_prompt(story)
 
     story.audio_duration_seconds = resolve_story_audio_duration_seconds(
         GeneratedStory(
@@ -110,21 +171,18 @@ def _apply_generated_story_enrichment(
         story.parent_approved = True
 
 
-def _build_default_word_usage(featured_words: list[str] | None) -> dict[str, str] | None:
-    if not featured_words:
-        return None
-
-    normalized_words = [word.strip() for word in featured_words if isinstance(word, str) and word.strip()]
-    if not normalized_words:
+def _build_default_word_usage(story: GeneratedStory) -> dict[str, str] | None:
+    keywords = _extract_story_keywords(story)
+    if not keywords:
         return None
 
     return {
-        word: "Used naturally in this curated story context."
-        for word in normalized_words
+        word: "在故事中自然地出現。"
+        for word in keywords
     }
 
 
-def _normalize_curated_story_fields(story: GeneratedStory, *, external_flow_expected: bool) -> None:
+def _normalize_curated_story_fields(story: GeneratedStory) -> None:
     normalized_text = (story.story_text or "").strip()
     if normalized_text:
         story.word_count = len(normalized_text)
@@ -132,26 +190,24 @@ def _normalize_curated_story_fields(story: GeneratedStory, *, external_flow_expe
     if not story.title_english:
         story.title_english = story.title
 
-    if not story.story_generate_provdier:
-        story.story_generate_provdier = "external_story_program" if external_flow_expected else "admin_curated"
+    story.story_generate_provdier = _configured_story_provider()
 
-    if not story.story_generate_model:
-        story.story_generate_model = story.ai_model or story.story_generate_provdier
+    if not story.story_generate_model or story.story_generate_model == "external_story_program":
+        story.story_generate_model = _configured_story_model()
 
-    if not story.ai_model:
-        story.ai_model = story.story_generate_model or story.story_generate_provdier
+    if not story.ai_model or story.ai_model == "external_story_program":
+        story.ai_model = story.story_generate_model or _configured_story_model()
 
     if not story.generation_prompt:
-        trigger_source = "external_program" if external_flow_expected else "admin_manual"
-        story.generation_prompt = f"Curated story saved via admin API ({trigger_source})"
+        story.generation_prompt = _build_generation_prompt(story)
 
     if not story.vocab_used:
-        featured_words = [word for word in (story.featured_words or []) if isinstance(word, str) and word.strip()]
-        if featured_words:
-            story.vocab_used = ", ".join(featured_words)
+        keywords = _extract_story_keywords(story)
+        if keywords:
+            story.vocab_used = ", ".join(keywords)
 
     if not story.word_usage:
-        story.word_usage = _build_default_word_usage(story.featured_words)
+        story.word_usage = _build_default_word_usage(story)
 
     story.audio_duration_seconds = resolve_story_audio_duration_seconds(story)
 
@@ -271,7 +327,7 @@ async def create_admin_story(
                 error,
             )
 
-    _normalize_curated_story_fields(story, external_flow_expected=should_autogenerate)
+    _normalize_curated_story_fields(story)
 
     db.add(story)
     await db.commit()
@@ -348,7 +404,7 @@ async def update_admin_story(
                 error,
             )
 
-    _normalize_curated_story_fields(story, external_flow_expected=should_autogenerate)
+    _normalize_curated_story_fields(story)
 
     await db.commit()
     await db.refresh(story)
